@@ -1,4 +1,7 @@
 /target
+# Built MCP binary copied to repo root for local use (current + legacy name)
+/rust-code-mcp
+/file-search-mcp
 /.TRASH
 /storage
 /.skeleton/
