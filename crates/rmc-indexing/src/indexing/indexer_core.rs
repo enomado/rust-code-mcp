@@ -102,10 +102,12 @@ impl IndexerCore {
             .with_env_overrides();
 
         let chunk_split_config = chunk_split_config_from(&config);
+        // Salt namespaces the shared per-directory sled cache by
+        // embedder + chunking; see `identity::metadata_cache_salt`.
         let file_processor = FileProcessor::with_cache_key_salt(
             cache_path,
             config.max_file_size,
-            config.chunking_cache_salt(),
+            crate::indexing::identity::metadata_cache_salt(&backend, &config.chunking_cache_salt()),
         )?;
         let chunker = Chunker::new();
 
