@@ -49,6 +49,7 @@ impl TextEmbedding {
             execution_providers,
             cache_dir,
             show_download_progress,
+            profiling_file,
         } = options;
         let threads = available_parallelism()?.get();
 
@@ -95,6 +96,14 @@ impl TextEmbedding {
                 .with_memory_pattern(false)
                 .map_err(Self::builder_error)?
                 .with_parallel_execution(false)
+                .map_err(Self::builder_error)?;
+        }
+
+        // Profiling can be enabled ONLY when the session is built: after `commit_*`
+        // there is no switch left, so the path has to be carried through the options.
+        if let Some(profiling_file) = profiling_file {
+            builder = builder
+                .with_profiling(profiling_file)
                 .map_err(Self::builder_error)?;
         }
 
@@ -578,5 +587,19 @@ impl TextEmbedding {
                 self.pooling.clone(),
             ))
         }
+    }
+}
+
+impl TextEmbedding {
+    /// Close the ONNX Runtime profile and return the FULL name of the written file.
+    ///
+    /// ORT appends a timestamp to the requested prefix, so the path
+    /// is known only from here. Without this call the profile stays unclosed:
+    /// a session built with profiling must finish it.
+    ///
+    /// Errors if profiling was not requested at initialization
+    /// (see [`crate::InitOptionsWithLength::with_profiling`]).
+    pub fn end_profiling(&mut self) -> anyhow::Result<String> {
+        Ok(self.session.end_profiling()?)
     }
 }

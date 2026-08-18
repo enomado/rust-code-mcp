@@ -14,6 +14,13 @@ pub struct InitOptionsWithLength<M> {
     pub cache_dir: PathBuf,
     pub show_download_progress: bool,
     pub max_length: usize,
+    /// ONNX Runtime profile file, if profiling was requested.
+    ///
+    /// Profiling can be enabled ONLY when the session is built (later is too late),
+    /// so the path has to be carried through the init options. It is the only
+    /// known way to find out which execution provider actually ran
+    /// EACH graph node: in the profile every node event carries the provider name.
+    pub profiling_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +40,7 @@ impl<M: Default + HasMaxLength> Default for InitOptionsWithLength<M> {
             cache_dir: get_cache_dir().into(),
             show_download_progress: true,
             max_length: M::MAX_LENGTH,
+            profiling_file: None,
         }
     }
 }
@@ -81,6 +89,16 @@ impl<M: Default + HasMaxLength> InitOptionsWithLength<M> {
     /// Set whether to show download progress
     pub fn with_show_download_progress(mut self, show_download_progress: bool) -> Self {
         self.show_download_progress = show_download_progress;
+        self
+    }
+
+    /// Write the ONNX Runtime profile to the given file.
+    ///
+    /// ORT extends the actual file name with a timestamp and returns it from
+    /// [`crate::TextEmbedding::end_profiling`]; writing a profile and NOT calling
+    /// `end_profiling` is pointless: the file stays empty.
+    pub fn with_profiling(mut self, profiling_file: PathBuf) -> Self {
+        self.profiling_file = Some(profiling_file);
         self
     }
 }

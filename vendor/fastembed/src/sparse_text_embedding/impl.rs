@@ -46,6 +46,7 @@ impl SparseTextEmbedding {
             cache_dir,
             show_download_progress,
             execution_providers,
+            profiling_file,
         } = options;
 
         let threads = available_parallelism()?.get();
@@ -71,14 +72,23 @@ impl SparseTextEmbedding {
             }
         }
 
-        let session = Session::builder()?
+        let mut builder = Session::builder()?
             .with_execution_providers(execution_providers)
             .map_err(Self::builder_error)?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(Self::builder_error)?
             .with_intra_threads(threads)
-            .map_err(Self::builder_error)?
-            .commit_from_file(model_file_reference)?;
+            .map_err(Self::builder_error)?;
+
+        // Profiling can be enabled ONLY when the session is built: after `commit_*`
+        // there is no switch left, so the path has to be carried through the options.
+        if let Some(profiling_file) = profiling_file {
+            builder = builder
+                .with_profiling(profiling_file)
+                .map_err(Self::builder_error)?;
+        }
+
+        let session = builder.commit_from_file(model_file_reference)?;
 
         let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
         Ok(Self::new(tokenizer, session, model_name))
@@ -316,5 +326,19 @@ impl SparseTextEmbedding {
                 SparseEmbedding { values, indices }
             })
             .collect()
+    }
+}
+
+impl SparseTextEmbedding {
+    /// Close the ONNX Runtime profile and return the FULL name of the written file.
+    ///
+    /// ORT appends a timestamp to the requested prefix, so the path
+    /// is known only from here. Without this call the profile stays unclosed:
+    /// a session built with profiling must finish it.
+    ///
+    /// Errors if profiling was not requested at initialization
+    /// (see [`crate::InitOptionsWithLength::with_profiling`]).
+    pub fn end_profiling(&mut self) -> anyhow::Result<String> {
+        Ok(self.session.end_profiling()?)
     }
 }
