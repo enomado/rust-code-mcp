@@ -12,6 +12,13 @@ use super::{OutputKey, OutputPrecedence};
 pub struct SingleBatchOutput {
     pub outputs: Vec<(String, ort::value::Value)>,
     pub attention_mask_array: Array2<i64>,
+    /// Сколько ПЕРВЫХ строк батча соответствуют реальным входам.
+    ///
+    /// Обычно равно высоте батча. Меньше — когда включена постоянная форма
+    /// входа ([`crate::FixedBatchShape`]) и последний батч добит до этой формы
+    /// строками-пустышками. Потребитель ОБЯЗАН отрезать хвост: добивки — не
+    /// данные, их эмбеддинги не соответствуют ничему на входе.
+    pub real_rows: usize,
 }
 
 impl SingleBatchOutput {

@@ -1,7 +1,7 @@
 //! Output types and functions for the [`TextEmbedding`] model.
 //!
 use crate::{
-    common::{normalize, Embedding},
+    common::{Embedding, normalize},
     output::{OutputKey, OutputPrecedence, SingleBatchOutput},
     pooling::Pooling,
 };
@@ -41,6 +41,11 @@ pub fn transformer_with_precedence(
                         array
                             .rows()
                             .into_iter()
+                            // Хвост строк-добивок (постоянная форма входа) не
+                            // соответствует ничему на входе — отрезаем здесь,
+                            // чтобы наружу уехало ровно столько эмбеддингов,
+                            // сколько было текстов.
+                            .take(batch.real_rows)
                             .map(|row| {
                                 row.as_slice()
                                     .ok_or_else(|| {

@@ -2,10 +2,10 @@
 //!
 
 use crate::{
+    EmbeddingModel, OutputKey, QuantizationMode,
     common::TokenizerFiles,
     init::{HasMaxLength, InitOptionsWithLength},
     pooling::Pooling,
-    EmbeddingModel, OutputKey, QuantizationMode,
 };
 use ort::{execution_providers::ExecutionProviderDispatch, session::Session};
 use tokenizers::Tokenizer;
@@ -123,6 +123,28 @@ impl UserDefinedEmbeddingModel {
     }
 }
 
+/// Постоянная форма входа модели: строк в батче × длина последовательности.
+///
+/// # Зачем
+/// По умолчанию форма входа плавает по ОБЕИМ осям: токенизатор паддит до самой
+/// длинной последовательности В БАТЧЕ (`PaddingStrategy::BatchLongest`), а
+/// последний батч ещё и неполный. Для CPU это безразлично, но компилирующие
+/// рантаймы (MIGraphX и прочие AOT-EP) компилируют ЯДРА ПОД ФОРМУ: каждая новая
+/// форма = отдельная компиляция (десятки секунд) и отдельный файл кэша (сотни
+/// мегабайт). Замерено на индексации 40 файлов: 4 формы, 659 МБ кэша.
+///
+/// Когда форма зафиксирована, компиляция ровно одна, а платой служит счёт по
+/// строкам-добивкам в неполном последнем батче.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedBatchShape {
+    /// Высота батча. Входы длиннее режутся на куски по `rows`, последний
+    /// кусок добивается до `rows` (добивки отбрасываются на выходе).
+    pub rows: usize,
+    /// Длина последовательности. Токенизатор паддит РОВНО до неё, а не до
+    /// самой длинной строки в батче.
+    pub seq_len: usize,
+}
+
 /// Rust representation of the TextEmbedding model
 pub struct TextEmbedding {
     pub tokenizer: Tokenizer,
@@ -131,4 +153,8 @@ pub struct TextEmbedding {
     pub(crate) need_token_type_ids: bool,
     pub(crate) quantization: QuantizationMode,
     pub(crate) output_key: Option<OutputKey>,
+    /// Постоянная форма входа, если её потребовали через
+    /// [`TextEmbedding::with_fixed_batch_shape`]. `None` — прежнее поведение
+    /// (форма плавает по обеим осям).
+    pub(crate) fixed_shape: Option<FixedBatchShape>,
 }

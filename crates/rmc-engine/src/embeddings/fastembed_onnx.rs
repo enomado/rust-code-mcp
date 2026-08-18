@@ -7,8 +7,24 @@
 use crate::embeddings::backend::{EmbeddingBackend, EmbeddingRuntime};
 use crate::embeddings::profile::FastembedOnnxModel;
 use crate::embeddings::{Embedding, EmbeddingError};
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{EmbeddingModel, FixedBatchShape, TextEmbedding, TextInitOptions};
 use std::sync::Mutex;
+
+/// Высота батча, под которую компилируются MIGraphX-ядра.
+///
+/// # Почему форма постоянная
+/// MIGraphX компилирует ядра ПОД ФОРМУ входа: каждая новая пара
+/// (строк × длина) стоит 45–70 с компиляции и ~145–200 МБ в кэше `.mxr`.
+/// Форма, которую fastembed отдаёт по умолчанию, плавает по обеим осям
+/// (паддинг до самой длинной строки В БАТЧЕ + неполный последний батч), и одна
+/// индексация 40 файлов породила 4 формы и 659 МБ кэша. Фиксация оставляет одну.
+///
+/// # Почему именно 32
+/// Это и высота, на которой снят потолок GPU-пути (242 seq/s против 7.5 на CPU),
+/// и дефолтный `gpu_batch_size` индексатора — то есть в типичном прогоне
+/// добивать приходится только последний кусок. Число намеренно НЕ выводится из
+/// входа: смысл в том, чтобы форма не зависела от того, сколько текстов пришло.
+const GPU_BATCH_ROWS: usize = 32;
 
 pub(super) struct FastembedOnnxEmbedder {
     inner: Mutex<TextEmbedding>,
@@ -36,14 +52,32 @@ impl FastembedOnnxEmbedder {
             "loading fastembed ONNX model"
         );
 
+        // Форма входа считается ДО создания сессии: от неё зависит каталог кэша
+        // ядер, который надо выставить раньше, чем EP получит управление.
+        let shape = FixedBatchShape {
+            rows: GPU_BATCH_ROWS,
+            seq_len: backend.max_len,
+        };
+
         let mut options = TextInitOptions::new(to_fastembed_model(model))
             .with_max_length(backend.max_len)
             .with_show_download_progress(false);
         if on_gpu {
-            options = options.with_execution_providers(migraphx_execution_providers()?);
+            options = options.with_execution_providers(migraphx_execution_providers(model, shape)?);
         }
-        let inner = TextEmbedding::try_new(options)
+        let mut inner = TextEmbedding::try_new(options)
             .map_err(|e| EmbeddingError::model_init(e.to_string()))?;
+        if on_gpu {
+            inner = inner
+                .with_fixed_batch_shape(shape)
+                .map_err(|e| EmbeddingError::model_init(e.to_string()))?;
+            tracing::info!(
+                target: "embeddings::fastembed_onnx",
+                rows = shape.rows,
+                seq_len = shape.seq_len,
+                "fixed MIGraphX input shape"
+            );
+        }
 
         Ok(Self {
             inner: Mutex::new(inner),
@@ -56,20 +90,14 @@ impl FastembedOnnxEmbedder {
         self.dim
     }
 
-    pub(super) fn embed_documents(
-        &self,
-        texts: &[&str],
-    ) -> Result<Vec<Embedding>, EmbeddingError> {
+    pub(super) fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Embedding>, EmbeddingError> {
         let mut model = self.inner.lock().unwrap();
         model
             .embed(texts, None)
             .map_err(|e| EmbeddingError::embed_failed(e.to_string()))
     }
 
-    pub(super) fn embed_queries(
-        &self,
-        texts: &[&str],
-    ) -> Result<Vec<Embedding>, EmbeddingError> {
+    pub(super) fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Embedding>, EmbeddingError> {
         let prefixed: Vec<String> = texts
             .iter()
             .map(|text| self.backend.format_query(text))
@@ -100,9 +128,11 @@ fn to_fastembed_model(model: FastembedOnnxModel) -> EmbeddingModel {
 /// работает» становится ложным выводом — ровно тот класс, которого этот код
 /// обязан избегать.
 #[cfg(feature = "embeddings-migraphx")]
-fn migraphx_execution_providers()
--> Result<Vec<ort::execution_providers::ExecutionProviderDispatch>, EmbeddingError> {
-    ensure_migraphx_kernel_cache()?;
+fn migraphx_execution_providers(
+    model: FastembedOnnxModel,
+    shape: FixedBatchShape,
+) -> Result<Vec<ort::execution_providers::ExecutionProviderDispatch>, EmbeddingError> {
+    ensure_migraphx_kernel_cache(model, shape)?;
     Ok(vec![
         ort::ep::migraphx::MIGraphX::default()
             .build()
@@ -111,8 +141,10 @@ fn migraphx_execution_providers()
 }
 
 #[cfg(not(feature = "embeddings-migraphx"))]
-fn migraphx_execution_providers()
--> Result<Vec<fastembed::ExecutionProviderDispatch>, EmbeddingError> {
+fn migraphx_execution_providers(
+    _model: FastembedOnnxModel,
+    _shape: FixedBatchShape,
+) -> Result<Vec<fastembed::ExecutionProviderDispatch>, EmbeddingError> {
     Err(EmbeddingError::model_init(
         "rmc-engine was built without the `embeddings-migraphx` feature; \
          rebuild with --features migraphx to use GPU embedding profiles",
@@ -134,30 +166,46 @@ fn migraphx_execution_providers()
 /// `OrtMIGraphXProviderOptions`, и ORT 1.28 её игнорирует), ни переменная
 /// `ORT_MIGRAPHX_CACHE_PATH`, которую strings показывает в той же библиотеке.
 ///
-/// # Почему каталог свой у каждой формы входа
-/// Имя `.mxr` включает хэш графа, но при загрузке чужого файла первый `run`
-/// после старта отдаёт результат ФОРМЫ ИЗ КЭША, а не фактического входа —
-/// молча, без ошибки. Смешивать в одном каталоге программы разных форм нельзя:
-/// это тихая порча первого батча. Компиляция одной формы стоит 45–70 с и ~200 МБ.
+/// # Почему каталог адресуется формой входа
+/// Имя `.mxr` включает хэш графа, но НЕ различает формы: при загрузке файла от
+/// ДРУГОЙ формы первый `run` после старта отдаёт результат формы ИЗ КЭША, а не
+/// фактического входа — молча, без ошибки (воспроизведено: вход 16×512, выход
+/// `[32, 512, 384]`). Поэтому каталог именуется моделью и формой: программы
+/// разных форм физически не встречаются, и старый кэш смешанных форм не
+/// подхватывается. Компиляция одной формы стоит 45–70 с и ~145–200 МБ.
+///
+/// Явный `ORT_MIGRAPHX_MODEL_CACHE_PATH` уважается, но трактуется как КОРЕНЬ:
+/// подкаталог формы дописывается и к нему — инвариант «один каталог = одна
+/// форма» не должен зависеть от того, задал ли кто-то переменную.
 #[cfg(feature = "embeddings-migraphx")]
-fn ensure_migraphx_kernel_cache() -> Result<std::path::PathBuf, EmbeddingError> {
+fn ensure_migraphx_kernel_cache(
+    model: FastembedOnnxModel,
+    shape: FixedBatchShape,
+) -> Result<std::path::PathBuf, EmbeddingError> {
     const CACHE_ENV: &str = "ORT_MIGRAPHX_MODEL_CACHE_PATH";
 
-    if let Some(dir) = std::env::var_os(CACHE_ENV).filter(|v| !v.is_empty()) {
-        let dir = std::path::PathBuf::from(dir);
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            EmbeddingError::model_init(format!(
-                "cannot create MIGraphX kernel cache at {}: {e}",
-                dir.display()
-            ))
-        })?;
-        return Ok(dir);
-    }
-    let dir = directories::ProjectDirs::from("", "", "rust-code-mcp")
-        .map(|d| d.cache_dir().join("migraphx"))
+    let shape_dir = format!("{}-{}x{}", model.display_name(), shape.rows, shape.seq_len);
+
+    // Корень читается из окружения ОДИН раз за процесс и запоминается: ниже мы
+    // сами пишем в ту же переменную путь подкаталога формы, и повторное чтение
+    // приняло бы наш собственный ответ за корень — каталоги вложились бы друг в
+    // друга при втором эмбеддере в том же процессе.
+    static CACHE_ROOT: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let root = CACHE_ROOT
+        .get_or_init(|| {
+            std::env::var_os(CACHE_ENV)
+                .filter(|v| !v.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    directories::ProjectDirs::from("", "", "rust-code-mcp")
+                        .map(|d| d.cache_dir().join("migraphx"))
+                })
+        })
+        .clone()
         .ok_or_else(|| {
             EmbeddingError::model_init("cannot resolve a cache directory for MIGraphX kernels")
         })?;
+    let dir = root.join(shape_dir);
     std::fs::create_dir_all(&dir).map_err(|e| {
         EmbeddingError::model_init(format!(
             "cannot create MIGraphX kernel cache at {}: {e}",
@@ -173,4 +221,131 @@ fn ensure_migraphx_kernel_cache() -> Result<std::path::PathBuf, EmbeddingError> 
     // и до появления фоновых потоков, которые могли бы читать окружение.
     unsafe { std::env::set_var(CACHE_ENV, &dir) };
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Тексты разной длины: важно, чтобы в батче встречались и короткие, и
+    /// длинные — на них `BatchLongest` и постоянная форма дают РАЗНЫЙ паддинг,
+    /// а значит разный путь через модель.
+    fn corpus() -> Vec<String> {
+        vec![
+            "fn main() {}".to_string(),
+            "pub struct ChunkId(pub u64);".to_string(),
+            "async fn embed_documents(&self, texts: Vec<String>) -> Result<Vec<Embedding>> { \
+             let refs = texts.iter().map(String::as_str).collect::<Vec<_>>(); \
+             self.inner.embed(&refs, None) }"
+                .to_string(),
+            "// комментарий".to_string(),
+            "impl Display for EmbeddingError { fn fmt(&self, f: &mut Formatter) -> fmt::Result }"
+                .to_string(),
+        ]
+    }
+
+    /// Тесты ниже тянут ОДИН И ТОТ ЖЕ файл модели через hf-hub, а тот берёт
+    /// файловый лок на блоб: два параллельных теста дерутся за него и один
+    /// падает на «Lock acquisition failed». Загрузка модели поэтому
+    /// сериализуется — это про кэш HF, а не про потокобезопасность fastembed.
+    fn model_guard() -> std::sync::MutexGuard<'static, ()> {
+        static MODEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        MODEL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>()
+    }
+
+    /// Оракул постоянной формы входа: она не меняет ЧИСЛА и не меняет
+    /// КОЛИЧЕСТВО эмбеддингов.
+    ///
+    /// Проверяются оба свойства, потому что ломаются они по-разному:
+    /// - количество — если строки-добивки уехали наружу (не отрезаны по
+    ///   `real_rows`); ловится на входе, чья длина НЕ кратна высоте батча;
+    /// - числа — если паддинг до фиксированной длины начал влиять на результат
+    ///   (например, attention-маска перестала гасить хвост). Эталон здесь —
+    ///   тот же fastembed без фиксации формы, то есть сравнение честное:
+    ///   меняется ровно одна вещь.
+    ///
+    /// Тест гоняется на CPU и потому не требует GPU, но требует скачанной
+    /// модели и полноценного forward — отсюда `#[ignore]`, запускать явно:
+    /// `cargo test -p rmc-engine --features embeddings fixed_batch_shape -- --ignored`
+    #[test]
+    #[ignore = "качает модель с HF и считает forward на CPU"]
+    fn fixed_batch_shape_preserves_embeddings() {
+        let texts = corpus();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+        let _guard = model_guard();
+        let options = || {
+            TextInitOptions::new(EmbeddingModel::BGESmallENV15)
+                .with_max_length(512)
+                .with_show_download_progress(false)
+        };
+
+        let mut baseline = TextEmbedding::try_new(options()).unwrap();
+        let expected = baseline.embed(&refs, None).unwrap();
+
+        // rows=4 при 5 текстах: два батча, из них второй добит тремя строками.
+        // Именно эта некратность и делает тест гейтом на отрезание хвоста.
+        let shape = FixedBatchShape {
+            rows: 4,
+            seq_len: 512,
+        };
+        let mut fixed = TextEmbedding::try_new(options())
+            .unwrap()
+            .with_fixed_batch_shape(shape)
+            .unwrap();
+        assert_eq!(fixed.fixed_batch_shape(), Some(shape));
+        let actual = fixed.embed(&refs, None).unwrap();
+
+        assert_eq!(
+            actual.len(),
+            texts.len(),
+            "строки-добивки уехали наружу: эмбеддингов больше, чем текстов"
+        );
+        for (idx, (want, got)) in expected.iter().zip(&actual).enumerate() {
+            let sim = cosine(want, got);
+            assert!(
+                sim > 0.999,
+                "текст #{idx}: постоянная форма изменила эмбеддинг (косинус {sim})"
+            );
+        }
+    }
+
+    /// Отказы, которые обязаны быть отказами, а не тихой сменой формы.
+    #[test]
+    #[ignore = "качает модель с HF"]
+    fn fixed_batch_shape_rejects_impossible_shapes() {
+        let _guard = model_guard();
+        let options = || {
+            TextInitOptions::new(EmbeddingModel::BGESmallENV15)
+                .with_max_length(512)
+                .with_show_download_progress(false)
+        };
+
+        // Длина последовательности сверх предела усечения: обещанной формы не
+        // получить — токенизатор всё равно обрежет.
+        let err = TextEmbedding::try_new(options())
+            .unwrap()
+            .with_fixed_batch_shape(FixedBatchShape {
+                rows: 32,
+                seq_len: 1024,
+            })
+            .err()
+            .expect("seq_len сверх предела усечения должен быть отказом");
+        assert!(err.to_string().contains("truncation limit"), "{err}");
+
+        let err = TextEmbedding::try_new(options())
+            .unwrap()
+            .with_fixed_batch_shape(FixedBatchShape {
+                rows: 0,
+                seq_len: 512,
+            })
+            .err()
+            .expect("нулевая высота батча должна быть отказом");
+        assert!(err.to_string().contains("non-zero"), "{err}");
+    }
 }
