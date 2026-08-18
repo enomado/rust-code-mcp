@@ -544,6 +544,7 @@ mod tests {
             indexing_identity: "test-indexing".to_string(),
             chunking_identity: "test-chunking".to_string(),
             cache_path: vector_path.join("cache"),
+            metadata_cache_salt: "test-salt".to_string(),
             tantivy_path: vector_path.join("tantivy"),
             snapshot_path: vector_path.join("snapshot.json"),
             collection_name: "code_chunks_test_legacy".to_string(),

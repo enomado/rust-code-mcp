@@ -24,6 +24,8 @@ pub struct ProjectPaths {
     pub indexing_identity: String,
     pub chunking_identity: String,
     pub cache_path: PathBuf,
+    /// Salt prefixing this project+profile's metadata-cache keys.
+    pub metadata_cache_salt: String,
     pub tantivy_path: PathBuf,
     pub snapshot_path: PathBuf,
     pub collection_name: String,
@@ -44,6 +46,7 @@ impl From<IndexingProjectPaths> for ProjectPaths {
             indexing_identity: paths.indexing_identity,
             chunking_identity: paths.chunking_identity,
             cache_path: paths.cache_path,
+            metadata_cache_salt: paths.metadata_cache_salt,
             tantivy_path: paths.tantivy_path,
             snapshot_path: paths.snapshot_path,
             collection_name: paths.collection_name,

@@ -6,7 +6,7 @@ use rmc_engine::embeddings::EmbeddingBackend;
 use sha2::{Digest, Sha256};
 
 use crate::indexing::identity::{
-    active_chunking_identity_for_backend, identity_hash, indexing_identity,
+    active_chunking_identity_for_backend, identity_hash, indexing_identity, metadata_cache_salt,
 };
 use crate::indexing::incremental::get_snapshot_path_for_identity;
 
@@ -16,6 +16,10 @@ pub struct IndexingProjectPaths {
     pub indexing_identity: String,
     pub chunking_identity: String,
     pub cache_path: PathBuf,
+    /// Salt that prefixes this project+profile's metadata-cache keys.
+    /// The sled database at `cache_path` is shared by every profile of
+    /// the directory, so reading it requires the matching salt.
+    pub metadata_cache_salt: String,
     pub tantivy_path: PathBuf,
     pub snapshot_path: PathBuf,
     pub collection_name: String,
@@ -55,6 +59,7 @@ impl IndexingProjectPaths {
 
         Self {
             cache_path: data_root.join("cache").join(&dir_hash),
+            metadata_cache_salt: metadata_cache_salt(backend, &chunking_identity),
             tantivy_path: data_root.join("index").join(&dir_hash),
             vector_path: data_root.join("cache").join("vectors").join(&collection_name),
             collection_name,
@@ -96,6 +101,7 @@ impl IndexingProjectPaths {
 
         Self {
             cache_path: data_root.join("cache").join(&dir_hash),
+            metadata_cache_salt: metadata_cache_salt(backend, &chunking_identity),
             tantivy_path: data_root.join("index").join(&dir_hash),
             vector_path: vectors_root.join(&collection_name),
             collection_name,
