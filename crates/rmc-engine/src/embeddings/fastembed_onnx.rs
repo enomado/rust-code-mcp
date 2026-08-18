@@ -34,6 +34,40 @@ pub(super) struct FastembedOnnxEmbedder {
 
 impl FastembedOnnxEmbedder {
     pub(super) fn new(backend: &EmbeddingBackend) -> Result<Self, EmbeddingError> {
+        Self::new_inner(backend, None)
+    }
+
+    /// Тот же путь инициализации, но с включённым профилированием ORT.
+    ///
+    /// Профилирование НЕЛЬЗЯ включить после сборки сессии, поэтому и отдельный
+    /// конструктор: тот же `backend`, тот же список EP, та же форма — иначе
+    /// профиль описывал бы не ту сессию, которая работает в проде, и оракул
+    /// гейтил бы собственную копию кода.
+    ///
+    /// `prefix` — префикс имени файла; ORT дописывает к нему отметку времени,
+    /// фактический путь возвращает [`Self::end_profiling`].
+    #[cfg(test)]
+    pub(super) fn new_profiled(
+        backend: &EmbeddingBackend,
+        prefix: &std::path::Path,
+    ) -> Result<Self, EmbeddingError> {
+        Self::new_inner(backend, Some(prefix))
+    }
+
+    /// Закрыть профиль ORT и вернуть путь записанного файла.
+    #[cfg(test)]
+    pub(super) fn end_profiling(&self) -> Result<std::path::PathBuf, EmbeddingError> {
+        let mut model = self.inner.lock().unwrap();
+        model
+            .end_profiling()
+            .map(std::path::PathBuf::from)
+            .map_err(|e| EmbeddingError::model_init(e.to_string()))
+    }
+
+    fn new_inner(
+        backend: &EmbeddingBackend,
+        profiling_prefix: Option<&std::path::Path>,
+    ) -> Result<Self, EmbeddingError> {
         if !backend.is_fastembed_onnx() {
             return Err(EmbeddingError::model_init(format!(
                 "embedding profile `{}` is not a fastembed ONNX profile",
@@ -64,6 +98,9 @@ impl FastembedOnnxEmbedder {
             .with_show_download_progress(false);
         if on_gpu {
             options = options.with_execution_providers(migraphx_execution_providers(model, shape)?);
+        }
+        if let Some(prefix) = profiling_prefix {
+            options = options.with_profiling(prefix.to_path_buf());
         }
         let mut inner = TextEmbedding::try_new(options)
             .map_err(|e| EmbeddingError::model_init(e.to_string()))?;
@@ -347,5 +384,100 @@ mod tests {
             .err()
             .expect("нулевая высота батча должна быть отказом");
         assert!(err.to_string().contains("non-zero"), "{err}");
+    }
+
+    /// Оракул GPU-пути: граф РЕАЛЬНО считается на MIGraphX, а не на CPU.
+    ///
+    /// # Что именно он ловит
+    /// `error_on_failure()` на EP закрывает только «провайдер не поднялся».
+    /// Класс «EP поднялся, но взял ноль узлов» проходит его насквозь: сессия
+    /// жива, эмбеддинги считаются, отличается лишь скорость — то есть до этого
+    /// теста деградация была видна только глазом и только в замере.
+    ///
+    /// # Почему утверждение про CPU-узлы, а не про долю
+    /// MIGraphX не «берёт узлы по одному»: он вырезает подграф, компилирует его
+    /// и подставляет ОДИН фьюженный узел. Замерено на этой сцене: здоровый
+    /// GPU-путь даёт `MIGraphXExecutionProvider=1` и ноль CPU-узлов, тогда как
+    /// тот же корпус на CPU-профиле — 365 узлов (см. позитивный контроль ниже).
+    /// Доля тут поэтому не работает как метрика: одна единица «весит» весь
+    /// граф. Утверждаем два свойства: фьюженный узел ЕСТЬ, и CPU не набрал
+    /// заметного хвоста — то есть подграф не отгрызли по кусочку.
+    ///
+    /// Слак в 32 узла — не измеренная величина, а запас: шейповые операторы
+    /// (Shape/Reshape/Cast) в принципе могут остаться снаружи подграфа, как это
+    /// видно в python-плече на ROCm EP (там 4158 узлов на GPU и 48 на CPU — но
+    /// ROCm EP не фьюзит, и картина узлов у него другая). Ниже 365 он на
+    /// порядок, поэтому откат «граф вернулся на CPU» ловится с запасом.
+    ///
+    /// Требует карту, системный ORT с MIGraphX и скачанную модель, поэтому
+    /// `#[ignore]`; первый прогон на холодном кэше ядер платит ~минуту
+    /// компиляции. Запуск:
+    /// `cargo test -p rmc-engine --features embeddings-migraphx migraphx_ep -- --ignored --nocapture`
+    #[cfg(feature = "embeddings-migraphx")]
+    #[test]
+    #[ignore = "нужны AMD-карта, ORT с MIGraphX и скачанная модель"]
+    fn migraphx_ep_actually_runs_the_graph() {
+        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP, ProviderCensus};
+
+        let _guard = model_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let backend = EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
+
+        let embedder =
+            FastembedOnnxEmbedder::new_profiled(&backend, &dir.path().join("migraphx")).unwrap();
+
+        // Профиль пуст, пока не было ни одного прогона: перепись должна
+        // считаться по РАБОТЕ сессии, а не по факту её создания.
+        let texts = corpus();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let embeddings = embedder.embed_documents(&refs).unwrap();
+        assert_eq!(embeddings.len(), refs.len());
+
+        let profile = embedder.end_profiling().unwrap();
+        let census = ProviderCensus::from_profile_file(&profile).unwrap();
+        eprintln!("узлы по провайдерам: {census}");
+
+        assert!(
+            census.nodes_on(MIGRAPHX_EP) > 0,
+            "ни один узел не достался MIGraphX — тихий откат на CPU: {census}"
+        );
+        const CPU_TAIL_SLACK: usize = 32;
+        assert!(
+            census.nodes_on(CPU_EP) <= CPU_TAIL_SLACK,
+            "на CPU осталось {} узлов (слак {CPU_TAIL_SLACK}) — подграф не ушёл на GPU целиком: {census}",
+            census.nodes_on(CPU_EP),
+        );
+    }
+
+    /// Позитивный контроль к оракулу выше: на CPU-профиле перепись обязана
+    /// показать CPU и НОЛЬ узлов на MIGraphX.
+    ///
+    /// Без него «зелёный GPU-тест» ничего не доказывает: тест, который зелен и
+    /// когда всё считается на GPU, и когда всё считается на CPU, не гейт, а
+    /// украшение. Здесь та же машинерия (профиль → перепись) гоняется на
+    /// заведомо CPU-сессии, и утверждение ровно обратное — так видно, что
+    /// перепись РАЗЛИЧАЕТ два исхода, а не всегда говорит «да».
+    ///
+    /// GPU не нужен, нужна только скачанная модель — отсюда `#[ignore]`:
+    /// `cargo test -p rmc-engine --features embeddings census_on_cpu -- --ignored --nocapture`
+    #[test]
+    #[ignore = "качает модель с HF и считает forward на CPU"]
+    fn census_on_cpu_profile_sees_no_migraphx() {
+        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP, ProviderCensus};
+
+        let _guard = model_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let backend = EmbeddingBackend::from_profile_name("local-cpu-small").unwrap();
+
+        let embedder =
+            FastembedOnnxEmbedder::new_profiled(&backend, &dir.path().join("cpu")).unwrap();
+        let texts = corpus();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        embedder.embed_documents(&refs).unwrap();
+
+        let census = ProviderCensus::from_profile_file(&embedder.end_profiling().unwrap()).unwrap();
+        eprintln!("узлы по провайдерам (CPU-профиль): {census}");
+        assert_eq!(census.nodes_on(MIGRAPHX_EP), 0);
+        assert!(census.nodes_on(CPU_EP) > 0, "{census}");
     }
 }
