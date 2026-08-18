@@ -357,6 +357,27 @@ impl HealthMonitor {
         let stale_skips = stale.len();
         let examples: Vec<String> = stale.iter().take(10).cloned().collect();
 
+        // Empty comparison is NOT a pass. The cache holds keys for one
+        // embedder+chunking salt; a profile that was never indexed (or
+        // whose salt changed, as happened when the embedder was added to
+        // the salt) yields zero cached files, and "all 0 cached files
+        // have vectors" is vacuously true — exactly the shape of verdict
+        // this component exists to abolish. Caught on the live index
+        // right after the salt change, where it printed `healthy` next
+        // to `files_cached: 0`.
+        if files_cached == 0 {
+            let mut unknown = CoverageHealth::unknown(format!(
+                "Coverage unknown: metadata cache holds no entries for this profile \
+                 (never indexed with it, or indexed before the cache salt changed); \
+                 store holds {} distinct files",
+                files_with_vectors
+            ));
+            unknown.files_tracked = files_tracked;
+            unknown.files_cached = Some(0);
+            unknown.files_with_vectors = Some(files_with_vectors);
+            return unknown;
+        }
+
         let (status, message) = if stale_skips == 0 {
             (
                 Status::Healthy,
@@ -613,7 +634,9 @@ mod tests {
         let coverage = monitor.check_coverage().await;
 
         assert_eq!(coverage.files_cached, Some(0));
-        assert_eq!(coverage.stale_skips, Some(0));
+        // Vacuous "all 0 files are fine" must never read as healthy.
+        assert_eq!(coverage.status, Status::Degraded);
+        assert_eq!(coverage.stale_skips, None);
     }
 
     #[test]
