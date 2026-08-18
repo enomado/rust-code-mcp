@@ -7,7 +7,7 @@ use crate::indexing::IndexingError;
 use crate::metrics::MemoryMonitor;
 use rmc_engine::chunker::CodeChunk;
 use rmc_engine::embeddings::batching::{
-    BatchPlan as EmbeddingBatchPlan, BatchRows, BatchingPolicy, FixedInputShape,
+    BatchPlan as EmbeddingBatchPlan, BatchingPolicy, FixedInputShape,
 };
 use rmc_engine::embeddings::{
     Embedding, EmbeddingGenerator, EmbeddingRuntime, EmbeddingTextLen, EmbeddingTokenCounter,
@@ -551,6 +551,7 @@ fn sort_embedding_inputs(ordered_texts: &mut [(usize, String, Option<EmbeddingTe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmc_engine::embeddings::batching::BatchRows;
 
     // Note: tests that need EmbeddingGenerator require the model to be loaded,
     // so we only test memory-related functionality here.
