@@ -71,3 +71,5 @@ embedded = []
 # GPU/CUDA embeddings (qwen3 reranker via candle). Requires nvcc/CUDA toolkit at build time.
 # Default build is CPU-only; opt in with `cargo build --release --features cuda`.
 cuda = ["rmc-server/cuda"]
+# AMD GPU (MIGraphX). Requires a system ONNX Runtime built with the MIGraphX EP.
+migraphx = ["rmc-server/migraphx"]
