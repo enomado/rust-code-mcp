@@ -56,7 +56,12 @@ fn resolve_backend(
     }
 
     let Some(s) = model else {
-        return Ok(automatic_embedding_backend());
+        // Ни profile, ни legacy model: отдать ОБЩЕМУ резолверу, а не встроенному
+        // дефолту напрямую — иначе index_codebase молча проиндексирует не тем
+        // эмбеддером, чем ищут поисковые тулы (они идут через резолвер и знают
+        // про RMC_EMBEDDING_PROFILE). Расхождение видно только по строке
+        // "Profile:" в ответе, то есть выглядит как успех.
+        return resolve_embedding_backend_for_mcp(None, project_root);
     };
     let variant = parse_variant(s).map_err(|msg| McpError::invalid_params(msg, None))?;
     Ok(EmbeddingBackend::from_qwen3_variant(variant))

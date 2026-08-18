@@ -69,11 +69,25 @@ pub(crate) fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".rust-code-mcp"))
 }
 
+/// Имя профиля эмбеддингов, выбираемого по умолчанию для ЭТОГО процесса.
+///
+/// Приоритет: явный параметр тула > `RMC_EMBEDDING_PROFILE` > встроенный
+/// `local-cpu-small`. Переменная нужна потому, что индекс, BM25 и имя коллекции
+/// ключуются идентичностью эмбеддера: сервер, поднятый на нестандартном профиле,
+/// без неё отвечал бы на каждый вызов БЕЗ параметра из ЧУЖОГО (пустого) индекса,
+/// и это выглядело бы не как отказ, а как «ничего не найдено».
+pub(crate) const EMBEDDING_PROFILE_ENV: &str = "RMC_EMBEDDING_PROFILE";
+
 pub(crate) fn resolve_embedding_backend_for_mcp(
     embedding_profile: Option<&str>,
     directory: &Path,
 ) -> Result<EmbeddingBackend, McpError> {
-    if let Some(profile) = embedding_profile {
+    let from_env = std::env::var(EMBEDDING_PROFILE_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let requested = embedding_profile.or(from_env.as_deref());
+
+    if let Some(profile) = requested {
         let profile = resolve_profile(profile, directory)
             .map_err(|msg| McpError::invalid_params(msg, None))?;
         return Ok(EmbeddingBackend::from_profile(profile));
