@@ -2,10 +2,10 @@
 //!
 
 use crate::{
-    EmbeddingModel, OutputKey, QuantizationMode,
     common::TokenizerFiles,
     init::{HasMaxLength, InitOptionsWithLength},
     pooling::Pooling,
+    EmbeddingModel, OutputKey, QuantizationMode,
 };
 use ort::{execution_providers::ExecutionProviderDispatch, session::Session};
 use tokenizers::Tokenizer;
@@ -27,6 +27,10 @@ pub type TextInitOptions = InitOptionsWithLength<EmbeddingModel>;
 pub struct InitOptionsUserDefined {
     pub execution_providers: Vec<ExecutionProviderDispatch>,
     pub max_length: usize,
+    /// Number of intra-op threads for ONNX Runtime. `None` (the default) uses
+    /// every available CPU core via `std::thread::available_parallelism`.
+    /// Set this to cap CPU usage (e.g. on laptops) at the cost of throughput.
+    pub intra_threads: Option<usize>,
 }
 
 impl InitOptionsUserDefined {
@@ -48,6 +52,14 @@ impl InitOptionsUserDefined {
         self.max_length = max_length;
         self
     }
+
+    /// Set the number of intra-op threads ONNX Runtime uses. By default
+    /// (`None`) all available CPU cores are used; capping this limits CPU
+    /// usage at the cost of per-inference throughput.
+    pub fn with_intra_threads(mut self, intra_threads: usize) -> Self {
+        self.intra_threads = Some(intra_threads);
+        self
+    }
 }
 
 impl Default for InitOptionsUserDefined {
@@ -55,6 +67,7 @@ impl Default for InitOptionsUserDefined {
         Self {
             execution_providers: Default::default(),
             max_length: DEFAULT_MAX_LENGTH,
+            intra_threads: None,
         }
     }
 }
@@ -67,6 +80,7 @@ impl From<TextInitOptions> for InitOptionsUserDefined {
         InitOptionsUserDefined {
             execution_providers: options.execution_providers,
             max_length: options.max_length,
+            intra_threads: options.intra_threads,
         }
     }
 }
@@ -123,25 +137,26 @@ impl UserDefinedEmbeddingModel {
     }
 }
 
-/// Fixed model input shape: rows per batch × sequence length.
+/// A constant input shape for the model: batch rows x sequence length.
 ///
 /// # Why
-/// By default the input shape floats along BOTH axes: the tokenizer pads to the
-/// longest sequence IN THE BATCH (`PaddingStrategy::BatchLongest`), and
-/// the last batch is also partial. For CPU this does not matter, but compiling
-/// runtimes (MIGraphX and other AOT EPs) compile KERNELS PER SHAPE: every new
-/// shape = a separate compilation (tens of seconds) and a separate cache file (hundreds
-/// of megabytes). Measured on indexing 40 files: 4 shapes, 659 MB of cache.
+/// By default the input shape floats on BOTH axes: the tokenizer pads to the
+/// longest sequence *in the batch* (`PaddingStrategy::BatchLongest`), and the
+/// last batch is usually partial. That is free on CPU, but compiling execution
+/// providers (MIGraphX and other AOT backends) compile *kernels per shape*:
+/// every new shape costs a separate compilation (tens of seconds) and a
+/// separate cache file (hundreds of megabytes). Measured while indexing a
+/// 40-file codebase: 4 distinct shapes, 659 MB of kernel cache.
 ///
-/// With the shape fixed there is exactly one compilation, and the price is the compute spent on
-/// padding rows in the partial last batch.
+/// With the shape pinned there is exactly one compilation; the price is the
+/// padding rows computed in the partial last batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedBatchShape {
-    /// Batch height. Longer inputs are cut into chunks of `rows`; the last
-    /// chunk is padded up to `rows` (the padding is discarded on output).
+    /// Batch height. Inputs are chunked by `rows`, and the last chunk is padded
+    /// up to `rows` (the padding rows are dropped from the output).
     pub rows: usize,
-    /// Sequence length. The tokenizer pads EXACTLY to it, not to
-    /// the longest row in the batch.
+    /// Sequence length. The tokenizer pads to EXACTLY this, not to the longest
+    /// sequence in the batch.
     pub seq_len: usize,
 }
 
@@ -153,8 +168,8 @@ pub struct TextEmbedding {
     pub(crate) need_token_type_ids: bool,
     pub(crate) quantization: QuantizationMode,
     pub(crate) output_key: Option<OutputKey>,
-    /// Fixed input shape, if requested via
-    /// [`TextEmbedding::with_fixed_batch_shape`]. `None` keeps the old behavior
-    /// (the shape floats along both axes).
+    /// The constant input shape, if one was requested through
+    /// [`TextEmbedding::with_fixed_batch_shape`]. `None` keeps the previous
+    /// behaviour (the shape floats on both axes).
     pub(crate) fixed_shape: Option<FixedBatchShape>,
 }

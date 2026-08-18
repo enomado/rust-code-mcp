@@ -3,39 +3,28 @@
 #[cfg(feature = "hf-hub")]
 use crate::common::load_tokenizer_hf_hub;
 use crate::{
+    common::{init_session_builder, load_tokenizer, Error, Result},
+    models::{text_embedding::models_list, ModelTrait},
+    pooling::Pooling,
     Embedding, EmbeddingModel, EmbeddingOutput, ModelInfo, OutputKey, QuantizationMode,
     SingleBatchOutput,
-    common::load_tokenizer,
-    models::{ModelTrait, text_embedding::models_list},
-    pooling::Pooling,
 };
-#[cfg(feature = "hf-hub")]
-use anyhow::Context;
-use anyhow::Result;
 #[cfg(feature = "hf-hub")]
 use hf_hub::api::sync::ApiRepo;
 use ndarray::Array;
-use ort::{
-    session::{Session, builder::GraphOptimizationLevel},
-    value::Value,
-};
+use ort::{session::Session, value::Value};
 #[cfg(feature = "hf-hub")]
 use std::path::PathBuf;
-use std::thread::available_parallelism;
 use tokenizers::{PaddingStrategy, Tokenizer, TruncationParams};
 
 #[cfg(feature = "hf-hub")]
 use super::TextInitOptions;
 use super::{
-    DEFAULT_BATCH_SIZE, FixedBatchShape, InitOptionsUserDefined, TextEmbedding,
-    UserDefinedEmbeddingModel, output,
+    output, FixedBatchShape, InitOptionsUserDefined, TextEmbedding, UserDefinedEmbeddingModel,
+    DEFAULT_BATCH_SIZE,
 };
 
 impl TextEmbedding {
-    fn builder_error(err: ort::Error<ort::session::builder::SessionBuilder>) -> anyhow::Error {
-        anyhow::Error::msg(err.to_string())
-    }
-
     /// Try to generate a new TextEmbedding Instance
     ///
     /// Uses the highest level of Graph optimization
@@ -49,9 +38,9 @@ impl TextEmbedding {
             execution_providers,
             cache_dir,
             show_download_progress,
+            intra_threads,
             profiling_file,
         } = options;
-        let threads = available_parallelism()?.get();
 
         let model_repo = TextEmbedding::retrieve_model(
             model_name.clone(),
@@ -61,53 +50,28 @@ impl TextEmbedding {
 
         let model_info = TextEmbedding::get_model_info(&model_name)?;
         let model_file_name = &model_info.model_file;
-        let model_file_reference = model_repo
-            .get(model_file_name)
-            .context(format!("Failed to retrieve {}", model_file_name))?;
+        let model_file_reference =
+            model_repo
+                .get(model_file_name)
+                .map_err(|e| Error::ModelRetrieval {
+                    file: model_file_name.clone(),
+                    source: Box::new(e),
+                })?;
 
         if !model_info.additional_files.is_empty() {
             for file in &model_info.additional_files {
-                model_repo
-                    .get(file)
-                    .context(format!("Failed to retrieve {}", file))?;
+                model_repo.get(file).map_err(|e| Error::ModelRetrieval {
+                    file: file.clone(),
+                    source: Box::new(e),
+                })?;
             }
         }
 
         // prioritise loading pooling config if available, if not (thanks qdrant!), look for it in hardcoded
         let post_processing = TextEmbedding::get_default_pooling_method(&model_name);
 
-        #[cfg(feature = "directml")]
-        let has_directml = execution_providers
-            .iter()
-            .any(|ep| ep.downcast_ref::<ort::ep::DirectML>().is_some());
-        #[cfg(not(feature = "directml"))]
-        let has_directml = false;
-
-        let mut builder = Session::builder()?
-            .with_execution_providers(execution_providers)
-            .map_err(Self::builder_error)?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(Self::builder_error)?
-            .with_intra_threads(threads)
-            .map_err(Self::builder_error)?;
-
-        if has_directml {
-            builder = builder
-                .with_memory_pattern(false)
-                .map_err(Self::builder_error)?
-                .with_parallel_execution(false)
-                .map_err(Self::builder_error)?;
-        }
-
-        // Profiling can be enabled ONLY when the session is built: after `commit_*`
-        // there is no switch left, so the path has to be carried through the options.
-        if let Some(profiling_file) = profiling_file {
-            builder = builder
-                .with_profiling(profiling_file)
-                .map_err(Self::builder_error)?;
-        }
-
-        let session = builder.commit_from_file(model_file_reference)?;
+        let session = init_session_builder(execution_providers, intra_threads, profiling_file)?
+            .commit_from_file(model_file_reference)?;
 
         let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
         Ok(Self::new(
@@ -129,33 +93,14 @@ impl TextEmbedding {
         let InitOptionsUserDefined {
             execution_providers,
             max_length,
+            intra_threads,
         } = options;
 
-        let threads = available_parallelism()?.get();
-
-        #[cfg(feature = "directml")]
-        let has_directml = execution_providers
-            .iter()
-            .any(|ep| ep.downcast_ref::<ort::ep::DirectML>().is_some());
-        #[cfg(not(feature = "directml"))]
-        let has_directml = false;
-
         let session = {
-            let mut session_builder = Session::builder()?
-                .with_execution_providers(execution_providers)
-                .map_err(Self::builder_error)?
-                .with_optimization_level(GraphOptimizationLevel::Level3)
-                .map_err(Self::builder_error)?
-                .with_intra_threads(threads)
-                .map_err(Self::builder_error)?;
-
-            if has_directml {
-                session_builder = session_builder
-                    .with_memory_pattern(false)
-                    .map_err(Self::builder_error)?
-                    .with_parallel_execution(false)
-                    .map_err(Self::builder_error)?;
-            }
+            let builder_error = |err: ort::Error<ort::session::builder::SessionBuilder>| {
+                Error::OrtBuilder(err.to_string())
+            };
+            let mut session_builder = init_session_builder(execution_providers, intra_threads, None)?;
 
             for external_initializer_file in model.external_initializers {
                 session_builder = session_builder
@@ -163,7 +108,7 @@ impl TextEmbedding {
                         external_initializer_file.file_name,
                         external_initializer_file.buffer.into(),
                     )
-                    .map_err(Self::builder_error)?;
+                    .map_err(builder_error)?;
             }
 
             session_builder.commit_from_memory(&model.onnx_file)?
@@ -203,62 +148,76 @@ impl TextEmbedding {
         }
     }
 
-    /// Fix the model input shape: `shape.rows` × `shape.seq_len`.
+    /// Pin the model input shape to `shape.rows` x `shape.seq_len`.
     ///
-    /// Changes two things: the tokenizer pads EXACTLY to `seq_len` (instead of to the
-    /// longest row in the batch), and a partial last batch is padded up to
-    /// `rows` rows. None of this is visible outside: the padding is cut off by
-    /// [`SingleBatchOutput::real_rows`], and each input text gets
-    /// exactly one embedding.
+    /// Two things change: the tokenizer pads to EXACTLY `seq_len` (instead of
+    /// "the longest sequence in the batch"), and a partial last batch is padded
+    /// up to `rows` rows. None of this is visible to the caller — the padding
+    /// rows are dropped through [`SingleBatchOutput::real_rows`], so there is
+    /// still exactly one embedding per input text.
     ///
     /// # When this is needed
-    /// For compiling execution providers (MIGraphX and kin): they compile
-    /// kernels PER SHAPE, and every new shape costs tens of seconds and hundreds
-    /// of megabytes of cache. On CPU there is no point: the shape is free there, and padding just
-    /// burns cycles.
+    /// Compiling execution providers (MIGraphX and friends) compile kernels per
+    /// input shape, and every new shape costs tens of seconds and hundreds of
+    /// megabytes of on-disk cache. On CPU there is nothing to win — the shape is
+    /// free there, and the padding rows would just burn cycles.
     ///
-    /// # Refusals
-    /// - `QuantizationMode::Dynamic`: dynamic quantization fits the
-    ///   range to EACH batch, so batching is forbidden there altogether;
-    ///   there is no batch height to fix.
-    /// - `seq_len` above the tokenizer truncation limit: a row longer than the limit
-    ///   gets truncated anyway, and the promised shape cannot be achieved.
+    /// # Errors
+    /// - [`QuantizationMode::Dynamic`] — dynamic quantization refits the data
+    ///   range per batch, which is why batching is disallowed for such models in
+    ///   the first place; there is no batch height to pin.
+    /// - `seq_len` above the tokenizer truncation limit: a longer sequence would
+    ///   be truncated anyway, so the promised shape would not be delivered.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use fastembed::{FixedBatchShape, TextEmbedding};
+    /// # fn main() -> fastembed::Result<()> {
+    /// let model = TextEmbedding::try_new(Default::default())?
+    ///     .with_fixed_batch_shape(FixedBatchShape { rows: 32, seq_len: 512 })?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn with_fixed_batch_shape(mut self, shape: FixedBatchShape) -> Result<Self> {
         if shape.rows == 0 || shape.seq_len == 0 {
-            return Err(anyhow::Error::msg(
-                "Fixed batch shape requires non-zero rows and seq_len.",
+            return Err(Error::InvalidArgument(
+                "Fixed batch shape requires non-zero rows and seq_len.".into(),
             ));
         }
         if self.quantization == QuantizationMode::Dynamic {
-            return Err(anyhow::Error::msg(
+            return Err(Error::InvalidArgument(
                 "Fixed batch shape cannot be used with dynamic quantization: \
                  the data range is refitted per batch, so batching is disallowed \
-                 for such models in the first place.",
+                 for such models in the first place."
+                    .into(),
             ));
         }
 
-        // Truncation: the shape is achievable only if the tokenizer emits no rows
-        // longer than seq_len. The limit is set by `load_tokenizer` (max_length, clamped
-        // to the model's model_max_length), so here we do not raise it but
-        // CHECK it; otherwise we would silently get a shape larger than the model supports.
+        // Truncation: the shape is only reachable if the tokenizer never emits a
+        // sequence longer than `seq_len`. The limit is set by `load_tokenizer`
+        // (max_length, clamped to the model's model_max_length), so we CHECK it
+        // here rather than raise it — otherwise we would silently promise a shape
+        // wider than the model can take.
         let truncation_limit = self
             .tokenizer
             .get_truncation()
             .map(|params| params.max_length)
             .ok_or_else(|| {
-                anyhow::Error::msg(
-                    "Tokenizer has no truncation params; cannot fix the input shape.",
+                Error::TokenizerConfig(
+                    "Tokenizer has no truncation params; cannot fix the input shape.".into(),
                 )
             })?;
         if shape.seq_len > truncation_limit {
-            return Err(anyhow::Error::msg(format!(
-                "Fixed seq_len {} exceeds the tokenizer truncation limit {}.",
-                shape.seq_len, truncation_limit
+            return Err(Error::InvalidArgument(format!(
+                "Fixed seq_len {} exceeds the tokenizer truncation limit {truncation_limit}.",
+                shape.seq_len
             )));
         }
 
         let mut padding = self.tokenizer.get_padding().cloned().ok_or_else(|| {
-            anyhow::Error::msg("Tokenizer has no padding params; cannot fix the input shape.")
+            Error::TokenizerConfig(
+                "Tokenizer has no padding params; cannot fix the input shape.".into(),
+            )
         })?;
         padding.strategy = PaddingStrategy::Fixed(shape.seq_len);
         self.tokenizer.with_padding(Some(padding));
@@ -267,13 +226,13 @@ impl TextEmbedding {
                 max_length: shape.seq_len,
                 ..Default::default()
             }))
-            .map_err(anyhow::Error::msg)?;
+            .map_err(|e| Error::TokenizerConfig(e.to_string()))?;
 
         self.fixed_shape = Some(shape);
         Ok(self)
     }
 
-    /// Fixed input shape, if one is set.
+    /// The constant input shape, if one is pinned.
     pub fn fixed_batch_shape(&self) -> Option<FixedBatchShape> {
         self.fixed_shape
     }
@@ -283,7 +242,7 @@ impl TextEmbedding {
         model: EmbeddingModel,
         cache_dir: PathBuf,
         show_download_progress: bool,
-    ) -> anyhow::Result<ApiRepo> {
+    ) -> Result<ApiRepo> {
         use crate::common::pull_from_hf;
 
         let model_code = TextEmbedding::get_model_info(&model)?.model_code.clone();
@@ -336,6 +295,8 @@ impl TextEmbedding {
             EmbeddingModel::JinaEmbeddingsV2BaseEN => Some(Pooling::Mean),
 
             EmbeddingModel::EmbeddingGemma300M => Some(Pooling::Mean),
+            EmbeddingModel::EmbeddingGemma300MQ4 => Some(Pooling::Mean),
+            EmbeddingModel::EmbeddingGemma300MQ => Some(Pooling::Mean),
 
             EmbeddingModel::SnowflakeArcticEmbedXS => Some(Pooling::Cls),
             EmbeddingModel::SnowflakeArcticEmbedXSQ => Some(Pooling::Cls),
@@ -380,7 +341,38 @@ impl TextEmbedding {
             EmbeddingModel::SnowflakeArcticEmbedMQ => QuantizationMode::Dynamic,
             EmbeddingModel::SnowflakeArcticEmbedMLongQ => QuantizationMode::Dynamic,
             EmbeddingModel::SnowflakeArcticEmbedLQ => QuantizationMode::Dynamic,
-            _ => QuantizationMode::None,
+            EmbeddingModel::EmbeddingGemma300MQ => QuantizationMode::Dynamic,
+            // 4-bit static quantization: batching-safe, so not Dynamic
+            EmbeddingModel::EmbeddingGemma300MQ4 => QuantizationMode::None,
+            EmbeddingModel::AllMiniLML6V2
+            | EmbeddingModel::AllMiniLML12V2
+            | EmbeddingModel::AllMpnetBaseV2
+            | EmbeddingModel::BGEBaseENV15
+            | EmbeddingModel::BGELargeENV15
+            | EmbeddingModel::BGESmallENV15
+            | EmbeddingModel::BGESmallZHV15
+            | EmbeddingModel::BGELargeZHV15
+            | EmbeddingModel::BGEM3
+            | EmbeddingModel::NomicEmbedTextV1
+            | EmbeddingModel::NomicEmbedTextV15
+            | EmbeddingModel::ParaphraseMLMiniLML12V2
+            | EmbeddingModel::ParaphraseMLMpnetBaseV2
+            | EmbeddingModel::ModernBertEmbedLarge
+            | EmbeddingModel::MultilingualE5Small
+            | EmbeddingModel::MultilingualE5Base
+            | EmbeddingModel::MultilingualE5Large
+            | EmbeddingModel::MxbaiEmbedLargeV1
+            | EmbeddingModel::GTEBaseENV15
+            | EmbeddingModel::GTELargeENV15
+            | EmbeddingModel::ClipVitB32
+            | EmbeddingModel::JinaEmbeddingsV2BaseCode
+            | EmbeddingModel::JinaEmbeddingsV2BaseEN
+            | EmbeddingModel::EmbeddingGemma300M
+            | EmbeddingModel::SnowflakeArcticEmbedXS
+            | EmbeddingModel::SnowflakeArcticEmbedS
+            | EmbeddingModel::SnowflakeArcticEmbedM
+            | EmbeddingModel::SnowflakeArcticEmbedMLong
+            | EmbeddingModel::SnowflakeArcticEmbedL => QuantizationMode::None,
         }
     }
 
@@ -392,7 +384,7 @@ impl TextEmbedding {
     /// Get ModelInfo from EmbeddingModel
     pub fn get_model_info(model: &EmbeddingModel) -> Result<&ModelInfo<EmbeddingModel>> {
         EmbeddingModel::get_model_info(model).ok_or_else(|| {
-            anyhow::Error::msg(format!(
+            Error::InvalidArgument(format!(
                 "Model {model:?} not found. Please check if the model is supported \
                 by the current version."
             ))
@@ -433,12 +425,13 @@ impl TextEmbedding {
             QuantizationMode::Dynamic => {
                 if let Some(batch_size) = batch_size {
                     if batch_size < texts.len() {
-                        Err(anyhow::Error::msg(
+                        Err(Error::InvalidArgument(
                             "Dynamic quantization cannot be used with batching. \
                             This is due to the dynamic quantization process adjusting \
                             the data range to fit each batch, making the embeddings \
                             incompatible across batches. Try specifying a batch size \
-                            of `None`, or use a model with static or no quantization.",
+                            of `None`, or use a model with static or no quantization."
+                                .into(),
                         ))
                     } else {
                         Ok(texts.len())
@@ -449,11 +442,17 @@ impl TextEmbedding {
             }
             _ => Ok(batch_size.unwrap_or(DEFAULT_BATCH_SIZE)),
         }?;
+        if batch_size == 0 {
+            return Err(Error::InvalidArgument(
+                "batch_size must be greater than 0".into(),
+            ));
+        }
 
-        // A fixed input shape dictates the batch height: chunks must be cut EXACTLY at
-        // `rows`, otherwise padding will not help, since chunks would still arrive with different
-        // heights. The batch_size requested by the caller is deliberately ignored
-        // here: the shape is a property of the model, not of an individual call.
+        // A constant input shape dictates the batch height: the chunks have to be
+        // cut by `rows` exactly, otherwise padding would not help — the chunks
+        // would still arrive with different heights. The caller-supplied
+        // batch_size is deliberately ignored here: the shape is a property of the
+        // model, not of an individual call.
         let fixed_shape = self.fixed_shape;
         let batch_size = fixed_shape.map_or(batch_size, |shape| shape.rows);
 
@@ -462,33 +461,32 @@ impl TextEmbedding {
             .map(|batch| {
                 // Encode the texts in the batch
                 let inputs = batch.iter().map(|text| text.as_ref()).collect();
-                let encodings = self.tokenizer.encode_batch(inputs, true).map_err(|e| {
-                    anyhow::Error::msg(e.to_string()).context("Failed to encode the batch.")
-                })?;
+                let encodings = self
+                    .tokenizer
+                    .encode_batch(inputs, true)
+                    .map_err(|e| Error::Tokenization(format!("Failed to encode the batch: {e}")))?;
 
                 // Extract the encoding length and batch size
-                let encoding_length = encodings
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("Tokenizer returned empty encodings"))?
-                    .len();
+                let encoding_length = encodings.first().ok_or(Error::EmptyTokenizations)?.len();
                 let real_rows = batch.len();
-                // Tensor height: with a fixed shape always `rows`, otherwise
-                // as many as there are texts in the chunk.
+                // Tensor height: always `rows` under a constant shape, otherwise
+                // as many rows as there are texts in the chunk.
                 let batch_size = fixed_shape.map_or(real_rows, |shape| shape.rows);
 
-                // Shape oracle: the sequence length must be exactly
-                // what `with_fixed_batch_shape` promised. If
-                // the tokenizer returned a different one (someone changed the padding strategy
-                // from outside; the `tokenizer` field is public), better to fail here than
-                // pay for compiling kernels for an unexpected shape.
+                // Shape oracle: the sequence length must be exactly what
+                // `with_fixed_batch_shape` promised. If the tokenizer produced a
+                // different one (the `tokenizer` field is public, so the padding
+                // strategy could have been changed from the outside), failing here
+                // is better than paying for a kernel compilation of an unexpected
+                // shape.
                 if let Some(shape) = fixed_shape {
                     if encoding_length != shape.seq_len {
-                        return Err(anyhow::anyhow!(
+                        return Err(Error::InvalidShape(format!(
                             "Fixed batch shape promised seq_len {}, but the tokenizer \
-                             produced {}; padding strategy was changed externally.",
-                            shape.seq_len,
-                            encoding_length
-                        ));
+                             produced {encoding_length}; the padding strategy was \
+                             changed externally.",
+                            shape.seq_len
+                        )));
                     }
                 }
 
@@ -509,25 +507,27 @@ impl TextEmbedding {
                     type_ids_array.extend(type_ids.iter().map(|x| *x as i64));
                 });
 
-                // Pad a partial chunk up to the fixed height. A padding row is
-                // a COPY of the last real row, not zeros: the copy has a non-empty
-                // attention mask, so mean pooling over it does not divide by zero.
-                // Its embedding is discarded via `real_rows` anyway.
+                // Pad the partial chunk up to the constant height. A padding row
+                // is a COPY of the last real row rather than zeros: a copy has a
+                // non-empty attention mask, so mean pooling over it does not
+                // divide by zero. Its embedding is dropped through `real_rows`
+                // anyway.
                 for _ in real_rows..batch_size {
-                    let last = encodings
-                        .last()
-                        .ok_or_else(|| anyhow::anyhow!("Tokenizer returned empty encodings"))?;
+                    let last = encodings.last().ok_or(Error::EmptyTokenizations)?;
                     ids_array.extend(last.get_ids().iter().map(|x| *x as i64));
                     mask_array.extend(last.get_attention_mask().iter().map(|x| *x as i64));
                     type_ids_array.extend(last.get_type_ids().iter().map(|x| *x as i64));
                 }
 
                 let inputs_ids_array =
-                    Array::from_shape_vec((batch_size, encoding_length), ids_array)?;
+                    Array::from_shape_vec((batch_size, encoding_length), ids_array)
+                        .map_err(|e| Error::InvalidShape(e.to_string()))?;
                 let attention_mask_array =
-                    Array::from_shape_vec((batch_size, encoding_length), mask_array)?;
+                    Array::from_shape_vec((batch_size, encoding_length), mask_array)
+                        .map_err(|e| Error::InvalidShape(e.to_string()))?;
                 let token_type_ids_array =
-                    Array::from_shape_vec((batch_size, encoding_length), type_ids_array)?;
+                    Array::from_shape_vec((batch_size, encoding_length), type_ids_array)
+                        .map_err(|e| Error::InvalidShape(e.to_string()))?;
 
                 let mut session_inputs = ort::inputs![
                     "input_ids" => Value::from_array(inputs_ids_array)?,
@@ -544,7 +544,7 @@ impl TextEmbedding {
                 let outputs_map = self
                     .session
                     .run(session_inputs)
-                    .map_err(anyhow::Error::new)?
+                    .map_err(|e| Error::OrtSession(e.to_string()))?
                     .into_iter()
                     .map(|(k, v)| (k.to_string(), v))
                     .collect();
@@ -590,6 +590,19 @@ impl TextEmbedding {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantized_variants_have_explicit_pooling() {
+        for variant in crate::models::text_embedding::all_variants() {
+            let _ = TextEmbedding::get_default_pooling_method(&variant);
+            let _ = TextEmbedding::get_quantization_mode(&variant);
+        }
+    }
+}
+
 impl TextEmbedding {
     /// Close the ONNX Runtime profile and return the FULL name of the written file.
     ///
@@ -599,7 +612,7 @@ impl TextEmbedding {
     ///
     /// Errors if profiling was not requested at initialization
     /// (see [`crate::InitOptionsWithLength::with_profiling`]).
-    pub fn end_profiling(&mut self) -> anyhow::Result<String> {
+    pub fn end_profiling(&mut self) -> crate::common::Result<String> {
         Ok(self.session.end_profiling()?)
     }
 }
