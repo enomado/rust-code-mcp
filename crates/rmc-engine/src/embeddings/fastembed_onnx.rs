@@ -5,6 +5,7 @@
 //! GPU-EP ничего не знает и знать не должен — он принимает EP снаружи.
 
 use crate::embeddings::backend::{EmbeddingBackend, EmbeddingRuntime};
+use crate::embeddings::ep_census::ProviderCensus;
 use crate::embeddings::profile::FastembedOnnxModel;
 use crate::embeddings::{Embedding, EmbeddingError};
 use fastembed::{EmbeddingModel, FixedBatchShape, TextEmbedding, TextInitOptions};
@@ -46,8 +47,7 @@ impl FastembedOnnxEmbedder {
     ///
     /// `prefix` — префикс имени файла; ORT дописывает к нему отметку времени,
     /// фактический путь возвращает [`Self::end_profiling`].
-    #[cfg(test)]
-    pub(super) fn new_profiled(
+    fn new_profiled(
         backend: &EmbeddingBackend,
         prefix: &std::path::Path,
     ) -> Result<Self, EmbeddingError> {
@@ -55,8 +55,7 @@ impl FastembedOnnxEmbedder {
     }
 
     /// Закрыть профиль ORT и вернуть путь записанного файла.
-    #[cfg(test)]
-    pub(super) fn end_profiling(&self) -> Result<std::path::PathBuf, EmbeddingError> {
+    fn end_profiling(&self) -> Result<std::path::PathBuf, EmbeddingError> {
         let mut model = self.inner.lock().unwrap();
         model
             .end_profiling()
@@ -142,6 +141,60 @@ impl FastembedOnnxEmbedder {
         let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
         self.embed_documents(&refs)
     }
+}
+
+/// Корпус пробы переписи EP.
+///
+/// Тексты РАЗНОЙ длины намеренно: на них плавающая форма и постоянная дают
+/// разный паддинг, то есть проба идёт тем же путём через модель, что и рабочий
+/// прогон, а не вырожденным.
+const CENSUS_PROBE_CORPUS: [&str; 4] = [
+    "fn main() {}",
+    "pub struct WorkspaceLockRegistry { global: Arc<Mutex<()>> }",
+    "impl Iterator for Chunks { type Item = CodeChunk; fn next(&mut self) -> Option<Self::Item> { self.inner.next() } }",
+    "async fn index_codebase(params: IndexCodebaseParams, sync: Option<&Arc<SyncManager>>) -> Result<CallToolResult, McpError>",
+];
+
+/// Один профилированный прогон эмбеддера + перепись «узлов по провайдерам».
+///
+/// # Зачем это в проде, а не только в тестах
+/// Тест с переписью гейтит МАШИНУ, на которой его запустили и не забыли
+/// запустить. Вопрос «а на этой машине граф правда ушёл на GPU» задаётся у
+/// живого сервера, где ни фича сборки, ни системный ORT, ни версия драйвера не
+/// те, что были у теста. Поэтому та же перепись доступна как рантайм-проба.
+///
+/// # Цена
+/// Проба поднимает ОТДЕЛЬНУЮ сессию (профилирование нельзя включить после
+/// сборки сессии), то есть повторно грузит модель, а на холодном кэше ядер
+/// платит и компиляцию MIGraphX (45–70 с). Отсюда она и вызывается только по
+/// явной ручке, а не при каждом старте.
+///
+/// Профиль ORT — временный файл: он нужен ровно на время разбора, и оставлять
+/// на диске сотни мегабайт JSON после каждой пробы незачем. Каталог удаляется
+/// и при отказе разбора тоже.
+pub(super) fn probe_provider_census(
+    backend: &EmbeddingBackend,
+) -> Result<ProviderCensus, EmbeddingError> {
+    // Имя каталога — по pid: два сервера на одной машине не должны делить
+    // каталог профиля, иначе перепись одного увидит файлы другого.
+    let dir = std::env::temp_dir().join(format!("rmc-ep-census-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        EmbeddingError::model_init(format!(
+            "cannot create ORT profile directory at {}: {e}",
+            dir.display()
+        ))
+    })?;
+
+    let census = (|| {
+        let embedder = FastembedOnnxEmbedder::new_profiled(backend, &dir.join("census"))?;
+        // Перепись обязана считаться по РАБОТЕ сессии: до первого прогона
+        // профиль пуст, и «ноль узлов на GPU» значил бы «не смотрели».
+        embedder.embed_documents(&CENSUS_PROBE_CORPUS)?;
+        ProviderCensus::from_profile_file(&embedder.end_profiling()?)
+    })();
+
+    let _ = std::fs::remove_dir_all(&dir);
+    census
 }
 
 fn to_fastembed_model(model: FastembedOnnxModel) -> EmbeddingModel {
@@ -417,24 +470,15 @@ mod tests {
     #[test]
     #[ignore = "нужны AMD-карта, ORT с MIGraphX и скачанная модель"]
     fn migraphx_ep_actually_runs_the_graph() {
-        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP, ProviderCensus};
+        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP};
 
         let _guard = model_guard();
-        let dir = tempfile::tempdir().unwrap();
         let backend = EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
 
-        let embedder =
-            FastembedOnnxEmbedder::new_profiled(&backend, &dir.path().join("migraphx")).unwrap();
-
-        // Профиль пуст, пока не было ни одного прогона: перепись должна
-        // считаться по РАБОТЕ сессии, а не по факту её создания.
-        let texts = corpus();
-        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let embeddings = embedder.embed_documents(&refs).unwrap();
-        assert_eq!(embeddings.len(), refs.len());
-
-        let profile = embedder.end_profiling().unwrap();
-        let census = ProviderCensus::from_profile_file(&profile).unwrap();
+        // Гейт зовёт РОВНО ту пробу, что зовёт сервер по своей ручке: иначе он
+        // проверял бы собственную копию пути, а рантайм-диагностика оставалась
+        // бы негейтнутой.
+        let census = probe_provider_census(&backend).unwrap();
         eprintln!("узлы по провайдерам: {census}");
 
         assert!(
@@ -463,19 +507,12 @@ mod tests {
     #[test]
     #[ignore = "качает модель с HF и считает forward на CPU"]
     fn census_on_cpu_profile_sees_no_migraphx() {
-        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP, ProviderCensus};
+        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP};
 
         let _guard = model_guard();
-        let dir = tempfile::tempdir().unwrap();
         let backend = EmbeddingBackend::from_profile_name("local-cpu-small").unwrap();
 
-        let embedder =
-            FastembedOnnxEmbedder::new_profiled(&backend, &dir.path().join("cpu")).unwrap();
-        let texts = corpus();
-        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        embedder.embed_documents(&refs).unwrap();
-
-        let census = ProviderCensus::from_profile_file(&embedder.end_profiling().unwrap()).unwrap();
+        let census = probe_provider_census(&backend).unwrap();
         eprintln!("узлы по провайдерам (CPU-профиль): {census}");
         assert_eq!(census.nodes_on(MIGRAPHX_EP), 0);
         assert!(census.nodes_on(CPU_EP) > 0, "{census}");

@@ -5,8 +5,9 @@
 #![recursion_limit = "512"]
 
 use rmc_server::mcp::{
-    automatic_embedding_profile_name, cuda_capable_features_compiled,
-    parse_background_sync_env, ServerRuntime, BACKGROUND_SYNC_ENABLED_VALUES, BACKGROUND_SYNC_ENV,
+    BACKGROUND_SYNC_ENABLED_VALUES, BACKGROUND_SYNC_ENV, EP_CENSUS_ENV, ServerRuntime,
+    automatic_embedding_profile_name, cuda_capable_features_compiled, parse_background_sync_env,
+    probe_ep_census_on_startup,
 };
 use rmc_server::tools::SearchTool;
 use rmcp::{ServiceExt, transport::stdio};
@@ -23,8 +24,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // socket-stderr write pipeline becomes the bottleneck — `build_hypergraph`
     // on a multi-crate workspace went from ~7s to 7+ minutes purely from log
     // formatting overhead. Keep this at WARN unless explicitly overridden.
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,rust_code_mcp=info,rmc_server=info,rmc_indexing=info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("warn,rust_code_mcp=info,rmc_server=info,rmc_indexing=info")
+    });
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
@@ -41,13 +43,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let background_sync_enabled = parse_background_sync_env(background_sync_env.as_deref());
     tracing::info!(
         "MCP startup defaults: background sync {} ({}='{}'; enabled only for {}, case-insensitive); automatic/background embedding profile default {}; CUDA-capable features compiled: {}",
-        if background_sync_enabled { "enabled" } else { "disabled" },
+        if background_sync_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
         BACKGROUND_SYNC_ENV,
         background_sync_env.as_deref().unwrap_or("<unset>"),
         BACKGROUND_SYNC_ENABLED_VALUES,
         automatic_embedding_profile_name(),
         cuda_capable_features_compiled(),
     );
+
+    // Проба «на чём реально считается граф» — по ручке RMC_EP_CENSUS.
+    //
+    // Блокирующая и делается ДО того, как поднят сервис: пока никто не
+    // обслуживается, занять поток тут ничем не мешает, а вот получить ответ
+    // после первого запроса было бы поздно.
+    //
+    // Отказ пробы валит старт намеренно: ручку взводят, чтобы узнать, работает
+    // ли GPU, и «сервер поехал, но на CPU» — ровно тот исход, который она
+    // обязана не пропустить (подробности у probe_ep_census_on_startup).
+    match probe_ep_census_on_startup() {
+        Ok(Some(census)) => tracing::info!("EP census on startup: {census}"),
+        Ok(None) => tracing::info!(
+            "EP census probe skipped; set {}=1 to check which provider runs the graph",
+            EP_CENSUS_ENV
+        ),
+        Err(e) => {
+            tracing::error!("{e}");
+            let shutdown = runtime.shutdown_gracefully(Duration::from_secs(10)).await;
+            tracing::info!("Runtime shutdown after EP census failure: {:?}", shutdown);
+            return Err(e.into());
+        }
+    }
 
     if background_sync_enabled {
         runtime.start_background_sync();
@@ -59,7 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let service = match SearchTool::with_server_runtime(&runtime).serve(stdio()).await {
+    let service = match SearchTool::with_server_runtime(&runtime)
+        .serve(stdio())
+        .await
+    {
         Ok(service) => service,
         Err(e) => {
             tracing::error!("serving error: {:?}", e);

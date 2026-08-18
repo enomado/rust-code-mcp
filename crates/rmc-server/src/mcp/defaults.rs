@@ -1,10 +1,23 @@
 //! Operational defaults for MCP server startup and automatic work.
 
-use rmc_engine::embeddings::{EmbeddingBackend, EmbeddingRuntime};
+use rmc_engine::embeddings::{
+    CPU_EP, EmbeddingBackend, EmbeddingRuntime, MIGRAPHX_EP, ProviderCensus, probe_provider_census,
+};
 use std::sync::OnceLock;
 
 pub const BACKGROUND_SYNC_ENV: &str = "RMC_BACKGROUND_SYNC";
+
 pub const BACKGROUND_SYNC_ENABLED_VALUES: &str = "1/true/yes/on";
+
+/// Ручка стартовой пробы «граф реально считается на execution provider'е»:
+/// `RMC_EP_CENSUS=1`.
+///
+/// # Почему по ручке, а не всегда
+/// Проба поднимает ОТДЕЛЬНУЮ сессию с профилированием (включить его после
+/// сборки сессии нельзя), то есть повторно грузит модель, а на холодном кэше
+/// ядер платит ещё и компиляцию MIGraphX (45–70 с). Платить это каждым стартом
+/// сервера ради диагностики незачем.
+pub const EP_CENSUS_ENV: &str = "RMC_EP_CENSUS";
 
 /// Профиль, которым сервер считает эмбеддинги, когда вызывающий не назвал свой.
 ///
@@ -20,7 +33,12 @@ pub const DEFAULT_AUTOMATIC_EMBEDDING_PROFILE: &str = "local-cpu-small";
 /// профиля означает ДРУГОЙ индекс, который надо построить заново.
 pub const EMBEDDING_PROFILE_ENV: &str = "RMC_EMBEDDING_PROFILE";
 
-pub fn parse_background_sync_env(value: Option<&str>) -> bool {
+/// Разбор булевой ручки окружения: включено только явным словом из
+/// [`BACKGROUND_SYNC_ENABLED_VALUES`].
+///
+/// Общий на все такие ручки намеренно: две переменные, включающиеся РАЗНЫМИ
+/// словами, — источник «я же выставил, а не работает».
+pub fn parse_enabled_env(value: Option<&str>) -> bool {
     let Some(value) = value else {
         return false;
     };
@@ -29,6 +47,10 @@ pub fn parse_background_sync_env(value: Option<&str>) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+pub fn parse_background_sync_env(value: Option<&str>) -> bool {
+    parse_enabled_env(value)
 }
 
 /// Имя профиля по умолчанию: из [`EMBEDDING_PROFILE_ENV`], иначе
@@ -74,6 +96,66 @@ pub(crate) fn resolve_automatic_profile_name(env_value: Option<&str>) -> String 
 pub(crate) fn automatic_embedding_backend() -> EmbeddingBackend {
     EmbeddingBackend::from_profile_name(automatic_embedding_profile_name())
         .expect("automatic embedding profile is validated on first read")
+}
+
+/// Стартовая проба EP, если её попросили через [`EP_CENSUS_ENV`].
+///
+/// Возвращает `Ok(None)`, когда ручка не взведена, и `Ok(Some(census))` —
+/// перепись узлов по провайдерам, уже записанную в лог.
+///
+/// # Почему отказ, а не предупреждение
+/// Ручку взводят с одним вопросом: «GPU правда работает?». Класс, ради
+/// которого весь этот слой существует — EP поднялся, но граф посчитан на CPU —
+/// проявляется ТОЛЬКО скоростью, то есть предупреждение в логе стартующего
+/// сервера его не ловит: сервер поедет, и «GPU включён» останется ложным
+/// выводом. Поэтому на GPU-профиле нулевая перепись MIGraphX — ошибка старта:
+/// вердикт машинно-читаем (код возврата), а не «видно на экране».
+///
+/// На CPU-профиле проба ничего не утверждает — только печатает перепись:
+/// «сколько узлов на CPU» это не отказ, а факт.
+pub fn probe_ep_census_on_startup() -> Result<Option<String>, String> {
+    if !parse_enabled_env(std::env::var(EP_CENSUS_ENV).ok().as_deref()) {
+        return Ok(None);
+    }
+
+    let backend = automatic_embedding_backend();
+    let profile = backend.profile.name();
+    tracing::info!(
+        profile,
+        "{EP_CENSUS_ENV} is set: probing which execution provider actually runs the graph \
+         (loads the model once more; a cold MIGraphX kernel cache costs 45-70s)"
+    );
+
+    let census = probe_provider_census(&backend)
+        .map_err(|e| format!("EP census probe failed for profile `{profile}`: {e}"))?;
+    tracing::info!(profile, census = %census, "EP census");
+
+    ep_census_verdict(backend.runtime, profile, &census)?;
+    Ok(Some(census.to_string()))
+}
+
+/// Вердикт по переписи: приемлема ли она для профиля, который просили.
+///
+/// Отделено от пробы намеренно: сама проба требует карты, ORT с MIGraphX и
+/// скачанной модели, то есть проверяется только на подходящей машине. Решение
+/// же «это отказ или норма» — чистая функция, и гейтится обычной суитой.
+pub(crate) fn ep_census_verdict(
+    runtime: EmbeddingRuntime,
+    profile: &str,
+    census: &ProviderCensus,
+) -> Result<(), String> {
+    // Утверждение НЕ про долю: MIGraphX не берёт узлы поштучно, он вырезает
+    // подграф и подставляет ОДИН фьюженный узел — на здоровом GPU-пути перепись
+    // выглядит как `MIGraphXExecutionProvider=1`. Поэтому порог тут ровно один:
+    // фьюженный узел есть или его нет.
+    if runtime == EmbeddingRuntime::LocalFastembedOnnxMigraphx && census.nodes_on(MIGRAPHX_EP) == 0
+    {
+        return Err(format!(
+            "profile `{profile}` asks for MIGraphX, but not a single graph node ran on it \
+             (census: {census}) — the graph silently fell back to CPU"
+        ));
+    }
+    Ok(())
 }
 
 pub fn cuda_capable_features_compiled() -> bool {
@@ -151,5 +233,91 @@ mod tests {
             EmbeddingBackend::from_profile_name(&requested).is_err(),
             "a typo in the profile name must not resolve"
         );
+    }
+
+    /// Профиль ORT в той форме, в какой его пишет рантайм: у узла три события.
+    fn profile_json(nodes: &[(&str, &str)]) -> String {
+        let events: Vec<serde_json::Value> = nodes
+            .iter()
+            .flat_map(|(name, provider)| {
+                ["_fence_before", "_kernel_time", "_fence_after"]
+                    .into_iter()
+                    .map(move |phase| {
+                        serde_json::json!({
+                            "cat": "Node",
+                            "name": format!("{name}{phase}"),
+                            "dur": 7,
+                            "args": {"provider": provider},
+                        })
+                    })
+            })
+            .collect();
+        serde_json::Value::Array(events).to_string()
+    }
+
+    /// Здоровый GPU-путь: ОДИН фьюженный узел MIGraphX и ничего на CPU.
+    #[test]
+    fn ep_verdict_accepts_a_fused_migraphx_node() {
+        let census =
+            ProviderCensus::from_profile_json(&profile_json(&[("MIGraphX_0", MIGRAPHX_EP)]))
+                .unwrap();
+
+        assert!(
+            ep_census_verdict(
+                EmbeddingRuntime::LocalFastembedOnnxMigraphx,
+                "local-gpu-bge",
+                &census
+            )
+            .is_ok()
+        );
+    }
+
+    /// Тот самый класс, ради которого ручка заведена: EP зарегистрировался, а
+    /// граф посчитан на CPU. Ошибок при этом нет НИ ОДНОЙ — только скорость.
+    #[test]
+    fn ep_verdict_rejects_a_silent_cpu_fallback() {
+        let census = ProviderCensus::from_profile_json(&profile_json(&[
+            ("Add_1", CPU_EP),
+            ("MatMul_2", CPU_EP),
+        ]))
+        .unwrap();
+
+        let verdict = ep_census_verdict(
+            EmbeddingRuntime::LocalFastembedOnnxMigraphx,
+            "local-gpu-bge",
+            &census,
+        );
+        assert!(
+            verdict.is_err(),
+            "перепись без узлов MIGraphX обязана отказать"
+        );
+        assert!(verdict.unwrap_err().contains("fell back to CPU"));
+    }
+
+    /// На CPU-профиле та же перепись — норма, а не отказ: вердикт обязан
+    /// различать «просили GPU и не получили» и «GPU не просили».
+    #[test]
+    fn ep_verdict_says_nothing_about_cpu_profiles() {
+        let census =
+            ProviderCensus::from_profile_json(&profile_json(&[("Add_1", CPU_EP)])).unwrap();
+
+        assert!(
+            ep_census_verdict(
+                EmbeddingRuntime::LocalFastembedOnnxCpu,
+                "local-cpu-small",
+                &census
+            )
+            .is_ok()
+        );
+    }
+
+    /// Ручка пробы включается тем же словарём, что и фоновый синк: две
+    /// переменные с разными «включающими» словами — источник «я же выставил».
+    #[test]
+    fn ep_census_env_shares_the_enabled_vocabulary() {
+        assert!(!parse_enabled_env(None));
+        assert!(!parse_enabled_env(Some("0")));
+        assert!(parse_enabled_env(Some("1")));
+        assert!(parse_enabled_env(Some(" ON\n")));
     }
 }

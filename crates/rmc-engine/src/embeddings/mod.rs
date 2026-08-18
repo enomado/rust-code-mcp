@@ -32,6 +32,22 @@ mod ep_census;
 pub use ep_census::{ProviderCensus, CPU_EP, MIGRAPHX_EP};
 
 mod fastembed_onnx;
+
+/// Перепись «узлов графа по execution provider'ам» одним профилированным
+/// прогоном выбранного профиля.
+///
+/// Отвечает на вопрос, на который `error_on_failure()` не отвечает: не
+/// «поднялся ли EP», а «достались ли ему узлы». Дорогая (отдельная сессия,
+/// на холодном кэше ядер — компиляция MIGraphX), поэтому вызывается по явной
+/// ручке, а не при каждом старте.
+///
+/// Профили не-fastembed-ONNX (Qwen3/OpenRouter) отказывают: у них нет
+/// ORT-сессии, а значит и профиля, из которого считать перепись.
+pub fn probe_provider_census(
+    backend: &EmbeddingBackend,
+) -> Result<ProviderCensus, EmbeddingError> {
+    fastembed_onnx::probe_provider_census(backend)
+}
 mod openrouter;
 pub use openrouter::{
     openrouter_runtime_config, OpenRouterEncodingFormat, OpenRouterProviderPreferences,
