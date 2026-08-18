@@ -63,6 +63,7 @@ impl TextRerank {
             execution_providers,
             cache_dir,
             show_download_progress,
+            profiling_file,
         } = options;
 
         let threads = available_parallelism()?.get();
@@ -87,14 +88,23 @@ impl TextRerank {
             ))?;
         }
 
-        let session = Session::builder()?
+        let mut builder = Session::builder()?
             .with_execution_providers(execution_providers)
             .map_err(Self::builder_error)?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(Self::builder_error)?
             .with_intra_threads(threads)
-            .map_err(Self::builder_error)?
-            .commit_from_file(model_file_reference)?;
+            .map_err(Self::builder_error)?;
+
+        // Профилирование включается ТОЛЬКО на сборке сессии — после `commit_*`
+        // ручки уже нет, поэтому путь и приходится нести через опции.
+        if let Some(profiling_file) = profiling_file {
+            builder = builder
+                .with_profiling(profiling_file)
+                .map_err(Self::builder_error)?;
+        }
+
+        let session = builder.commit_from_file(model_file_reference)?;
 
         let tokenizer = load_tokenizer_hf_hub(model_repo, max_length)?;
         Ok(Self::new(tokenizer, session))
@@ -220,5 +230,19 @@ impl TextRerank {
             .collect();
         top_n_result.sort_by(|a, b| a.score.total_cmp(&b.score).reverse());
         Ok(top_n_result)
+    }
+}
+
+impl TextRerank {
+    /// Закрыть профиль ONNX Runtime и вернуть ПОЛНОЕ имя записанного файла.
+    ///
+    /// ORT дописывает к запрошенному префиксу отметку времени, поэтому путь
+    /// известен только отсюда. Без этого вызова профиль остаётся не закрытым:
+    /// сессия, собранная с профилированием, обязана его завершить.
+    ///
+    /// Ошибка, если профилирование не запрашивалось при инициализации
+    /// (см. [`crate::InitOptionsWithLength::with_profiling`]).
+    pub fn end_profiling(&mut self) -> anyhow::Result<String> {
+        Ok(self.session.end_profiling()?)
     }
 }
