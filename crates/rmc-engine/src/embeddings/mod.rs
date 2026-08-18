@@ -18,7 +18,7 @@ pub use backend::{EmbeddingBackend, EmbeddingRuntime};
 
 mod profile;
 pub use profile::{EmbeddingProfile, Qwen3Variant};
-pub use profile::{FastembedCpuModel, LocalLoaderSpec, QueryPolicy};
+pub use profile::{FastembedOnnxModel, LocalLoaderSpec, QueryPolicy};
 
 mod identity;
 
@@ -28,7 +28,7 @@ mod util;
 mod profile_registry;
 pub use profile_registry::resolve_profile;
 
-mod fastembed_cpu;
+mod fastembed_onnx;
 mod openrouter;
 pub use openrouter::{
     openrouter_runtime_config, OpenRouterEncodingFormat, OpenRouterProviderPreferences,
@@ -67,7 +67,7 @@ pub struct EmbeddingGenerator {
 enum EmbeddingGeneratorInner {
     #[cfg(feature = "embeddings-cuda")]
     Qwen3(Arc<qwen3::Qwen3Embedder>),
-    FastembedCpu(Arc<fastembed_cpu::FastembedCpuEmbedder>),
+    FastembedOnnx(Arc<fastembed_onnx::FastembedOnnxEmbedder>),
     OpenRouter(Arc<openrouter::OpenRouterEmbedder>),
 }
 
@@ -96,9 +96,10 @@ impl EmbeddingGenerator {
             EmbeddingRuntime::OpenRouter => EmbeddingGeneratorInner::OpenRouter(Arc::new(
                 openrouter::OpenRouterEmbedder::new(&backend)?,
             )),
-            EmbeddingRuntime::LocalFastembedOnnxCpu => {
-                EmbeddingGeneratorInner::FastembedCpu(Arc::new(
-                    fastembed_cpu::FastembedCpuEmbedder::new(&backend)?,
+            EmbeddingRuntime::LocalFastembedOnnxCpu
+            | EmbeddingRuntime::LocalFastembedOnnxMigraphx => {
+                EmbeddingGeneratorInner::FastembedOnnx(Arc::new(
+                    fastembed_onnx::FastembedOnnxEmbedder::new(&backend)?,
                 ))
             }
         };
@@ -110,7 +111,7 @@ impl EmbeddingGenerator {
         match &self.inner {
             #[cfg(feature = "embeddings-cuda")]
             EmbeddingGeneratorInner::Qwen3(inner) => inner.dim(),
-            EmbeddingGeneratorInner::FastembedCpu(inner) => inner.dim(),
+            EmbeddingGeneratorInner::FastembedOnnx(inner) => inner.dim(),
             EmbeddingGeneratorInner::OpenRouter(inner) => inner.dim(),
         }
     }
@@ -137,7 +138,7 @@ impl EmbeddingGenerator {
                 .await
                 .map_err(|e| EmbeddingError::task_join(e.to_string()))?
             }
-            EmbeddingGeneratorInner::FastembedCpu(inner) => {
+            EmbeddingGeneratorInner::FastembedOnnx(inner) => {
                 let inner = inner.clone();
                 tokio::task::spawn_blocking(move || {
                     let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
@@ -169,7 +170,7 @@ impl EmbeddingGenerator {
                 .await
                 .map_err(|e| EmbeddingError::task_join(e.to_string()))?
             }
-            EmbeddingGeneratorInner::FastembedCpu(inner) => {
+            EmbeddingGeneratorInner::FastembedOnnx(inner) => {
                 let inner = inner.clone();
                 tokio::task::spawn_blocking(move || {
                     let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();

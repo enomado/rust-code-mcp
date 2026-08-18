@@ -26,6 +26,22 @@ embeddings-cuda = [
   "fastembed/qwen3",
   "fastembed/cuda",
 ]
+# AMD GPU через MIGraphX EP ONNX Runtime (замер на RX 7700 XT / gfx1101: ×32 к
+# CPU на BGE-small fp32, batch 32x512). ROCm EP сюда НЕ добавлен намеренно: он
+# в ORT депрекейтнут, а в системных сборках его просто нет —
+# libonnxruntime_providers_rocm.so не поставляется, есть только migraphx.
+#
+# Фича аддитивна к `embeddings`: CPU-профиль продолжает работать в той же
+# сборке, GPU — отдельный профиль. Скачанный `ort-download-binaries` архив при
+# этом не используется (load-dynamic грузит системную библиотеку), но и не
+# мешает — так фичи остаются аддитивными, как того требует cargo.
+embeddings-migraphx = [
+  "embeddings",
+  "dep:ort",
+  "ort/migraphx",
+  # Каталог кэша скомпилированных ядер — см. ensure_migraphx_kernel_cache().
+  "dep:directories",
+]
 vector-store = [
   "embeddings",
   "dep:lancedb",
@@ -58,6 +74,7 @@ uuid  = { workspace = true }
 reqwest     = { workspace = true, optional = true }
 hf-hub      = { workspace = true, optional = true }
 fastembed   = { workspace = true, optional = true }
+ort         = { workspace = true, optional = true }
 candle-core = { workspace = true, optional = true }
 tokenizers  = { workspace = true, optional = true }
 serde_json  = { workspace = true }

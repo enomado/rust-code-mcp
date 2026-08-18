@@ -5,13 +5,13 @@
 //! stable identity string used in cache paths and `EMBEDDER_VERSION`.
 //!
 //! The profile data model itself — `EmbeddingProfile`, `QueryPolicy`,
-//! `LocalLoaderSpec`, `FastembedCpuModel`, `Qwen3Variant`, and the
+//! `LocalLoaderSpec`, `FastembedOnnxModel`, `Qwen3Variant`, and the
 //! built-in profile registry — lives in [`super::profile`].
 
 use super::error::EmbeddingError;
 use super::identity::EmbeddingIdentity;
 use super::profile::{
-    EmbeddingProfile, FastembedCpuModel, LocalLoaderSpec, QueryPolicy, Qwen3Variant,
+    EmbeddingProfile, FastembedOnnxModel, LocalLoaderSpec, QueryPolicy, Qwen3Variant,
 };
 use super::util::arc;
 
@@ -35,6 +35,15 @@ pub struct EmbeddingBackend {
 pub enum EmbeddingRuntime {
     LocalQwen3CandleCuda,
     LocalFastembedOnnxCpu,
+    /// Тот же ONNX-граф, что и у `LocalFastembedOnnxCpu`, но исполняемый на AMD
+    /// GPU через MIGraphX EP.
+    ///
+    /// Отдельный вариант, а не флаг у CPU-рантайма, ПОТОМУ ЧТО он попадает в
+    /// `EmbeddingIdentity` и, значит, разделяет индексы. Разделение здесь не
+    /// перестраховка: GPU-профиль гоняет fp32-модель, а CPU-профиль —
+    /// int8-квантованную, то есть векторы РАЗНЫЕ, и смешивать их в одном
+    /// индексе нельзя.
+    LocalFastembedOnnxMigraphx,
     OpenRouter,
 }
 
@@ -90,7 +99,7 @@ impl EmbeddingBackend {
     pub fn model_display_name(&self) -> &str {
         match self.profile.local_loader {
             Some(LocalLoaderSpec::Qwen3(variant)) => variant.display_name(),
-            Some(LocalLoaderSpec::FastembedCpu(model)) => model.display_name(),
+            Some(LocalLoaderSpec::FastembedOnnx(model)) => model.display_name(),
             None => self.model_id(),
         }
     }
@@ -111,15 +120,23 @@ impl EmbeddingBackend {
         })
     }
 
-    pub fn fastembed_cpu_model(&self) -> Option<FastembedCpuModel> {
+    pub fn fastembed_onnx_model(&self) -> Option<FastembedOnnxModel> {
         match self.profile.local_loader {
-            Some(LocalLoaderSpec::FastembedCpu(model)) => Some(model),
+            Some(LocalLoaderSpec::FastembedOnnx(model)) => Some(model),
             _ => None,
         }
     }
 
-    pub fn require_fastembed_cpu_model(&self) -> Result<FastembedCpuModel, EmbeddingError> {
-        self.fastembed_cpu_model().ok_or_else(|| {
+    /// Идёт ли этот бэкенд через fastembed/ONNX — на CPU или на GPU.
+    pub fn is_fastembed_onnx(&self) -> bool {
+        matches!(
+            self.runtime,
+            EmbeddingRuntime::LocalFastembedOnnxCpu | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+        )
+    }
+
+    pub fn require_fastembed_onnx_model(&self) -> Result<FastembedOnnxModel, EmbeddingError> {
+        self.fastembed_onnx_model().ok_or_else(|| {
             EmbeddingError::model_init(format!(
                 "embedding profile `{}` does not use the fastembed ONNX CPU runtime",
                 self.profile.name()
@@ -146,7 +163,7 @@ impl EmbeddingBackend {
             Some(LocalLoaderSpec::Qwen3(_)) => 0.85,
             // BGE general-purpose sentence embeddings sit on a lower
             // similarity scale than instruction-tuned code embeddings.
-            Some(LocalLoaderSpec::FastembedCpu(_)) => 0.80,
+            Some(LocalLoaderSpec::FastembedOnnx(_)) => 0.80,
             // API models have no local loader. The built-in OpenRouter
             // Qwen3 model shares the Qwen3 scale; other API models (e.g.
             // OpenAI text-embedding-3, whose similarity range is markedly
