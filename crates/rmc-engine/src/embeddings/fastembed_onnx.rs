@@ -308,9 +308,22 @@ fn ensure_migraphx_kernel_cache(
             dir.display()
         ))
     })?;
+
+    // The 'this shape is in use' mark is set BEFORE the sweep: otherwise the shape we
+    // are bringing up right now would be queued for eviction based on stale recency.
+    // It would not have been removed anyway (`keep`), but its recency would remain
+    // a lie for the next run.
+    crate::embeddings::kernel_cache::touch_last_used(&dir);
+    let cap_bytes = crate::embeddings::kernel_cache::cap_bytes_from_env()
+        .map_err(EmbeddingError::model_init)?;
+    let plan = crate::embeddings::kernel_cache::sweep(&root, &dir, cap_bytes);
+
     tracing::info!(
         target: "embeddings::fastembed_onnx",
         cache = %dir.display(),
+        cap_bytes,
+        cache_bytes = plan.bytes_after,
+        evicted_shapes = plan.remove.len(),
         "MIGraphX kernel cache"
     );
     // SAFETY: called on the embedder initialization path, before the ORT session is created

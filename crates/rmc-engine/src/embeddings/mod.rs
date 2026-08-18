@@ -31,6 +31,8 @@ pub use profile_registry::resolve_profile;
 mod ep_census;
 pub use ep_census::{ProviderCensus, CPU_EP, MIGRAPHX_EP};
 
+mod kernel_cache;
+
 mod fastembed_onnx;
 
 /// Census of graph nodes per execution provider, taken from one profiled
