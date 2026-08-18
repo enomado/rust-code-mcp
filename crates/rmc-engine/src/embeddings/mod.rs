@@ -32,6 +32,22 @@ mod ep_census;
 pub use ep_census::{ProviderCensus, CPU_EP, MIGRAPHX_EP};
 
 mod fastembed_onnx;
+
+/// Census of graph nodes per execution provider, taken from one profiled
+/// run of the selected profile.
+///
+/// Answers the question `error_on_failure()` does not answer: not
+/// whether the EP came up, but whether it got any nodes. Expensive (a separate session;
+/// on a cold kernel cache, a MIGraphX compile), so it is called only through an explicit
+/// switch, not on every startup.
+///
+/// Non-fastembed-ONNX profiles (Qwen3/OpenRouter) refuse: they have no
+/// ORT session, and therefore no profile to compute the census from.
+pub fn probe_provider_census(
+    backend: &EmbeddingBackend,
+) -> Result<ProviderCensus, EmbeddingError> {
+    fastembed_onnx::probe_provider_census(backend)
+}
 mod openrouter;
 pub use openrouter::{
     openrouter_runtime_config, OpenRouterEncodingFormat, OpenRouterProviderPreferences,

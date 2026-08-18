@@ -5,6 +5,7 @@
 //! nothing about GPU EPs and should not have to — it accepts the EPs from outside.
 
 use crate::embeddings::backend::{EmbeddingBackend, EmbeddingRuntime};
+use crate::embeddings::ep_census::ProviderCensus;
 use crate::embeddings::profile::FastembedOnnxModel;
 use crate::embeddings::{Embedding, EmbeddingError};
 use fastembed::{EmbeddingModel, FixedBatchShape, TextEmbedding, TextInitOptions};
@@ -46,8 +47,7 @@ impl FastembedOnnxEmbedder {
     ///
     /// `prefix` is the file name prefix; ORT appends a timestamp to it,
     /// the actual path is returned by [`Self::end_profiling`].
-    #[cfg(test)]
-    pub(super) fn new_profiled(
+    fn new_profiled(
         backend: &EmbeddingBackend,
         prefix: &std::path::Path,
     ) -> Result<Self, EmbeddingError> {
@@ -55,8 +55,7 @@ impl FastembedOnnxEmbedder {
     }
 
     /// Close the ORT profile and return the path of the written file.
-    #[cfg(test)]
-    pub(super) fn end_profiling(&self) -> Result<std::path::PathBuf, EmbeddingError> {
+    fn end_profiling(&self) -> Result<std::path::PathBuf, EmbeddingError> {
         let mut model = self.inner.lock().unwrap();
         model
             .end_profiling()
@@ -142,6 +141,60 @@ impl FastembedOnnxEmbedder {
         let refs: Vec<&str> = prefixed.iter().map(String::as_str).collect();
         self.embed_documents(&refs)
     }
+}
+
+/// Corpus for the EP census probe.
+///
+/// Texts of DIFFERENT lengths on purpose: on them the floating and the constant shape give
+/// different padding, so the probe takes the same path through the model as a real
+/// run rather than a degenerate one.
+const CENSUS_PROBE_CORPUS: [&str; 4] = [
+    "fn main() {}",
+    "pub struct WorkspaceLockRegistry { global: Arc<Mutex<()>> }",
+    "impl Iterator for Chunks { type Item = CodeChunk; fn next(&mut self) -> Option<Self::Item> { self.inner.next() } }",
+    "async fn index_codebase(params: IndexCodebaseParams, sync: Option<&Arc<SyncManager>>) -> Result<CallToolResult, McpError>",
+];
+
+/// One profiled embedder run + a census of 'nodes per provider'.
+///
+/// # Why this is in production and not only in tests
+/// A census test gates the MACHINE it was run on, where someone remembered
+/// to run it. The question 'did the graph really go to the GPU on this machine' is asked of
+/// a live server, where neither the build feature, nor the system ORT, nor the driver version is
+/// what the test had. So the same census is available as a runtime probe.
+///
+/// # Cost
+/// The probe brings up a SEPARATE session (profiling cannot be enabled after the
+/// session is built), i.e. it loads the model again, and on a cold kernel cache
+/// it also pays the MIGraphX compilation (45–70 s). That is why it is called only via
+/// an explicit knob, not on every startup.
+///
+/// The ORT profile is a temporary file: it is needed only while it is being parsed, and there is
+/// no reason to leave hundreds of megabytes of JSON on disk after every probe. The directory is removed
+/// even when parsing fails.
+pub(super) fn probe_provider_census(
+    backend: &EmbeddingBackend,
+) -> Result<ProviderCensus, EmbeddingError> {
+    // The directory name is per pid: two servers on one machine must not share
+    // a profile directory, otherwise one's census would see the other's files.
+    let dir = std::env::temp_dir().join(format!("rmc-ep-census-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        EmbeddingError::model_init(format!(
+            "cannot create ORT profile directory at {}: {e}",
+            dir.display()
+        ))
+    })?;
+
+    let census = (|| {
+        let embedder = FastembedOnnxEmbedder::new_profiled(backend, &dir.join("census"))?;
+        // The census must be based on the session's WORK: before the first run
+        // the profile is empty, and 'zero nodes on GPU' would mean 'did not look'.
+        embedder.embed_documents(&CENSUS_PROBE_CORPUS)?;
+        ProviderCensus::from_profile_file(&embedder.end_profiling()?)
+    })();
+
+    let _ = std::fs::remove_dir_all(&dir);
+    census
 }
 
 fn to_fastembed_model(model: FastembedOnnxModel) -> EmbeddingModel {
@@ -417,24 +470,15 @@ mod tests {
     #[test]
     #[ignore = "needs an AMD GPU, ORT with MIGraphX and a downloaded model"]
     fn migraphx_ep_actually_runs_the_graph() {
-        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP, ProviderCensus};
+        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP};
 
         let _guard = model_guard();
-        let dir = tempfile::tempdir().unwrap();
         let backend = EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
 
-        let embedder =
-            FastembedOnnxEmbedder::new_profiled(&backend, &dir.path().join("migraphx")).unwrap();
-
-        // The profile is empty until at least one run has happened: the census must
-        // be based on the session's WORK, not on the fact that it was created.
-        let texts = corpus();
-        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let embeddings = embedder.embed_documents(&refs).unwrap();
-        assert_eq!(embeddings.len(), refs.len());
-
-        let profile = embedder.end_profiling().unwrap();
-        let census = ProviderCensus::from_profile_file(&profile).unwrap();
+        // The gate calls EXACTLY the same probe the server calls via its knob: otherwise it
+        // would be checking its own copy of the path, and the runtime diagnostics would remain
+        // ungated.
+        let census = probe_provider_census(&backend).unwrap();
         eprintln!("nodes per provider: {census}");
 
         assert!(
@@ -463,19 +507,12 @@ mod tests {
     #[test]
     #[ignore = "downloads the model from HF and runs forward on CPU"]
     fn census_on_cpu_profile_sees_no_migraphx() {
-        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP, ProviderCensus};
+        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP};
 
         let _guard = model_guard();
-        let dir = tempfile::tempdir().unwrap();
         let backend = EmbeddingBackend::from_profile_name("local-cpu-small").unwrap();
 
-        let embedder =
-            FastembedOnnxEmbedder::new_profiled(&backend, &dir.path().join("cpu")).unwrap();
-        let texts = corpus();
-        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        embedder.embed_documents(&refs).unwrap();
-
-        let census = ProviderCensus::from_profile_file(&embedder.end_profiling().unwrap()).unwrap();
+        let census = probe_provider_census(&backend).unwrap();
         eprintln!("nodes per provider (CPU profile): {census}");
         assert_eq!(census.nodes_on(MIGRAPHX_EP), 0);
         assert!(census.nodes_on(CPU_EP) > 0, "{census}");

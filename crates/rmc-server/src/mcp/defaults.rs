@@ -1,10 +1,23 @@
 //! Operational defaults for MCP server startup and automatic work.
 
-use rmc_engine::embeddings::{EmbeddingBackend, EmbeddingRuntime};
+use rmc_engine::embeddings::{
+    CPU_EP, EmbeddingBackend, EmbeddingRuntime, MIGRAPHX_EP, ProviderCensus, probe_provider_census,
+};
 use std::sync::OnceLock;
 
 pub const BACKGROUND_SYNC_ENV: &str = "RMC_BACKGROUND_SYNC";
+
 pub const BACKGROUND_SYNC_ENABLED_VALUES: &str = "1/true/yes/on";
+
+/// Knob for the startup probe 'the graph is actually computed on the execution provider':
+/// `RMC_EP_CENSUS=1`.
+///
+/// # Why behind a knob and not always
+/// The probe brings up a SEPARATE session with profiling (it cannot be enabled after the
+/// session is built), i.e. it loads the model again, and on a cold kernel
+/// cache it also pays the MIGraphX compilation (45–70 s). There is no reason to pay that on every
+/// server startup just for diagnostics.
+pub const EP_CENSUS_ENV: &str = "RMC_EP_CENSUS";
 
 /// The profile the server computes embeddings with when the caller did not name one.
 ///
@@ -20,7 +33,12 @@ pub const DEFAULT_AUTOMATIC_EMBEDDING_PROFILE: &str = "local-cpu-small";
 /// the profile means a DIFFERENT index that has to be rebuilt from scratch.
 pub const EMBEDDING_PROFILE_ENV: &str = "RMC_EMBEDDING_PROFILE";
 
-pub fn parse_background_sync_env(value: Option<&str>) -> bool {
+/// Parsing of a boolean environment knob: enabled only by an explicit word from
+/// [`BACKGROUND_SYNC_ENABLED_VALUES`].
+///
+/// Shared by all such knobs on purpose: two variables that are enabled by DIFFERENT
+/// words are a source of 'but I did set it, and it does not work'.
+pub fn parse_enabled_env(value: Option<&str>) -> bool {
     let Some(value) = value else {
         return false;
     };
@@ -29,6 +47,10 @@ pub fn parse_background_sync_env(value: Option<&str>) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+pub fn parse_background_sync_env(value: Option<&str>) -> bool {
+    parse_enabled_env(value)
 }
 
 /// Default profile name: from [`EMBEDDING_PROFILE_ENV`], otherwise
@@ -74,6 +96,66 @@ pub(crate) fn resolve_automatic_profile_name(env_value: Option<&str>) -> String 
 pub(crate) fn automatic_embedding_backend() -> EmbeddingBackend {
     EmbeddingBackend::from_profile_name(automatic_embedding_profile_name())
         .expect("automatic embedding profile is validated on first read")
+}
+
+/// Startup EP probe, if it was requested via [`EP_CENSUS_ENV`].
+///
+/// Returns `Ok(None)` when the knob is not set, and `Ok(Some(census))` —
+/// the census of nodes per provider, already written to the log.
+///
+/// # Why a refusal and not a warning
+/// The knob is set with one question in mind: 'does the GPU really work?'. The class for
+/// which this whole layer exists — the EP came up, but the graph was computed on CPU —
+/// shows up ONLY as speed, so a warning in the log of a starting
+/// server does not catch it: the server will run, and 'GPU enabled' remains a false
+/// conclusion. So on a GPU profile a zero MIGraphX census is a startup error:
+/// the verdict is machine-readable (exit code), not 'visible on screen'.
+///
+/// On a CPU profile the probe asserts nothing — it only prints the census:
+/// 'how many nodes are on CPU' is not a refusal but a fact.
+pub fn probe_ep_census_on_startup() -> Result<Option<String>, String> {
+    if !parse_enabled_env(std::env::var(EP_CENSUS_ENV).ok().as_deref()) {
+        return Ok(None);
+    }
+
+    let backend = automatic_embedding_backend();
+    let profile = backend.profile.name();
+    tracing::info!(
+        profile,
+        "{EP_CENSUS_ENV} is set: probing which execution provider actually runs the graph \
+         (loads the model once more; a cold MIGraphX kernel cache costs 45-70s)"
+    );
+
+    let census = probe_provider_census(&backend)
+        .map_err(|e| format!("EP census probe failed for profile `{profile}`: {e}"))?;
+    tracing::info!(profile, census = %census, "EP census");
+
+    ep_census_verdict(backend.runtime, profile, &census)?;
+    Ok(Some(census.to_string()))
+}
+
+/// Verdict on the census: whether it is acceptable for the requested profile.
+///
+/// Separated from the probe on purpose: the probe itself requires a GPU, ORT with MIGraphX and
+/// a downloaded model, i.e. it can only be checked on a suitable machine. The decision
+/// 'is this a refusal or normal', on the other hand, is a pure function and is gated by the regular suite.
+pub(crate) fn ep_census_verdict(
+    runtime: EmbeddingRuntime,
+    profile: &str,
+    census: &ProviderCensus,
+) -> Result<(), String> {
+    // The assertion is NOT about a ratio: MIGraphX does not take nodes one at a time, it cuts out
+    // a subgraph and substitutes ONE fused node — on a healthy GPU path the census
+    // looks like `MIGraphXExecutionProvider=1`. So there is exactly one threshold here:
+    // the fused node is either there or not.
+    if runtime == EmbeddingRuntime::LocalFastembedOnnxMigraphx && census.nodes_on(MIGRAPHX_EP) == 0
+    {
+        return Err(format!(
+            "profile `{profile}` asks for MIGraphX, but not a single graph node ran on it \
+             (census: {census}) — the graph silently fell back to CPU"
+        ));
+    }
+    Ok(())
 }
 
 pub fn cuda_capable_features_compiled() -> bool {
@@ -151,5 +233,91 @@ mod tests {
             EmbeddingBackend::from_profile_name(&requested).is_err(),
             "a typo in the profile name must not resolve"
         );
+    }
+
+    /// The ORT profile in the form the runtime writes it: each node has three events.
+    fn profile_json(nodes: &[(&str, &str)]) -> String {
+        let events: Vec<serde_json::Value> = nodes
+            .iter()
+            .flat_map(|(name, provider)| {
+                ["_fence_before", "_kernel_time", "_fence_after"]
+                    .into_iter()
+                    .map(move |phase| {
+                        serde_json::json!({
+                            "cat": "Node",
+                            "name": format!("{name}{phase}"),
+                            "dur": 7,
+                            "args": {"provider": provider},
+                        })
+                    })
+            })
+            .collect();
+        serde_json::Value::Array(events).to_string()
+    }
+
+    /// Healthy GPU path: ONE fused MIGraphX node and nothing on CPU.
+    #[test]
+    fn ep_verdict_accepts_a_fused_migraphx_node() {
+        let census =
+            ProviderCensus::from_profile_json(&profile_json(&[("MIGraphX_0", MIGRAPHX_EP)]))
+                .unwrap();
+
+        assert!(
+            ep_census_verdict(
+                EmbeddingRuntime::LocalFastembedOnnxMigraphx,
+                "local-gpu-bge",
+                &census
+            )
+            .is_ok()
+        );
+    }
+
+    /// The very class the knob was introduced for: the EP registered, but
+    /// the graph was computed on CPU. There is NOT A SINGLE error — only speed.
+    #[test]
+    fn ep_verdict_rejects_a_silent_cpu_fallback() {
+        let census = ProviderCensus::from_profile_json(&profile_json(&[
+            ("Add_1", CPU_EP),
+            ("MatMul_2", CPU_EP),
+        ]))
+        .unwrap();
+
+        let verdict = ep_census_verdict(
+            EmbeddingRuntime::LocalFastembedOnnxMigraphx,
+            "local-gpu-bge",
+            &census,
+        );
+        assert!(
+            verdict.is_err(),
+            "a census without MIGraphX nodes must be refused"
+        );
+        assert!(verdict.unwrap_err().contains("fell back to CPU"));
+    }
+
+    /// On a CPU profile the same census is normal, not a refusal: the verdict must
+    /// distinguish 'asked for GPU and did not get it' from 'did not ask for GPU'.
+    #[test]
+    fn ep_verdict_says_nothing_about_cpu_profiles() {
+        let census =
+            ProviderCensus::from_profile_json(&profile_json(&[("Add_1", CPU_EP)])).unwrap();
+
+        assert!(
+            ep_census_verdict(
+                EmbeddingRuntime::LocalFastembedOnnxCpu,
+                "local-cpu-small",
+                &census
+            )
+            .is_ok()
+        );
+    }
+
+    /// The probe knob is enabled by the same vocabulary as background sync: two
+    /// variables with different 'enabling' words are a source of 'but I did set it'.
+    #[test]
+    fn ep_census_env_shares_the_enabled_vocabulary() {
+        assert!(!parse_enabled_env(None));
+        assert!(!parse_enabled_env(Some("0")));
+        assert!(parse_enabled_env(Some("1")));
+        assert!(parse_enabled_env(Some(" ON\n")));
     }
 }
