@@ -5,27 +5,12 @@
 //! GPU-EP ничего не знает и знать не должен — он принимает EP снаружи.
 
 use crate::embeddings::backend::{EmbeddingBackend, EmbeddingRuntime};
+use crate::embeddings::batching::FixedInputShape;
 use crate::embeddings::ep_census::ProviderCensus;
 use crate::embeddings::profile::FastembedOnnxModel;
 use crate::embeddings::{Embedding, EmbeddingError};
 use fastembed::{EmbeddingModel, FixedBatchShape, TextEmbedding, TextInitOptions};
 use std::sync::Mutex;
-
-/// Высота батча, под которую компилируются MIGraphX-ядра.
-///
-/// # Почему форма постоянная
-/// MIGraphX компилирует ядра ПОД ФОРМУ входа: каждая новая пара
-/// (строк × длина) стоит 45–70 с компиляции и ~145–200 МБ в кэше `.mxr`.
-/// Форма, которую fastembed отдаёт по умолчанию, плавает по обеим осям
-/// (паддинг до самой длинной строки В БАТЧЕ + неполный последний батч), и одна
-/// индексация 40 файлов породила 4 формы и 659 МБ кэша. Фиксация оставляет одну.
-///
-/// # Почему именно 32
-/// Это и высота, на которой снят потолок GPU-пути (242 seq/s против 7.5 на CPU),
-/// и дефолтный `gpu_batch_size` индексатора — то есть в типичном прогоне
-/// добивать приходится только последний кусок. Число намеренно НЕ выводится из
-/// входа: смысл в том, чтобы форма не зависела от того, сколько текстов пришло.
-const GPU_BATCH_ROWS: usize = 32;
 
 pub(super) struct FastembedOnnxEmbedder {
     inner: Mutex<TextEmbedding>,
@@ -87,15 +72,24 @@ impl FastembedOnnxEmbedder {
 
         // Форма входа считается ДО создания сессии: от неё зависит каталог кэша
         // ядер, который надо выставить раньше, чем EP получит управление.
-        let shape = FixedBatchShape {
-            rows: GPU_BATCH_ROWS,
-            seq_len: backend.max_len,
-        };
+        //
+        // Величину объявляет БЭКЕНД — ту же самую читает индексатор, когда режет
+        // входы на батчи. Отказ здесь не гипотетический: он срабатывает, если
+        // кто-то заведёт GPU-рантайм и забудет вторую половину пары
+        // «рантайм ⇄ форма», и тогда мы платили бы компиляцию ядер под каждую
+        // случайную форму входа молча.
+        let shape = backend.fixed_input_shape().map(to_fastembed_shape);
+        if on_gpu && shape.is_none() {
+            return Err(EmbeddingError::model_init(format!(
+                "profile `{}` runs on MIGraphX but declares no fixed input shape",
+                backend.profile.name()
+            )));
+        }
 
         let mut options = TextInitOptions::new(to_fastembed_model(model))
             .with_max_length(backend.max_len)
             .with_show_download_progress(false);
-        if on_gpu {
+        if let (true, Some(shape)) = (on_gpu, shape) {
             options = options.with_execution_providers(migraphx_execution_providers(model, shape)?);
         }
         if let Some(prefix) = profiling_prefix {
@@ -103,7 +97,7 @@ impl FastembedOnnxEmbedder {
         }
         let mut inner = TextEmbedding::try_new(options)
             .map_err(|e| EmbeddingError::model_init(e.to_string()))?;
-        if on_gpu {
+        if let (true, Some(shape)) = (on_gpu, shape) {
             inner = inner
                 .with_fixed_batch_shape(shape)
                 .map_err(|e| EmbeddingError::model_init(e.to_string()))?;
@@ -195,6 +189,18 @@ pub(super) fn probe_provider_census(
 
     let _ = std::fs::remove_dir_all(&dir);
     census
+}
+
+/// Наша форма → форма вендора.
+///
+/// Переводчик отдельной функцией, чтобы `FixedBatchShape` из fastembed не
+/// расползался выше этого модуля: индексатору форма нужна, а зависимость на
+/// вендора — нет.
+fn to_fastembed_shape(shape: FixedInputShape) -> FixedBatchShape {
+    FixedBatchShape {
+        rows: shape.rows.0,
+        seq_len: shape.seq_len,
+    }
 }
 
 fn to_fastembed_model(model: FastembedOnnxModel) -> EmbeddingModel {

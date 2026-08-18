@@ -8,12 +8,32 @@
 //! `LocalLoaderSpec`, `FastembedOnnxModel`, `Qwen3Variant`, and the
 //! built-in profile registry — lives in [`super::profile`].
 
+use super::batching::{BatchRows, FixedInputShape};
 use super::error::EmbeddingError;
 use super::identity::EmbeddingIdentity;
 use super::profile::{
     EmbeddingProfile, FastembedOnnxModel, LocalLoaderSpec, QueryPolicy, Qwen3Variant,
 };
 use super::util::arc;
+
+/// Высота батча, под которую компилируются MIGraphX-ядра.
+///
+/// # Почему форма постоянная
+/// MIGraphX компилирует ядра ПОД ФОРМУ входа: каждая новая пара
+/// (строк × длина) стоит 45–70 с компиляции и ~145–200 МБ в кэше `.mxr`.
+/// Форма, которую fastembed отдаёт по умолчанию, плавает по обеим осям
+/// (паддинг до самой длинной строки В БАТЧЕ + неполный последний батч), и одна
+/// индексация 40 файлов породила 4 формы и 659 МБ кэша. Фиксация оставляет одну.
+///
+/// # Почему именно 32
+/// Это высота, на которой снят потолок GPU-пути (242 seq/s против 7.5 на CPU).
+/// Число намеренно НЕ выводится из входа: смысл в том, чтобы форма не зависела
+/// от того, сколько текстов пришло.
+///
+/// Совпадение с дефолтным `gpu_batch_size` индексатора больше НЕ несёт нагрузки:
+/// при постоянной форме индексатор берёт высоту отсюда, а свою настройку не
+/// применяет вовсе.
+const GPU_BATCH_ROWS: BatchRows = BatchRows(32);
 
 /// Cross-crate embedding runtime boundary.
 ///
@@ -73,9 +93,7 @@ impl EmbeddingBackend {
     pub fn from_qwen3_variant(variant: Qwen3Variant) -> Self {
         let profile = EmbeddingProfile::built_in_profiles()
             .iter()
-            .find(|profile| {
-                profile.local_loader == Some(LocalLoaderSpec::Qwen3(variant))
-            })
+            .find(|profile| profile.local_loader == Some(LocalLoaderSpec::Qwen3(variant)))
             .cloned()
             .expect("built-in Qwen3 embedding profile exists");
         Self::from_profile(profile)
@@ -142,6 +160,29 @@ impl EmbeddingBackend {
                 self.profile.name()
             ))
         })
+    }
+
+    /// Постоянная форма входа, если рантайм этого профиля её ТРЕБУЕТ.
+    ///
+    /// # Единственный источник формы
+    /// Форму читают двое: загрузчик модели (компилирует под неё ядра и
+    /// адресует ею каталог кэша) и индексатор (режет ею входы). Пока каждый
+    /// знал свою константу, их согласованность держалась на совпадении
+    /// дефолтов — см. [`super::batching::BatchingPolicy`]. Теперь величину
+    /// объявляет ОДНА сторона, вторая её принимает.
+    ///
+    /// `None` — не «форма неизвестна», а «рантайму форма не нужна»: на CPU и у
+    /// API-моделей паддинг до самой длинной строки в батче бесплатен.
+    pub fn fixed_input_shape(&self) -> Option<FixedInputShape> {
+        match self.runtime {
+            EmbeddingRuntime::LocalFastembedOnnxMigraphx => Some(FixedInputShape {
+                rows: GPU_BATCH_ROWS,
+                seq_len: self.max_len,
+            }),
+            EmbeddingRuntime::LocalQwen3CandleCuda
+            | EmbeddingRuntime::LocalFastembedOnnxCpu
+            | EmbeddingRuntime::OpenRouter => None,
+        }
     }
 
     pub fn format_query(&self, text: &str) -> String {
@@ -311,9 +352,7 @@ impl EmbeddingBackend {
                     )));
                 }
                 match parts[1] {
-                    "qwen/qwen3-embedding-8b" => {
-                        Self::from_profile_name("openrouter-qwen3-8b")?
-                    }
+                    "qwen/qwen3-embedding-8b" => Self::from_profile_name("openrouter-qwen3-8b")?,
                     other => {
                         return Err(EmbeddingError::invalid_identity(format!(
                             "unknown OpenRouter model `{}` in `{}`",
@@ -365,8 +404,8 @@ impl EmbeddingBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::profile::QWEN3_CODE_QUERY_PREFIX;
+    use super::*;
 
     fn profile(name: &str) -> EmbeddingProfile {
         EmbeddingProfile::parse(name).unwrap()
@@ -391,7 +430,10 @@ mod tests {
 
     #[test]
     fn profile_dimensions_match_expected_values() {
-        assert_eq!(EmbeddingBackend::from_profile(profile("local-cpu-small")).dim(), 384);
+        assert_eq!(
+            EmbeddingBackend::from_profile(profile("local-cpu-small")).dim(),
+            384
+        );
         assert_eq!(
             EmbeddingBackend::from_profile(profile("openrouter-qwen3-8b")).dim(),
             4096
@@ -412,13 +454,11 @@ mod tests {
     #[test]
     fn query_policy_is_profile_aware() {
         assert_eq!(
-            EmbeddingBackend::from_profile(profile("local-gpu-small"))
-                .format_query("find parser"),
+            EmbeddingBackend::from_profile(profile("local-gpu-small")).format_query("find parser"),
             "Instruct: Given a code search query, retrieve relevant code\nQuery: find parser"
         );
         assert_eq!(
-            EmbeddingBackend::from_profile(profile("local-cpu-small"))
-                .format_query("find parser"),
+            EmbeddingBackend::from_profile(profile("local-cpu-small")).format_query("find parser"),
             "Represent this sentence for searching relevant passages: find parser"
         );
     }
@@ -501,8 +541,7 @@ mod tests {
 
     #[test]
     fn from_identity_accepts_legacy_identities() {
-        let default =
-            "fastembed-candle:Qwen3-Embedding-0.6B:dim1024:max1024:v2";
+        let default = "fastembed-candle:Qwen3-Embedding-0.6B:dim1024:max1024:v2";
         let cpu = "fastembed-onnx-cpu:BGESmallENV15Q:dim384:max512:v1";
         let openrouter = "openrouter:qwen/qwen3-embedding-8b:dim4096:max32768:v1";
 
@@ -546,13 +585,55 @@ mod tests {
     #[test]
     fn from_identity_rejects_garbage() {
         assert!(EmbeddingBackend::from_identity("garbage").is_err());
-        assert!(EmbeddingBackend::from_identity(
-            "fastembed-candle:Qwen3-Embedding-0.6B:dim999:max2048:v2"
-        )
-        .is_err());
-        assert!(EmbeddingBackend::from_identity(
-            "fastembed-candle:Qwen3-Embedding-0.6B:dim1024:max1024:v1"
-        )
-        .is_err());
+        assert!(
+            EmbeddingBackend::from_identity(
+                "fastembed-candle:Qwen3-Embedding-0.6B:dim999:max2048:v2"
+            )
+            .is_err()
+        );
+        assert!(
+            EmbeddingBackend::from_identity(
+                "fastembed-candle:Qwen3-Embedding-0.6B:dim1024:max1024:v1"
+            )
+            .is_err()
+        );
+    }
+
+    /// Гейт пары «рантайм ⇄ постоянная форма»: форма есть РОВНО у тех
+    /// рантаймов, что компилируют ядра под неё.
+    ///
+    /// Заведён потому, что половинки пары живут в разных файлах: загрузчик
+    /// модели откажет, если рантайм GPU-шный, а формы нет, — но обратный
+    /// перекос (форма объявлена рантайму, которому она не нужна) не заметил бы
+    /// никто, кроме этого теста. Он же держит охват: новый рантайм обязан
+    /// попасть в `match` явно, иначе `fixed_input_shape` не соберётся.
+    #[test]
+    fn fixed_shape_exists_exactly_for_shape_compiling_runtimes() {
+        let profiles = EmbeddingProfile::built_in_profiles();
+        let mut seen_migraphx = false;
+        for profile in profiles.iter() {
+            let backend = EmbeddingBackend::from_profile(profile.clone());
+            let shape = backend.fixed_input_shape();
+            let wants_shape = backend.runtime == EmbeddingRuntime::LocalFastembedOnnxMigraphx;
+            assert_eq!(
+                shape.is_some(),
+                wants_shape,
+                "профиль `{}` ({:?}): форма и рантайм разошлись",
+                profile.name(),
+                backend.runtime
+            );
+            if let Some(shape) = shape {
+                seen_migraphx = true;
+                assert_eq!(shape.rows, GPU_BATCH_ROWS);
+                // Длина последовательности — это `max_len` бэкенда, а не
+                // константа: она переопределяется на инстансе, и разъезд с ней
+                // означал бы компиляцию ядер под форму, которой не бывает.
+                assert_eq!(shape.seq_len, backend.max_len);
+            }
+        }
+        assert!(
+            seen_migraphx,
+            "в реестре не осталось GPU-профиля — тест стал вакуумным"
+        );
     }
 }
