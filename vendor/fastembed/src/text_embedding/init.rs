@@ -2,10 +2,10 @@
 //!
 
 use crate::{
+    EmbeddingModel, OutputKey, QuantizationMode,
     common::TokenizerFiles,
     init::{HasMaxLength, InitOptionsWithLength},
     pooling::Pooling,
-    EmbeddingModel, OutputKey, QuantizationMode,
 };
 use ort::{execution_providers::ExecutionProviderDispatch, session::Session};
 use tokenizers::Tokenizer;
@@ -123,6 +123,28 @@ impl UserDefinedEmbeddingModel {
     }
 }
 
+/// Fixed model input shape: rows per batch × sequence length.
+///
+/// # Why
+/// By default the input shape floats along BOTH axes: the tokenizer pads to the
+/// longest sequence IN THE BATCH (`PaddingStrategy::BatchLongest`), and
+/// the last batch is also partial. For CPU this does not matter, but compiling
+/// runtimes (MIGraphX and other AOT EPs) compile KERNELS PER SHAPE: every new
+/// shape = a separate compilation (tens of seconds) and a separate cache file (hundreds
+/// of megabytes). Measured on indexing 40 files: 4 shapes, 659 MB of cache.
+///
+/// With the shape fixed there is exactly one compilation, and the price is the compute spent on
+/// padding rows in the partial last batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedBatchShape {
+    /// Batch height. Longer inputs are cut into chunks of `rows`; the last
+    /// chunk is padded up to `rows` (the padding is discarded on output).
+    pub rows: usize,
+    /// Sequence length. The tokenizer pads EXACTLY to it, not to
+    /// the longest row in the batch.
+    pub seq_len: usize,
+}
+
 /// Rust representation of the TextEmbedding model
 pub struct TextEmbedding {
     pub tokenizer: Tokenizer,
@@ -131,4 +153,8 @@ pub struct TextEmbedding {
     pub(crate) need_token_type_ids: bool,
     pub(crate) quantization: QuantizationMode,
     pub(crate) output_key: Option<OutputKey>,
+    /// Fixed input shape, if requested via
+    /// [`TextEmbedding::with_fixed_batch_shape`]. `None` keeps the old behavior
+    /// (the shape floats along both axes).
+    pub(crate) fixed_shape: Option<FixedBatchShape>,
 }

@@ -12,6 +12,13 @@ use super::{OutputKey, OutputPrecedence};
 pub struct SingleBatchOutput {
     pub outputs: Vec<(String, ort::value::Value)>,
     pub attention_mask_array: Array2<i64>,
+    /// How many LEADING rows of the batch correspond to real inputs.
+    ///
+    /// Usually equal to the batch height. Smaller when a fixed input shape
+    /// ([`crate::FixedBatchShape`]) is enabled and the last batch is padded to that shape
+    /// with dummy rows. The consumer MUST cut off the tail: padding is not
+    /// data, its embeddings correspond to no input.
+    pub real_rows: usize,
 }
 
 impl SingleBatchOutput {
