@@ -34,6 +34,40 @@ pub(super) struct FastembedOnnxEmbedder {
 
 impl FastembedOnnxEmbedder {
     pub(super) fn new(backend: &EmbeddingBackend) -> Result<Self, EmbeddingError> {
+        Self::new_inner(backend, None)
+    }
+
+    /// The same initialization path, but with ORT profiling enabled.
+    ///
+    /// Profiling CANNOT be enabled after the session is built, hence a separate
+    /// constructor: the same `backend`, the same EP list, the same shape — otherwise
+    /// the profile would describe a session other than the one running in production, and the oracle
+    /// would gate its own copy of the code.
+    ///
+    /// `prefix` is the file name prefix; ORT appends a timestamp to it,
+    /// the actual path is returned by [`Self::end_profiling`].
+    #[cfg(test)]
+    pub(super) fn new_profiled(
+        backend: &EmbeddingBackend,
+        prefix: &std::path::Path,
+    ) -> Result<Self, EmbeddingError> {
+        Self::new_inner(backend, Some(prefix))
+    }
+
+    /// Close the ORT profile and return the path of the written file.
+    #[cfg(test)]
+    pub(super) fn end_profiling(&self) -> Result<std::path::PathBuf, EmbeddingError> {
+        let mut model = self.inner.lock().unwrap();
+        model
+            .end_profiling()
+            .map(std::path::PathBuf::from)
+            .map_err(|e| EmbeddingError::model_init(e.to_string()))
+    }
+
+    fn new_inner(
+        backend: &EmbeddingBackend,
+        profiling_prefix: Option<&std::path::Path>,
+    ) -> Result<Self, EmbeddingError> {
         if !backend.is_fastembed_onnx() {
             return Err(EmbeddingError::model_init(format!(
                 "embedding profile `{}` is not a fastembed ONNX profile",
@@ -64,6 +98,9 @@ impl FastembedOnnxEmbedder {
             .with_show_download_progress(false);
         if on_gpu {
             options = options.with_execution_providers(migraphx_execution_providers(model, shape)?);
+        }
+        if let Some(prefix) = profiling_prefix {
+            options = options.with_profiling(prefix.to_path_buf());
         }
         let mut inner = TextEmbedding::try_new(options)
             .map_err(|e| EmbeddingError::model_init(e.to_string()))?;
@@ -347,5 +384,100 @@ mod tests {
             .err()
             .expect("a zero batch height must be refused");
         assert!(err.to_string().contains("non-zero"), "{err}");
+    }
+
+    /// Oracle for the GPU path: the graph is ACTUALLY computed on MIGraphX, not on CPU.
+    ///
+    /// # What exactly it catches
+    /// `error_on_failure()` on the EP only covers 'the provider did not come up'.
+    /// The class 'the EP came up but took zero nodes' passes straight through it: the session
+    /// is alive, embeddings get computed, only the speed differs — i.e. before this
+    /// test the degradation was visible only by eye and only in a benchmark.
+    ///
+    /// # Why the assertion is about CPU nodes and not about a ratio
+    /// MIGraphX does not 'take nodes one by one': it cuts out a subgraph, compiles it
+    /// and substitutes ONE fused node. Measured on this scene: a healthy
+    /// GPU path gives `MIGraphXExecutionProvider=1` and zero CPU nodes, whereas
+    /// the same corpus on the CPU profile gives 365 nodes (see the positive control below).
+    /// So a ratio does not work as a metric here: a single unit 'weighs' the whole
+    /// graph. We assert two properties: the fused node EXISTS, and the CPU has not accumulated
+    /// a noticeable tail — i.e. the subgraph was not nibbled away piece by piece.
+    ///
+    /// The slack of 32 nodes is not a measured value but a margin: shape operators
+    /// (Shape/Reshape/Cast) may in principle stay outside the subgraph, as
+    /// seen on the python side with the ROCm EP (4158 nodes on GPU and 48 on CPU there — but
+    /// the ROCm EP does not fuse, and its node picture is different). It is an order of magnitude
+    /// below 365, so a 'graph went back to CPU' regression is caught with margin to spare.
+    ///
+    /// Requires a GPU, a system ORT with MIGraphX and a downloaded model, hence
+    /// `#[ignore]`; the first run on a cold kernel cache pays ~a minute of
+    /// compilation. Run:
+    /// `cargo test -p rmc-engine --features embeddings-migraphx migraphx_ep -- --ignored --nocapture`
+    #[cfg(feature = "embeddings-migraphx")]
+    #[test]
+    #[ignore = "needs an AMD GPU, ORT with MIGraphX and a downloaded model"]
+    fn migraphx_ep_actually_runs_the_graph() {
+        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP, ProviderCensus};
+
+        let _guard = model_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let backend = EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
+
+        let embedder =
+            FastembedOnnxEmbedder::new_profiled(&backend, &dir.path().join("migraphx")).unwrap();
+
+        // The profile is empty until at least one run has happened: the census must
+        // be based on the session's WORK, not on the fact that it was created.
+        let texts = corpus();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let embeddings = embedder.embed_documents(&refs).unwrap();
+        assert_eq!(embeddings.len(), refs.len());
+
+        let profile = embedder.end_profiling().unwrap();
+        let census = ProviderCensus::from_profile_file(&profile).unwrap();
+        eprintln!("nodes per provider: {census}");
+
+        assert!(
+            census.nodes_on(MIGRAPHX_EP) > 0,
+            "not a single node went to MIGraphX — silent fallback to CPU: {census}"
+        );
+        const CPU_TAIL_SLACK: usize = 32;
+        assert!(
+            census.nodes_on(CPU_EP) <= CPU_TAIL_SLACK,
+            "{} nodes left on CPU (slack {CPU_TAIL_SLACK}) — the subgraph did not move to the GPU entirely: {census}",
+            census.nodes_on(CPU_EP),
+        );
+    }
+
+    /// Positive control for the oracle above: on the CPU profile the census must
+    /// show CPU and ZERO nodes on MIGraphX.
+    ///
+    /// Without it a 'green GPU test' proves nothing: a test that is green both
+    /// when everything runs on GPU and when everything runs on CPU is not a gate but
+    /// decoration. Here the same machinery (profile → census) runs on a
+    /// known-CPU session, and the assertion is exactly the opposite — this shows that
+    /// the census DISTINGUISHES the two outcomes rather than always saying 'yes'.
+    ///
+    /// No GPU needed, only a downloaded model — hence `#[ignore]`:
+    /// `cargo test -p rmc-engine --features embeddings census_on_cpu -- --ignored --nocapture`
+    #[test]
+    #[ignore = "downloads the model from HF and runs forward on CPU"]
+    fn census_on_cpu_profile_sees_no_migraphx() {
+        use crate::embeddings::ep_census::{CPU_EP, MIGRAPHX_EP, ProviderCensus};
+
+        let _guard = model_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let backend = EmbeddingBackend::from_profile_name("local-cpu-small").unwrap();
+
+        let embedder =
+            FastembedOnnxEmbedder::new_profiled(&backend, &dir.path().join("cpu")).unwrap();
+        let texts = corpus();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        embedder.embed_documents(&refs).unwrap();
+
+        let census = ProviderCensus::from_profile_file(&embedder.end_profiling().unwrap()).unwrap();
+        eprintln!("nodes per provider (CPU profile): {census}");
+        assert_eq!(census.nodes_on(MIGRAPHX_EP), 0);
+        assert!(census.nodes_on(CPU_EP) > 0, "{census}");
     }
 }

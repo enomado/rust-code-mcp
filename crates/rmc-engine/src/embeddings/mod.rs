@@ -28,6 +28,9 @@ mod util;
 mod profile_registry;
 pub use profile_registry::resolve_profile;
 
+mod ep_census;
+pub use ep_census::{ProviderCensus, CPU_EP, MIGRAPHX_EP};
+
 mod fastembed_onnx;
 mod openrouter;
 pub use openrouter::{
