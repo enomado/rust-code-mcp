@@ -1,0 +1,162 @@
+[
+  {
+    "path": "crates/apps/accrual_calc/src/app.rs",
+    "query": "где рисуется форма редактирования вариантов долота: название, тип покупное/пометровое, факт-интервал"
+  },
+  {
+    "path": "crates/apps/rene2/src/app/camera.rs",
+    "query": "тестовая сцена bevy-приложения с камерой и данными траектории ствола для юнит-тестов"
+  },
+  {
+    "path": "crates/apps/rene2/src/data/pipe_od.rs",
+    "query": "трейт для наружного диаметра трубы вдоль ствола: диапазон MD, точки излома, диаметр в точке"
+  },
+  {
+    "path": "crates/apps/rheology_app/src/form_theta.rs",
+    "query": "форма редактирования параметров реологии Гершеля-Балкли (τy, K, n) в UI"
+  },
+  {
+    "path": "crates/apps/welllog/src/app.rs",
+    "query": "распознавание горячих клавиш undo/redo (Ctrl+Z, Ctrl+Shift+Z, Ctrl+Y) во viewport welllog, когда клавиатурный фокус свободен"
+  },
+  {
+    "path": "crates/apps/welllog/src/state/segment_prefs.rs",
+    "query": "тест: пустое хранилище настроек сегмента отличимо от хранилища с дефолтным значением"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/config/data_config.rs",
+    "query": "тест: подгонка размеров панелей на пустом экране не трогает размер рамки"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/graph/draw_graph/rulers.rs",
+    "query": "отрисовка активного жеста линейки (замер тренда между двумя точками) на графике welllog"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/layout/grid_render.rs",
+    "query": "маппинг варианта панели раскладки в строковую метку/id"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/notes/annotate.rs",
+    "query": "извлечь состояние модалки переименования одной заметки, вернуть None если открыта другая модалка"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/notes/derived.rs",
+    "query": "тест: кэш снапшота дорожки заметок пересобирается один раз за жест, а рендер-кэш — каждый кадр"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/notes/keymap.rs",
+    "query": "тест: стрелки принадлежат навигации таймлайна ровно при одной комбинации модификаторов клавиш"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/notes/notes_render/body.rs",
+    "query": "тест: шаг влево от крайней левой дорожки заметок попадает в жёлоб операций"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/notes/notes_render/body/interact.rs",
+    "query": "тестовый сценарий прилипания (snap) при перетаскивании тела заметки к соседней заметке"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/notes/notes_render/body/interact/dst.rs",
+    "query": "проекция состояния заметок и интервалов активити в id → интервал времени для DST-теста"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/notes/notes_render/journal/editor.rs",
+    "query": "тест: редактирование записи, которой больше нет в списках участников, не показывает автора"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/notes/notes_render/journal/rows.rs",
+    "query": "тест: журнал по умолчанию показывает два уровня вложенности, более глубокое — свёрнуто со счётчиком скрытых"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/notes/op_wiring.rs",
+    "query": "публикация черновика заметки: новый id и флаг public=true"
+  },
+  {
+    "path": "crates/apps/welllog/src/ui/notes/selection.rs",
+    "query": "итератор по выбранным рёбрам интервала при текущем захвате (grab)"
+  },
+  {
+    "path": "crates/apps/welllog/tests/fixture_round_trip.rs",
+    "query": "тест: цвет numeric-колонки после обратного заполнения фикстуры берётся по классу темы, а не по дефолту"
+  },
+  {
+    "path": "crates/apps/welllog_reports_ui/src/range.rs",
+    "query": "диапазон времени текущего календарного года с 1 января по 1 января в локальном времени"
+  },
+  {
+    "path": "crates/backend/data_logger/src/cli/commands/check_gtd_range.rs",
+    "query": "перевод диапазона календарных дат в Excel-числовой формат для запроса к GTD"
+  },
+  {
+    "path": "crates/backend/data_logger/src/load_thread_ssw.rs",
+    "query": "тест: молчаливая потеря части строк батча при синке засчитывается как Unaccounted, а не игнорируется"
+  },
+  {
+    "path": "crates/backend/etp_server/src/session.rs",
+    "query": "список поддерживаемых типов данных ETP-сервера для анонса возможностей клиенту"
+  },
+  {
+    "path": "crates/backend/main_db/service/src/auth/public_user.rs",
+    "query": "включить или выключить публичного пользователя прямым SQL UPDATE is_active"
+  },
+  {
+    "path": "crates/backend/main_db/service/src/utils/conversions.rs",
+    "query": "конвертация модели пользователя в DTO с датой последнего входа, без списка скважин"
+  },
+  {
+    "path": "crates/backend/main_db/service/src/well/journal/checkpoint.rs",
+    "query": "сравнение проекции журнала с чекпоинтом: список расхождений по id сущности"
+  },
+  {
+    "path": "crates/backend/main_db/service/src/well/journal/rebuild.rs",
+    "query": "тестовая фикстура строки заметки (модель notes) для конкретного ствола и пользователя"
+  },
+  {
+    "path": "crates/backend/main_db/service/src/well/well.rs",
+    "query": "создание новой скважины: генерация uuid и slug, запись в базу"
+  },
+  {
+    "path": "crates/backend/regime_features/src/stream.rs",
+    "query": "вычисление скорости проходки и максимума нагрузки на крюк в скользящем окне кольцевого буфера"
+  },
+  {
+    "path": "crates/backend/regime_research/src/bin/hrse_probe.rs",
+    "query": "резервуарная выборка сырых сэмплов буровых параметров в буфер фиксированного размера"
+  },
+  {
+    "path": "crates/backend/regime_research/src/cross_channel/bank.rs",
+    "query": "набор физически обоснованных кросс-канальных детекторов первого уровня: SPP, момент на долоте, MSE-баланс, скорость блока"
+  },
+  {
+    "path": "crates/backend/regime_research/src/hmm/activity_event.rs",
+    "query": "завершить и вернуть текущее событие активности с временем начала и конца"
+  },
+  {
+    "path": "crates/backend/regime_research/src/microstate/rotating.rs",
+    "query": "конфигурация уставки для детектора вращения: шаг, окно сглаживания, порог изменения RPM"
+  },
+  {
+    "path": "crates/backend/ssm_license/src/service.rs",
+    "query": "ручная реализация декодера base64url без паддинга"
+  },
+  {
+    "path": "crates/backend/ssm_main/src/data_plane/wellbore_survey_service.rs",
+    "query": "проверка доступа пользователя к стволу скважины в gRPC-сервисе инклинометрии, маппинг ошибок в статус"
+  },
+  {
+    "path": "crates/backend/ssm_main_client/src/client/calc.rs",
+    "query": "тест: при неуказанной роли пользователя старые булевы флаги admin/senior определяют роль по легаси-правилам"
+  },
+  {
+    "path": "crates/backend/ssm_observe/src/storage/lsm_backend.rs",
+    "query": "вычисление порога отсечения по TTL для очистки хранилища в зависимости от занятого места на диске"
+  },
+  {
+    "path": "crates/backend/ssm_web/src/controllers/drilling_company.rs",
+    "query": "конвертация строки буровой компании в DTO"
+  },
+  {
+    "path": "crates/backend/ssw_arch/src/query/get_columns.rs",
+    "query": "дедупликация колонок по коду с оставлением самой свежей по времени создания"
+  }
+]
