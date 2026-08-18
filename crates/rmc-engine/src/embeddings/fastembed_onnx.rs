@@ -308,9 +308,22 @@ fn ensure_migraphx_kernel_cache(
             dir.display()
         ))
     })?;
+
+    // Отметка «этой формой пользуются» ставится ДО уборки: иначе форма, которую
+    // мы прямо сейчас поднимаем, шла бы в вытеснение по чужой давности.
+    // Сноса её это не допустило бы и так (`keep`), но давность осталась бы
+    // враньём для следующего прогона.
+    crate::embeddings::kernel_cache::touch_last_used(&dir);
+    let cap_bytes = crate::embeddings::kernel_cache::cap_bytes_from_env()
+        .map_err(EmbeddingError::model_init)?;
+    let plan = crate::embeddings::kernel_cache::sweep(&root, &dir, cap_bytes);
+
     tracing::info!(
         target: "embeddings::fastembed_onnx",
         cache = %dir.display(),
+        cap_bytes,
+        cache_bytes = plan.bytes_after,
+        evicted_shapes = plan.remove.len(),
         "MIGraphX kernel cache"
     );
     // SAFETY: вызывается на пути инициализации эмбеддера, до создания ORT-сессии
