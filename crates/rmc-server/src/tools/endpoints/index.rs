@@ -56,7 +56,12 @@ fn resolve_backend(
     }
 
     let Some(s) = model else {
-        return Ok(automatic_embedding_backend());
+        // Neither profile nor legacy model: hand off to the SHARED resolver, not the built-in
+        // default directly; otherwise index_codebase silently indexes with a different
+        // embedder than the search tools use (they go through the resolver and know
+        // about RMC_EMBEDDING_PROFILE). The mismatch is visible only in the
+        // "Profile:" line of the response, i.e. it looks like success.
+        return resolve_embedding_backend_for_mcp(None, project_root);
     };
     let variant = parse_variant(s).map_err(|msg| McpError::invalid_params(msg, None))?;
     Ok(EmbeddingBackend::from_qwen3_variant(variant))
