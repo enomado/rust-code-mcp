@@ -52,6 +52,8 @@ struct ProfileOutcome {
     index_secs: f64,
     vector: RelevanceSummary,
     hybrid: RelevanceSummary,
+    /// Labels naming a file that is not in the index at all.
+    unreachable_labels: Vec<String>,
 }
 
 #[tokio::main]
@@ -87,6 +89,13 @@ async fn main() -> Result<()> {
     }
 
     print_table(&outcomes, &args.profiles);
+
+    // The table is printed either way — an hour of indexing should not be
+    // thrown away over a bad label — but the verdict is machine-readable:
+    // a broken ruler exits non-zero instead of only saying so on screen.
+    if outcomes.iter().any(|o| !o.unreachable_labels.is_empty()) {
+        std::process::exit(2);
+    }
     Ok(())
 }
 
@@ -130,6 +139,28 @@ async fn run_profile(
         bail!("indexing produced no chunks; nothing to search");
     }
 
+    // A label the indexer never ingested can never be found — by ANY profile.
+    // Left unchecked it lowers every row by the same amount and reads as "the
+    // models are weak" instead of "the ruler points at a file that is not
+    // there". Caught here, where the actual index can be asked.
+    let indexed = indexer
+        .vector_store_cloned()
+        .indexed_file_paths()
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot list indexed files: {e}"))?;
+    let indexed: std::collections::HashSet<RepoRelPath> = indexed
+        .iter()
+        .filter_map(|path| {
+            RepoRelPath::from_indexed_path(Path::new(path), &args.codebase)
+        })
+        .collect();
+    let unreachable_labels: Vec<String> = cases
+        .iter()
+        .flat_map(|case| case.expected_files.iter().map(move |f| (case, f)))
+        .filter(|(_, file)| !indexed.contains(*file))
+        .map(|(case, file)| format!("`{}` -> {}", case.query, file.0))
+        .collect();
+
     // Same generator and same store for both modes — the ONLY difference is
     // whether BM25 participates. Anything else would confound the comparison.
     let vector_only = HybridSearch::with_defaults(
@@ -156,6 +187,7 @@ async fn run_profile(
 
     Ok(ProfileOutcome {
         profile: profile_name.to_string(),
+        unreachable_labels,
         dim: backend.dim(),
         indexed_files: stats.indexed_files,
         total_chunks: stats.total_chunks,
@@ -175,10 +207,12 @@ async fn evaluate(
     let mut unjudgeable = 0usize;
 
     for case in cases {
+        // `SearchError` is not `Sync`, so it cannot ride anyhow's `Context`;
+        // flattened to text here rather than propagated as a typed cause.
         let results = search
             .search(&case.query, RESULT_LIMIT)
             .await
-            .with_context(|| format!("search failed for query `{}`", case.query))?;
+            .map_err(|e| anyhow::anyhow!("search failed for query `{}`: {e}", case.query))?;
 
         let mut ranked = Vec::with_capacity(results.len());
         for result in &results {
@@ -224,6 +258,15 @@ fn print_profile_detail(outcome: &ProfileOutcome) {
             summary.queries_without_hit,
             summary.unjudgeable_results
         );
+    }
+    if !outcome.unreachable_labels.is_empty() {
+        println!(
+            "  BROKEN RULER: {} label(s) name a file the indexer never ingested:",
+            outcome.unreachable_labels.len()
+        );
+        for label in &outcome.unreachable_labels {
+            println!("    {label}");
+        }
     }
     println!();
 }
