@@ -5,27 +5,12 @@
 //! nothing about GPU EPs and should not have to — it accepts the EPs from outside.
 
 use crate::embeddings::backend::{EmbeddingBackend, EmbeddingRuntime};
+use crate::embeddings::batching::FixedInputShape;
 use crate::embeddings::ep_census::ProviderCensus;
 use crate::embeddings::profile::FastembedOnnxModel;
 use crate::embeddings::{Embedding, EmbeddingError};
 use fastembed::{EmbeddingModel, FixedBatchShape, TextEmbedding, TextInitOptions};
 use std::sync::Mutex;
-
-/// Batch height that the MIGraphX kernels are compiled for.
-///
-/// # Why the shape is constant
-/// MIGraphX compiles kernels FOR THE INPUT SHAPE: every new pair
-/// (rows × length) costs 45–70 s of compilation and ~145–200 MB in the `.mxr` cache.
-/// The shape fastembed produces by default floats along both axes
-/// (padding to the longest row IN THE BATCH + an incomplete last batch), and a single
-/// indexing run over 40 files produced 4 shapes and 659 MB of cache. Fixing it leaves one.
-///
-/// # Why exactly 32
-/// It is both the height at which the GPU path's ceiling was measured (242 seq/s vs 7.5 on CPU)
-/// and the indexer's default `gpu_batch_size` — i.e. in a typical run
-/// only the last chunk needs padding. The number is deliberately NOT derived from the
-/// input: the point is that the shape does not depend on how many texts arrived.
-const GPU_BATCH_ROWS: usize = 32;
 
 pub(super) struct FastembedOnnxEmbedder {
     inner: Mutex<TextEmbedding>,
@@ -87,15 +72,24 @@ impl FastembedOnnxEmbedder {
 
         // The input shape is computed BEFORE the session is created: the kernel cache
         // directory depends on it and must be set before the EP takes control.
-        let shape = FixedBatchShape {
-            rows: GPU_BATCH_ROWS,
-            seq_len: backend.max_len,
-        };
+        //
+        // The value is declared by the BACKEND — the indexer reads the same value when it cuts
+        // inputs into batches. The refusal here is not hypothetical: it fires if
+        // someone adds a GPU runtime and forgets the second half of the pair
+        // 'runtime ⇄ shape', and then we would silently pay kernel compilation for every
+        // random input shape.
+        let shape = backend.fixed_input_shape().map(to_fastembed_shape);
+        if on_gpu && shape.is_none() {
+            return Err(EmbeddingError::model_init(format!(
+                "profile `{}` runs on MIGraphX but declares no fixed input shape",
+                backend.profile.name()
+            )));
+        }
 
         let mut options = TextInitOptions::new(to_fastembed_model(model))
             .with_max_length(backend.max_len)
             .with_show_download_progress(false);
-        if on_gpu {
+        if let (true, Some(shape)) = (on_gpu, shape) {
             options = options.with_execution_providers(migraphx_execution_providers(model, shape)?);
         }
         if let Some(prefix) = profiling_prefix {
@@ -103,7 +97,7 @@ impl FastembedOnnxEmbedder {
         }
         let mut inner = TextEmbedding::try_new(options)
             .map_err(|e| EmbeddingError::model_init(e.to_string()))?;
-        if on_gpu {
+        if let (true, Some(shape)) = (on_gpu, shape) {
             inner = inner
                 .with_fixed_batch_shape(shape)
                 .map_err(|e| EmbeddingError::model_init(e.to_string()))?;
@@ -195,6 +189,18 @@ pub(super) fn probe_provider_census(
 
     let _ = std::fs::remove_dir_all(&dir);
     census
+}
+
+/// Our shape → the vendor's shape.
+///
+/// A separate translator function so that fastembed's `FixedBatchShape` does not
+/// spread beyond this module: the indexer needs the shape, but not a dependency on the
+/// vendor.
+fn to_fastembed_shape(shape: FixedInputShape) -> FixedBatchShape {
+    FixedBatchShape {
+        rows: shape.rows.0,
+        seq_len: shape.seq_len,
+    }
 }
 
 fn to_fastembed_model(model: FastembedOnnxModel) -> EmbeddingModel {

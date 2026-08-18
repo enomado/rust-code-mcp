@@ -8,12 +8,32 @@
 //! `LocalLoaderSpec`, `FastembedOnnxModel`, `Qwen3Variant`, and the
 //! built-in profile registry — lives in [`super::profile`].
 
+use super::batching::{BatchRows, FixedInputShape};
 use super::error::EmbeddingError;
 use super::identity::EmbeddingIdentity;
 use super::profile::{
     EmbeddingProfile, FastembedOnnxModel, LocalLoaderSpec, QueryPolicy, Qwen3Variant,
 };
 use super::util::arc;
+
+/// Batch height that the MIGraphX kernels are compiled for.
+///
+/// # Why the shape is constant
+/// MIGraphX compiles kernels FOR THE INPUT SHAPE: every new pair
+/// (rows × length) costs 45–70 s of compilation and ~145–200 MB in the `.mxr` cache.
+/// The shape fastembed produces by default floats along both axes
+/// (padding to the longest row IN THE BATCH + an incomplete last batch), and a single
+/// indexing run over 40 files produced 4 shapes and 659 MB of cache. Fixing it leaves one.
+///
+/// # Why exactly 32
+/// It is the height at which the GPU path's ceiling was measured (242 seq/s vs 7.5 on CPU).
+/// The number is deliberately NOT derived from the input: the point is that the shape does not depend
+/// on how many texts arrived.
+///
+/// The coincidence with the indexer's default `gpu_batch_size` NO LONGER carries any weight:
+/// with a constant shape the indexer takes the height from here and does not apply its own setting
+/// at all.
+const GPU_BATCH_ROWS: BatchRows = BatchRows(32);
 
 /// Cross-crate embedding runtime boundary.
 ///
@@ -73,9 +93,7 @@ impl EmbeddingBackend {
     pub fn from_qwen3_variant(variant: Qwen3Variant) -> Self {
         let profile = EmbeddingProfile::built_in_profiles()
             .iter()
-            .find(|profile| {
-                profile.local_loader == Some(LocalLoaderSpec::Qwen3(variant))
-            })
+            .find(|profile| profile.local_loader == Some(LocalLoaderSpec::Qwen3(variant)))
             .cloned()
             .expect("built-in Qwen3 embedding profile exists");
         Self::from_profile(profile)
@@ -142,6 +160,29 @@ impl EmbeddingBackend {
                 self.profile.name()
             ))
         })
+    }
+
+    /// Constant input shape, if this profile's runtime REQUIRES one.
+    ///
+    /// # Single source of the shape
+    /// The shape is read by two parties: the model loader (compiles kernels for it and
+    /// addresses the cache directory by it) and the indexer (cuts inputs by it). While each
+    /// knew its own constant, their consistency rested on the coincidence of
+    /// defaults — see [`super::batching::BatchingPolicy`]. Now the value
+    /// is declared by ONE side, and the other accepts it.
+    ///
+    /// `None` does not mean 'shape unknown' but 'the runtime does not need a shape': on CPU and for
+    /// API models padding to the longest row in the batch is free.
+    pub fn fixed_input_shape(&self) -> Option<FixedInputShape> {
+        match self.runtime {
+            EmbeddingRuntime::LocalFastembedOnnxMigraphx => Some(FixedInputShape {
+                rows: GPU_BATCH_ROWS,
+                seq_len: self.max_len,
+            }),
+            EmbeddingRuntime::LocalQwen3CandleCuda
+            | EmbeddingRuntime::LocalFastembedOnnxCpu
+            | EmbeddingRuntime::OpenRouter => None,
+        }
     }
 
     pub fn format_query(&self, text: &str) -> String {
@@ -311,9 +352,7 @@ impl EmbeddingBackend {
                     )));
                 }
                 match parts[1] {
-                    "qwen/qwen3-embedding-8b" => {
-                        Self::from_profile_name("openrouter-qwen3-8b")?
-                    }
+                    "qwen/qwen3-embedding-8b" => Self::from_profile_name("openrouter-qwen3-8b")?,
                     other => {
                         return Err(EmbeddingError::invalid_identity(format!(
                             "unknown OpenRouter model `{}` in `{}`",
@@ -365,8 +404,8 @@ impl EmbeddingBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::profile::QWEN3_CODE_QUERY_PREFIX;
+    use super::*;
 
     fn profile(name: &str) -> EmbeddingProfile {
         EmbeddingProfile::parse(name).unwrap()
@@ -391,7 +430,10 @@ mod tests {
 
     #[test]
     fn profile_dimensions_match_expected_values() {
-        assert_eq!(EmbeddingBackend::from_profile(profile("local-cpu-small")).dim(), 384);
+        assert_eq!(
+            EmbeddingBackend::from_profile(profile("local-cpu-small")).dim(),
+            384
+        );
         assert_eq!(
             EmbeddingBackend::from_profile(profile("openrouter-qwen3-8b")).dim(),
             4096
@@ -412,13 +454,11 @@ mod tests {
     #[test]
     fn query_policy_is_profile_aware() {
         assert_eq!(
-            EmbeddingBackend::from_profile(profile("local-gpu-small"))
-                .format_query("find parser"),
+            EmbeddingBackend::from_profile(profile("local-gpu-small")).format_query("find parser"),
             "Instruct: Given a code search query, retrieve relevant code\nQuery: find parser"
         );
         assert_eq!(
-            EmbeddingBackend::from_profile(profile("local-cpu-small"))
-                .format_query("find parser"),
+            EmbeddingBackend::from_profile(profile("local-cpu-small")).format_query("find parser"),
             "Represent this sentence for searching relevant passages: find parser"
         );
     }
@@ -501,8 +541,7 @@ mod tests {
 
     #[test]
     fn from_identity_accepts_legacy_identities() {
-        let default =
-            "fastembed-candle:Qwen3-Embedding-0.6B:dim1024:max1024:v2";
+        let default = "fastembed-candle:Qwen3-Embedding-0.6B:dim1024:max1024:v2";
         let cpu = "fastembed-onnx-cpu:BGESmallENV15Q:dim384:max512:v1";
         let openrouter = "openrouter:qwen/qwen3-embedding-8b:dim4096:max32768:v1";
 
@@ -546,13 +585,55 @@ mod tests {
     #[test]
     fn from_identity_rejects_garbage() {
         assert!(EmbeddingBackend::from_identity("garbage").is_err());
-        assert!(EmbeddingBackend::from_identity(
-            "fastembed-candle:Qwen3-Embedding-0.6B:dim999:max2048:v2"
-        )
-        .is_err());
-        assert!(EmbeddingBackend::from_identity(
-            "fastembed-candle:Qwen3-Embedding-0.6B:dim1024:max1024:v1"
-        )
-        .is_err());
+        assert!(
+            EmbeddingBackend::from_identity(
+                "fastembed-candle:Qwen3-Embedding-0.6B:dim999:max2048:v2"
+            )
+            .is_err()
+        );
+        assert!(
+            EmbeddingBackend::from_identity(
+                "fastembed-candle:Qwen3-Embedding-0.6B:dim1024:max1024:v1"
+            )
+            .is_err()
+        );
+    }
+
+    /// Gate for the pair 'runtime ⇄ constant shape': a shape exists for EXACTLY those
+    /// runtimes that compile kernels for it.
+    ///
+    /// Introduced because the halves of the pair live in different files: the model loader
+    /// refuses if the runtime is a GPU one and there is no shape — but the reverse
+    /// skew (a shape declared for a runtime that does not need it) would go unnoticed by
+    /// anyone except this test. It also keeps coverage: a new runtime must
+    /// appear in the `match` explicitly, otherwise `fixed_input_shape` will not compile.
+    #[test]
+    fn fixed_shape_exists_exactly_for_shape_compiling_runtimes() {
+        let profiles = EmbeddingProfile::built_in_profiles();
+        let mut seen_migraphx = false;
+        for profile in profiles.iter() {
+            let backend = EmbeddingBackend::from_profile(profile.clone());
+            let shape = backend.fixed_input_shape();
+            let wants_shape = backend.runtime == EmbeddingRuntime::LocalFastembedOnnxMigraphx;
+            assert_eq!(
+                shape.is_some(),
+                wants_shape,
+                "profile `{}` ({:?}): shape and runtime diverged",
+                profile.name(),
+                backend.runtime
+            );
+            if let Some(shape) = shape {
+                seen_migraphx = true;
+                assert_eq!(shape.rows, GPU_BATCH_ROWS);
+                // The sequence length is the backend's `max_len`, not a
+                // constant: it is overridden per instance, and a mismatch with it
+                // would mean compiling kernels for a shape that never occurs.
+                assert_eq!(shape.seq_len, backend.max_len);
+            }
+        }
+        assert!(
+            seen_migraphx,
+            "no GPU profile left in the registry — the test has become vacuous"
+        );
     }
 }
