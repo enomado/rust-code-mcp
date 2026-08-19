@@ -64,6 +64,17 @@ pub enum EmbeddingRuntime {
     /// an int8-quantized one, i.e. the vectors are DIFFERENT, and mixing them in one
     /// index is not allowed.
     LocalFastembedOnnxMigraphx,
+    /// The same ONNX graph, executed on GPU via the **DirectML EP** — the WINDOWS path.
+    ///
+    /// A separate variant for the same reason as MIGraphX (it is in
+    /// `EmbeddingIdentity` ⇒ separates indexes), and additionally because these are
+    /// DIFFERENT runtimes with different arithmetic: DirectML computes fp16 where
+    /// MIGraphX computes fp32, so vectors from the two GPU paths must not be mixed
+    /// any more than GPU and CPU vectors.
+    ///
+    /// Why not MIGraphX on Windows: it does not exist there at all — not the whole ROCm
+    /// stack has been ported to Windows, and MIGraphX is not part of what was ported.
+    LocalFastembedOnnxDirectml,
     OpenRouter,
 }
 
@@ -149,7 +160,9 @@ impl EmbeddingBackend {
     pub fn is_fastembed_onnx(&self) -> bool {
         matches!(
             self.runtime,
-            EmbeddingRuntime::LocalFastembedOnnxCpu | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+            EmbeddingRuntime::LocalFastembedOnnxCpu
+                | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+                | EmbeddingRuntime::LocalFastembedOnnxDirectml
         )
     }
 
@@ -175,7 +188,13 @@ impl EmbeddingBackend {
     /// API models padding to the longest row in the batch is free.
     pub fn fixed_input_shape(&self) -> Option<FixedInputShape> {
         match self.runtime {
-            EmbeddingRuntime::LocalFastembedOnnxMigraphx => Some(FixedInputShape {
+            // MIGraphX compiles kernels for the shape; DirectML does not compile kernels,
+            // but likewise rebuilds the graph for every new shape, and its
+            // own documentation says outright that the EP works best
+            // when input sizes are known at session creation. For both we
+            // DECLARE the shape — the only difference is the cost of violating it.
+            EmbeddingRuntime::LocalFastembedOnnxMigraphx
+            | EmbeddingRuntime::LocalFastembedOnnxDirectml => Some(FixedInputShape {
                 rows: GPU_BATCH_ROWS,
                 seq_len: self.max_len,
             }),
@@ -183,6 +202,20 @@ impl EmbeddingBackend {
             | EmbeddingRuntime::LocalFastembedOnnxCpu
             | EmbeddingRuntime::OpenRouter => None,
         }
+    }
+
+    /// Whether this backend goes through fastembed/ONNX ON GPU.
+    ///
+    /// Collected in one place on purpose: there are now two GPU runtimes (MIGraphX on
+    /// Linux, DirectML on Windows), and any `== LocalFastembedOnnxMigraphx` in
+    /// the sense of 'this is GPU' became a BUG once the second one appeared — it would silently answer
+    /// 'no' on the Windows path.
+    pub fn is_fastembed_onnx_gpu(&self) -> bool {
+        matches!(
+            self.runtime,
+            EmbeddingRuntime::LocalFastembedOnnxMigraphx
+                | EmbeddingRuntime::LocalFastembedOnnxDirectml
+        )
     }
 
     pub fn format_query(&self, text: &str) -> String {
@@ -600,7 +633,7 @@ mod tests {
     }
 
     /// Gate for the pair 'runtime ⇄ constant shape': a shape exists for EXACTLY those
-    /// runtimes that compile kernels for it.
+    /// runtimes that execute the graph on GPU.
     ///
     /// Introduced because the halves of the pair live in different files: the model loader
     /// refuses if the runtime is a GPU one and there is no shape — but the reverse
@@ -610,11 +643,11 @@ mod tests {
     #[test]
     fn fixed_shape_exists_exactly_for_shape_compiling_runtimes() {
         let profiles = EmbeddingProfile::built_in_profiles();
-        let mut seen_migraphx = false;
+        let mut seen_gpu = false;
         for profile in profiles.iter() {
             let backend = EmbeddingBackend::from_profile(profile.clone());
             let shape = backend.fixed_input_shape();
-            let wants_shape = backend.runtime == EmbeddingRuntime::LocalFastembedOnnxMigraphx;
+            let wants_shape = backend.is_fastembed_onnx_gpu();
             assert_eq!(
                 shape.is_some(),
                 wants_shape,
@@ -623,7 +656,7 @@ mod tests {
                 backend.runtime
             );
             if let Some(shape) = shape {
-                seen_migraphx = true;
+                seen_gpu = true;
                 assert_eq!(shape.rows, GPU_BATCH_ROWS);
                 // The sequence length is the backend's `max_len`, not a
                 // constant: it is overridden per instance, and a mismatch with it
@@ -632,7 +665,7 @@ mod tests {
             }
         }
         assert!(
-            seen_migraphx,
+            seen_gpu,
             "no GPU profile left in the registry — the test has become vacuous"
         );
     }

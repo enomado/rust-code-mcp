@@ -27,6 +27,12 @@ use std::path::Path;
 
 /// Name of the MIGraphX EP in the ORT profile: what the provider tags its nodes with.
 pub const MIGRAPHX_EP: &str = "MIGraphXExecutionProvider";
+/// Name of the DirectML EP in the ORT profile (the Windows GPU path).
+///
+/// 🚨 Not `DirectMLExecutionProvider`: ORT uses the short name, and a typo
+/// here would go completely unnoticed: the census would just return zero nodes, i.e.
+/// the 'GPU really works' gate would go red on a healthy machine.
+pub const DIRECTML_EP: &str = "DmlExecutionProvider";
 /// Name of the CPU EP in the ORT profile. Shape nodes (Shape/Reshape/Cast) stay on it
 /// even with a fully healthy GPU path; there are a handful of them, and that is normal.
 pub const CPU_EP: &str = "CPUExecutionProvider";

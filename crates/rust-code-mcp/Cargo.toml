@@ -73,3 +73,6 @@ embedded = []
 cuda = ["rmc-server/cuda"]
 # AMD GPU (MIGraphX). Requires a system ONNX Runtime built with the MIGraphX EP.
 migraphx = ["rmc-server/migraphx"]
+# GPU on Windows (DirectML). Requires an ORT built with the DirectML EP: the DLL from NuGet
+# `Microsoft.ML.OnnxRuntime.DirectML`; no ROCm needed, it runs on DX12.
+directml = ["rmc-server/directml"]

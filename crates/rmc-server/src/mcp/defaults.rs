@@ -1,7 +1,8 @@
 //! Operational defaults for MCP server startup and automatic work.
 
 use rmc_engine::embeddings::{
-    CPU_EP, EmbeddingBackend, EmbeddingRuntime, MIGRAPHX_EP, ProviderCensus, probe_provider_census,
+    CPU_EP, DIRECTML_EP, EmbeddingBackend, EmbeddingRuntime, MIGRAPHX_EP, ProviderCensus,
+    probe_provider_census,
 };
 use std::sync::OnceLock;
 
@@ -148,10 +149,20 @@ pub(crate) fn ep_census_verdict(
     // a subgraph and substitutes ONE fused node — on a healthy GPU path the census
     // looks like `MIGraphXExecutionProvider=1`. So there is exactly one threshold here:
     // the fused node is either there or not.
-    if runtime == EmbeddingRuntime::LocalFastembedOnnxMigraphx && census.nodes_on(MIGRAPHX_EP) == 0
-    {
+    //
+    // The threshold is the same for both GPU runtimes, but each has ITS OWN provider:
+    // asking for MIGraphX on the Windows profile is guaranteed to yield
+    // zero and declare a refusal on a healthy machine.
+    let (want_ep, ep_label) = match runtime {
+        EmbeddingRuntime::LocalFastembedOnnxMigraphx => (MIGRAPHX_EP, "MIGraphX"),
+        EmbeddingRuntime::LocalFastembedOnnxDirectml => (DIRECTML_EP, "DirectML"),
+        EmbeddingRuntime::LocalQwen3CandleCuda
+        | EmbeddingRuntime::LocalFastembedOnnxCpu
+        | EmbeddingRuntime::OpenRouter => return Ok(()),
+    };
+    if census.nodes_on(want_ep) == 0 {
         return Err(format!(
-            "profile `{profile}` asks for MIGraphX, but not a single graph node ran on it \
+            "profile `{profile}` asks for {ep_label}, but not a single graph node ran on it \
              (census: {census}) — the graph silently fell back to CPU"
         ));
     }
@@ -269,6 +280,55 @@ mod tests {
                 &census
             )
             .is_ok()
+        );
+    }
+
+    /// The Windows GPU path is judged by ITS OWN provider.
+    #[test]
+    fn ep_verdict_accepts_a_directml_node() {
+        let census =
+            ProviderCensus::from_profile_json(&profile_json(&[("MatMul_0", DIRECTML_EP)])).unwrap();
+
+        assert!(
+            ep_census_verdict(
+                EmbeddingRuntime::LocalFastembedOnnxDirectml,
+                "local-dml-bge",
+                &census
+            )
+            .is_ok()
+        );
+    }
+
+    /// 🚨 Gate against the most likely mistake in this layer: judging the Windows
+    /// profile by MIGraphX. The census is HEALTHY — the whole graph is on DirectML — and
+    /// a verdict asking about the wrong provider would declare a refusal on a working
+    /// machine. The reverse pair is checked too: a MIGraphX profile with only
+    /// DirectML nodes is a refusal, not 'well, it is a GPU anyway'.
+    #[test]
+    fn ep_verdict_asks_the_provider_that_matches_the_runtime() {
+        let dml_only =
+            ProviderCensus::from_profile_json(&profile_json(&[("MatMul_0", DIRECTML_EP)])).unwrap();
+        assert!(
+            ep_census_verdict(
+                EmbeddingRuntime::LocalFastembedOnnxMigraphx,
+                "local-gpu-bge",
+                &dml_only
+            )
+            .is_err(),
+            "a MIGraphX profile must refuse a census without MIGraphX nodes"
+        );
+
+        let migraphx_only =
+            ProviderCensus::from_profile_json(&profile_json(&[("MIGraphX_0", MIGRAPHX_EP)]))
+                .unwrap();
+        assert!(
+            ep_census_verdict(
+                EmbeddingRuntime::LocalFastembedOnnxDirectml,
+                "local-dml-bge",
+                &migraphx_only
+            )
+            .is_err(),
+            "a DirectML profile must refuse a census without DirectML nodes"
         );
     }
 

@@ -42,6 +42,25 @@ embeddings-migraphx = [
   # Compiled-kernel cache directory; see ensure_migraphx_kernel_cache().
   "dep:directories",
 ]
+# AMD (and any other DX12) GPU on WINDOWS, via the DirectML EP.
+#
+# A separate feature rather than 'GPU in general', because MIGraphX does NOT exist on
+# Windows: not all of the ROCm stack has been ported to Windows, MIGraphX is not part of
+# the ported set (ROCm/TheRock#1912 is open), and the only AMD plugin EP for ORT
+# that made it to Windows is DirectML. So this is not 'a second way to do the same', but
+# the ONLY way to compute embeddings inside the tool on Windows.
+#
+# `fastembed/directml` is required, and not for the EP: through it the vendored fastembed
+# recognizes DirectML in the provider list and disables memory pattern + parallel
+# execution (init_session_builder), which the DirectML EP does not survive. Taking
+# `ort/directml` without it means building a session that crashes or silently
+# degrades, and not in this file.
+embeddings-directml = [
+  "embeddings",
+  "dep:ort",
+  "ort/directml",
+  "fastembed/directml",
+]
 vector-store = [
   "embeddings",
   "dep:lancedb",
