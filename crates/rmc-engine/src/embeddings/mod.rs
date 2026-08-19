@@ -29,7 +29,7 @@ mod profile_registry;
 pub use profile_registry::resolve_profile;
 
 mod ep_census;
-pub use ep_census::{ProviderCensus, CPU_EP, MIGRAPHX_EP};
+pub use ep_census::{ProviderCensus, CPU_EP, DIRECTML_EP, MIGRAPHX_EP};
 
 mod kernel_cache;
 
@@ -118,7 +118,8 @@ impl EmbeddingGenerator {
                 openrouter::OpenRouterEmbedder::new(&backend)?,
             )),
             EmbeddingRuntime::LocalFastembedOnnxCpu
-            | EmbeddingRuntime::LocalFastembedOnnxMigraphx => {
+            | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+            | EmbeddingRuntime::LocalFastembedOnnxDirectml => {
                 EmbeddingGeneratorInner::FastembedOnnx(Arc::new(
                     fastembed_onnx::FastembedOnnxEmbedder::new(&backend)?,
                 ))

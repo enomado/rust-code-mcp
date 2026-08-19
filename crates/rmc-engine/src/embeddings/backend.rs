@@ -64,6 +64,17 @@ pub enum EmbeddingRuntime {
     /// int8-квантованную, то есть векторы РАЗНЫЕ, и смешивать их в одном
     /// индексе нельзя.
     LocalFastembedOnnxMigraphx,
+    /// Тот же ONNX-граф, исполняемый на GPU через **DirectML EP** — путь ВИНДЫ.
+    ///
+    /// Отдельный вариант по той же причине, что и MIGraphX (он в
+    /// `EmbeddingIdentity` ⇒ разделяет индексы), и вдобавок потому, что это
+    /// РАЗНЫЕ рантаймы с разной арифметикой: DirectML считает fp16 там, где
+    /// MIGraphX считает fp32, так что векторы двух GPU-путей смешивать нельзя
+    /// не меньше, чем векторы GPU и CPU.
+    ///
+    /// Почему не MIGraphX на винде: его там нет вообще — из ROCm под Windows
+    /// портирован не весь стек, MIGraphX в портированное не входит.
+    LocalFastembedOnnxDirectml,
     OpenRouter,
 }
 
@@ -149,7 +160,9 @@ impl EmbeddingBackend {
     pub fn is_fastembed_onnx(&self) -> bool {
         matches!(
             self.runtime,
-            EmbeddingRuntime::LocalFastembedOnnxCpu | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+            EmbeddingRuntime::LocalFastembedOnnxCpu
+                | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+                | EmbeddingRuntime::LocalFastembedOnnxDirectml
         )
     }
 
@@ -175,7 +188,13 @@ impl EmbeddingBackend {
     /// API-моделей паддинг до самой длинной строки в батче бесплатен.
     pub fn fixed_input_shape(&self) -> Option<FixedInputShape> {
         match self.runtime {
-            EmbeddingRuntime::LocalFastembedOnnxMigraphx => Some(FixedInputShape {
+            // MIGraphX компилирует ядра под форму; DirectML ядра не компилирует,
+            // но так же перестраивает граф на каждую новую форму, а его
+            // собственная дока прямо говорит, что EP работает лучше всего,
+            // когда размеры входов известны на создании сессии. Обоим форму
+            // ОБЪЯВЛЯЕМ — разница только в цене её нарушения.
+            EmbeddingRuntime::LocalFastembedOnnxMigraphx
+            | EmbeddingRuntime::LocalFastembedOnnxDirectml => Some(FixedInputShape {
                 rows: GPU_BATCH_ROWS,
                 seq_len: self.max_len,
             }),
@@ -183,6 +202,20 @@ impl EmbeddingBackend {
             | EmbeddingRuntime::LocalFastembedOnnxCpu
             | EmbeddingRuntime::OpenRouter => None,
         }
+    }
+
+    /// Идёт ли этот бэкенд через fastembed/ONNX НА GPU.
+    ///
+    /// Собрано в одном месте нарочно: GPU-рантаймов теперь два (MIGraphX на
+    /// линуксе, DirectML на винде), и любое `== LocalFastembedOnnxMigraphx` в
+    /// смысле «это GPU» с появлением второго стало БАГОМ — молча отвечало бы
+    /// «нет» на виндовом пути.
+    pub fn is_fastembed_onnx_gpu(&self) -> bool {
+        matches!(
+            self.runtime,
+            EmbeddingRuntime::LocalFastembedOnnxMigraphx
+                | EmbeddingRuntime::LocalFastembedOnnxDirectml
+        )
     }
 
     pub fn format_query(&self, text: &str) -> String {
@@ -600,7 +633,7 @@ mod tests {
     }
 
     /// Гейт пары «рантайм ⇄ постоянная форма»: форма есть РОВНО у тех
-    /// рантаймов, что компилируют ядра под неё.
+    /// рантаймов, что исполняют граф на GPU.
     ///
     /// Заведён потому, что половинки пары живут в разных файлах: загрузчик
     /// модели откажет, если рантайм GPU-шный, а формы нет, — но обратный
@@ -610,11 +643,11 @@ mod tests {
     #[test]
     fn fixed_shape_exists_exactly_for_shape_compiling_runtimes() {
         let profiles = EmbeddingProfile::built_in_profiles();
-        let mut seen_migraphx = false;
+        let mut seen_gpu = false;
         for profile in profiles.iter() {
             let backend = EmbeddingBackend::from_profile(profile.clone());
             let shape = backend.fixed_input_shape();
-            let wants_shape = backend.runtime == EmbeddingRuntime::LocalFastembedOnnxMigraphx;
+            let wants_shape = backend.is_fastembed_onnx_gpu();
             assert_eq!(
                 shape.is_some(),
                 wants_shape,
@@ -623,7 +656,7 @@ mod tests {
                 backend.runtime
             );
             if let Some(shape) = shape {
-                seen_migraphx = true;
+                seen_gpu = true;
                 assert_eq!(shape.rows, GPU_BATCH_ROWS);
                 // Длина последовательности — это `max_len` бэкенда, а не
                 // константа: она переопределяется на инстансе, и разъезд с ней
@@ -632,7 +665,7 @@ mod tests {
             }
         }
         assert!(
-            seen_migraphx,
+            seen_gpu,
             "в реестре не осталось GPU-профиля — тест стал вакуумным"
         );
     }

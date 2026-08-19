@@ -8,6 +8,7 @@ edition = "2024"
 default = []
 cuda = ["rmc-engine/embeddings-cuda", "rmc-indexing/cuda"]
 migraphx = ["rmc-engine/embeddings-migraphx", "rmc-indexing/migraphx"]
+directml = ["rmc-engine/embeddings-directml", "rmc-indexing/directml"]
 
 [dependencies]
 # In-workspace dependencies

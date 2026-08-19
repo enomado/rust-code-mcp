@@ -42,6 +42,25 @@ embeddings-migraphx = [
   # Каталог кэша скомпилированных ядер — см. ensure_migraphx_kernel_cache().
   "dep:directories",
 ]
+# AMD (и любой другой DX12) GPU на ВИНДЕ — через DirectML EP.
+#
+# Отдельная фича, а не «GPU вообще», потому что MIGraphX под Windows НЕ
+# существует: из ROCm под винду портирован не весь стек, MIGraphX в
+# портированное не входит (ROCm/TheRock#1912 открыт), а в плагин-EP AMD для ORT
+# под винду попал только DirectML. То есть это не «второй способ того же», а
+# ЕДИНСТВЕННЫЙ способ считать эмбеддинги внутри тула на винде.
+#
+# `fastembed/directml` обязателен, и не ради EP: по нему вендоренный fastembed
+# узнаёт DirectML в списке провайдеров и выключает memory pattern + parallel
+# execution (init_session_builder), чего DirectML EP не переживает. Взять
+# `ort/directml` без него — значит собрать сессию, которая падает или молча
+# деградирует, причём не в этом файле.
+embeddings-directml = [
+  "embeddings",
+  "dep:ort",
+  "ort/directml",
+  "fastembed/directml",
+]
 vector-store = [
   "embeddings",
   "dep:lancedb",

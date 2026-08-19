@@ -27,6 +27,12 @@ use std::path::Path;
 
 /// Имя MIGraphX EP в профиле ORT — то, чем провайдер подписывает свои узлы.
 pub const MIGRAPHX_EP: &str = "MIGraphXExecutionProvider";
+/// Имя DirectML EP в профиле ORT (виндовый GPU-путь).
+///
+/// 🚨 Не `DirectMLExecutionProvider`: ORT называет его сокращённо, и опечатка
+/// здесь не заметна ничем — перепись просто вернула бы ноль узлов, то есть
+/// гейт «GPU правда работает» краснел бы на здоровой машине.
+pub const DIRECTML_EP: &str = "DmlExecutionProvider";
 /// Имя CPU EP в профиле ORT. Узлы формы (Shape/Reshape/Cast) остаются на нём
 /// даже при полностью здоровом GPU-пути — их горстка, и это норма.
 pub const CPU_EP: &str = "CPUExecutionProvider";

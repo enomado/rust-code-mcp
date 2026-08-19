@@ -59,7 +59,7 @@ impl FastembedOnnxEmbedder {
             )));
         }
         let model = backend.require_fastembed_onnx_model()?;
-        let on_gpu = backend.runtime == EmbeddingRuntime::LocalFastembedOnnxMigraphx;
+        let on_gpu = backend.is_fastembed_onnx_gpu();
 
         tracing::info!(
             target: "embeddings::fastembed_onnx",
@@ -81,7 +81,7 @@ impl FastembedOnnxEmbedder {
         let shape = backend.fixed_input_shape().map(to_fastembed_shape);
         if on_gpu && shape.is_none() {
             return Err(EmbeddingError::model_init(format!(
-                "profile `{}` runs on MIGraphX but declares no fixed input shape",
+                "profile `{}` runs on a GPU execution provider but declares no fixed input shape",
                 backend.profile.name()
             )));
         }
@@ -90,7 +90,11 @@ impl FastembedOnnxEmbedder {
             .with_max_length(backend.max_len)
             .with_show_download_progress(false);
         if let (true, Some(shape)) = (on_gpu, shape) {
-            options = options.with_execution_providers(migraphx_execution_providers(model, shape)?);
+            options = options.with_execution_providers(gpu_execution_providers(
+                backend.runtime,
+                model,
+                shape,
+            )?);
         }
         if let Some(prefix) = profiling_prefix {
             options = options.with_profiling(prefix.to_path_buf());
@@ -105,7 +109,8 @@ impl FastembedOnnxEmbedder {
                 target: "embeddings::fastembed_onnx",
                 rows = shape.rows,
                 seq_len = shape.seq_len,
-                "fixed MIGraphX input shape"
+                runtime = ?backend.runtime,
+                "fixed GPU input shape"
             );
         }
 
@@ -210,7 +215,36 @@ fn to_fastembed_model(model: FastembedOnnxModel) -> EmbeddingModel {
     }
 }
 
-/// Список EP для AMD GPU.
+/// Тип диспатча EP. Один и тот же тип в обеих формах — `fastembed`
+/// реэкспортирует его из `ort`; алиас нужен потому, что сам крейт `ort` в
+/// зависимостях появляется только вместе с GPU-фичами.
+#[cfg(any(feature = "embeddings-migraphx", feature = "embeddings-directml"))]
+type EpDispatch = ort::execution_providers::ExecutionProviderDispatch;
+#[cfg(not(any(feature = "embeddings-migraphx", feature = "embeddings-directml")))]
+type EpDispatch = fastembed::ExecutionProviderDispatch;
+
+/// EP для GPU-рантайма — по одному на ОС, и это не дублирование.
+///
+/// MIGraphX (линукс) и DirectML (винда) не взаимозаменяемы: MIGraphX под
+/// Windows не существует вовсе (из ROCm под винду портирован не весь стек), а
+/// DirectML — виндовый API поверх DX12 и на линуксе не существует так же
+/// симметрично. Поэтому рантайм выбирает ПРОФИЛЬ, а не автоопределение: выбор
+/// EP здесь — это выбор индекса (рантайм входит в `EmbeddingIdentity`).
+fn gpu_execution_providers(
+    runtime: EmbeddingRuntime,
+    model: FastembedOnnxModel,
+    shape: FixedBatchShape,
+) -> Result<Vec<EpDispatch>, EmbeddingError> {
+    match runtime {
+        EmbeddingRuntime::LocalFastembedOnnxMigraphx => migraphx_execution_providers(model, shape),
+        EmbeddingRuntime::LocalFastembedOnnxDirectml => directml_execution_providers(),
+        other => Err(EmbeddingError::model_init(format!(
+            "runtime {other:?} is not a fastembed ONNX GPU runtime"
+        ))),
+    }
+}
+
+/// Список EP для AMD GPU на ЛИНУКСЕ.
 ///
 /// # Почему тут только MIGraphX
 /// ROCm EP в ONNX Runtime депрекейтнут, и в поставляемых сборках его физически
@@ -227,7 +261,7 @@ fn to_fastembed_model(model: FastembedOnnxModel) -> EmbeddingModel {
 fn migraphx_execution_providers(
     model: FastembedOnnxModel,
     shape: FixedBatchShape,
-) -> Result<Vec<ort::execution_providers::ExecutionProviderDispatch>, EmbeddingError> {
+) -> Result<Vec<EpDispatch>, EmbeddingError> {
     ensure_migraphx_kernel_cache(model, shape)?;
     Ok(vec![
         ort::ep::migraphx::MIGraphX::default()
@@ -240,10 +274,42 @@ fn migraphx_execution_providers(
 fn migraphx_execution_providers(
     _model: FastembedOnnxModel,
     _shape: FixedBatchShape,
-) -> Result<Vec<fastembed::ExecutionProviderDispatch>, EmbeddingError> {
+) -> Result<Vec<EpDispatch>, EmbeddingError> {
     Err(EmbeddingError::model_init(
         "rmc-engine was built without the `embeddings-migraphx` feature; \
          rebuild with --features migraphx to use GPU embedding profiles",
+    ))
+}
+
+/// Список EP для GPU на ВИНДЕ — DirectML.
+///
+/// # Почему форма входа не приводит сюда аргументов
+/// В отличие от MIGraphX, DirectML не компилирует ядра в файлы и не нуждается
+/// ни в каталоге кэша, ни в переменной окружения: у него нет ни холодного
+/// старта в 45–70 с, ни `.mxr` по 145–200 МБ на форму. Форма всё равно
+/// объявляется (см. `fixed_input_shape`), но EP про неё знать не обязан —
+/// сессия получает её через фиксированный батч fastembed.
+///
+/// # Что здесь МОЛЧА ломается без `fastembed/directml`
+/// DirectML EP не переживает memory pattern и параллельного исполнения; гасит
+/// их вендоренный fastembed, и узнаёт он DirectML в списке провайдеров только
+/// под своей фичей. Поэтому фича включена в `embeddings-directml` жёстко —
+/// собрать «только ort/directml» технически можно, и это была бы сессия,
+/// падающая не в этом файле.
+#[cfg(feature = "embeddings-directml")]
+fn directml_execution_providers() -> Result<Vec<EpDispatch>, EmbeddingError> {
+    Ok(vec![
+        ort::ep::directml::DirectML::default()
+            .build()
+            .error_on_failure(),
+    ])
+}
+
+#[cfg(not(feature = "embeddings-directml"))]
+fn directml_execution_providers() -> Result<Vec<EpDispatch>, EmbeddingError> {
+    Err(EmbeddingError::model_init(
+        "rmc-engine was built without the `embeddings-directml` feature; \
+         rebuild with --features directml to use the `local-dml-bge` profile",
     ))
 }
 

@@ -1,7 +1,8 @@
 //! Operational defaults for MCP server startup and automatic work.
 
 use rmc_engine::embeddings::{
-    CPU_EP, EmbeddingBackend, EmbeddingRuntime, MIGRAPHX_EP, ProviderCensus, probe_provider_census,
+    CPU_EP, DIRECTML_EP, EmbeddingBackend, EmbeddingRuntime, MIGRAPHX_EP, ProviderCensus,
+    probe_provider_census,
 };
 use std::sync::OnceLock;
 
@@ -148,10 +149,20 @@ pub(crate) fn ep_census_verdict(
     // подграф и подставляет ОДИН фьюженный узел — на здоровом GPU-пути перепись
     // выглядит как `MIGraphXExecutionProvider=1`. Поэтому порог тут ровно один:
     // фьюженный узел есть или его нет.
-    if runtime == EmbeddingRuntime::LocalFastembedOnnxMigraphx && census.nodes_on(MIGRAPHX_EP) == 0
-    {
+    //
+    // Порог одинаков для обоих GPU-рантаймов, но провайдер у каждого СВОЙ:
+    // спрашивать MIGraphX на виндовом профиле — значит гарантированно получить
+    // ноль и объявить отказ на здоровой машине.
+    let (want_ep, ep_label) = match runtime {
+        EmbeddingRuntime::LocalFastembedOnnxMigraphx => (MIGRAPHX_EP, "MIGraphX"),
+        EmbeddingRuntime::LocalFastembedOnnxDirectml => (DIRECTML_EP, "DirectML"),
+        EmbeddingRuntime::LocalQwen3CandleCuda
+        | EmbeddingRuntime::LocalFastembedOnnxCpu
+        | EmbeddingRuntime::OpenRouter => return Ok(()),
+    };
+    if census.nodes_on(want_ep) == 0 {
         return Err(format!(
-            "profile `{profile}` asks for MIGraphX, but not a single graph node ran on it \
+            "profile `{profile}` asks for {ep_label}, but not a single graph node ran on it \
              (census: {census}) — the graph silently fell back to CPU"
         ));
     }
@@ -269,6 +280,55 @@ mod tests {
                 &census
             )
             .is_ok()
+        );
+    }
+
+    /// Виндовый GPU-путь судится СВОИМ провайдером.
+    #[test]
+    fn ep_verdict_accepts_a_directml_node() {
+        let census =
+            ProviderCensus::from_profile_json(&profile_json(&[("MatMul_0", DIRECTML_EP)])).unwrap();
+
+        assert!(
+            ep_census_verdict(
+                EmbeddingRuntime::LocalFastembedOnnxDirectml,
+                "local-dml-bge",
+                &census
+            )
+            .is_ok()
+        );
+    }
+
+    /// 🚨 Гейт против самой вероятной ошибки этого слоя: судить виндовый
+    /// профиль по MIGraphX. Перепись ЗДОРОВАЯ — весь граф на DirectML, — и
+    /// вердикт, спрашивающий не тот провайдер, объявил бы отказ на исправной
+    /// машине. Обратная пара тоже проверяется: MIGraphX-профиль с одними
+    /// DirectML-узлами — отказ, а не «ну GPU же».
+    #[test]
+    fn ep_verdict_asks_the_provider_that_matches_the_runtime() {
+        let dml_only =
+            ProviderCensus::from_profile_json(&profile_json(&[("MatMul_0", DIRECTML_EP)])).unwrap();
+        assert!(
+            ep_census_verdict(
+                EmbeddingRuntime::LocalFastembedOnnxMigraphx,
+                "local-gpu-bge",
+                &dml_only
+            )
+            .is_err(),
+            "MIGraphX-профиль обязан отказать на переписи без узлов MIGraphX"
+        );
+
+        let migraphx_only =
+            ProviderCensus::from_profile_json(&profile_json(&[("MIGraphX_0", MIGRAPHX_EP)]))
+                .unwrap();
+        assert!(
+            ep_census_verdict(
+                EmbeddingRuntime::LocalFastembedOnnxDirectml,
+                "local-dml-bge",
+                &migraphx_only
+            )
+            .is_err(),
+            "DirectML-профиль обязан отказать на переписи без узлов DirectML"
         );
     }
 
