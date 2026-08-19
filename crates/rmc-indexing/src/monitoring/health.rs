@@ -365,13 +365,35 @@ impl HealthMonitor {
         // this component exists to abolish. Caught on the live index
         // right after the salt change, where it printed `healthy` next
         // to `files_cached: 0`.
+        //
+        // "No cache entries" comes in TWO shapes that call for different
+        // actions, so they get different messages. One text for both made
+        // the cheap, frequent case (cache dropped or re-salted, vectors
+        // intact) read exactly like the expensive, rare one (a run died
+        // halfway) — whose printed remedy is a full `force_reindex`, an
+        // hour of work this state does not call for. The shapes are
+        // distinguishable by construction: the cache is written only
+        // after a successful upsert, so a half-finished run leaves cache
+        // entries behind; an empty cache next to a non-empty store means
+        // the cache was lost, not the vectors.
         if files_cached == 0 {
-            let mut unknown = CoverageHealth::unknown(format!(
-                "Coverage unknown: metadata cache holds no entries for this profile \
-                 (never indexed with it, or indexed before the cache salt changed); \
-                 store holds {} distinct files",
-                files_with_vectors
-            ));
+            let message = if files_with_vectors == 0 {
+                "Coverage unknown: nothing is indexed under this profile yet — \
+                 neither cache entries nor vectors. Fix: a plain index_codebase run"
+                    .to_string()
+            } else {
+                format!(
+                    "Coverage unknown: store holds {} distinct files, but the metadata \
+                     cache holds no entries for this profile (cleared, or written before \
+                     the cache salt changed), so there is nothing to compare them against. \
+                     This is lost bookkeeping, NOT evidence of a damaged index: a \
+                     half-finished run would have left cache entries. Fix: a plain \
+                     index_codebase run refills the cache for the files it touches; \
+                     force_reindex is not indicated by this state",
+                    files_with_vectors
+                )
+            };
+            let mut unknown = CoverageHealth::unknown(message);
             unknown.files_tracked = files_tracked;
             unknown.files_cached = Some(0);
             unknown.files_with_vectors = Some(files_with_vectors);
@@ -637,6 +659,66 @@ mod tests {
         // Vacuous "all 0 files are fine" must never read as healthy.
         assert_eq!(coverage.status, Status::Degraded);
         assert_eq!(coverage.stale_skips, None);
+    }
+
+    /// An empty cache next to a POPULATED store is lost bookkeeping, and
+    /// the message must not push the reader towards `force_reindex` —
+    /// that misread cost an hour of needless work on the live index
+    /// (2026-08-19).
+    #[tokio::test]
+    async fn coverage_without_cache_but_with_vectors_does_not_advise_force_reindex() {
+        let temp = TempDir::new().unwrap();
+        let (store, cache_path) = stale_skip_scene(&temp, "salt-a").await;
+
+        let monitor = HealthMonitor::new(None, Some(store), temp.path().join("missing.snapshot"))
+            .with_metadata_cache(cache_path, "salt-b".to_string());
+        let coverage = monitor.check_coverage().await;
+
+        assert_eq!(coverage.files_cached, Some(0));
+        assert_eq!(coverage.files_with_vectors, Some(1));
+        assert!(
+            coverage.message.contains("force_reindex is not indicated"),
+            "message must say force_reindex is NOT the fix here: {}",
+            coverage.message
+        );
+        assert!(
+            !coverage.message.contains("force_reindex: true"),
+            "message must not carry the force_reindex recipe: {}",
+            coverage.message
+        );
+    }
+
+    /// Positive control for the test above: the SAME empty cache over an
+    /// EMPTY store must produce a different message. Without this, the
+    /// assertion above would pass on a component that prints one text
+    /// unconditionally — which is exactly the defect being fixed.
+    #[tokio::test]
+    async fn coverage_with_empty_cache_and_empty_store_says_nothing_is_indexed() {
+        let temp = TempDir::new().unwrap();
+        let store = VectorStore::new_embedded(temp.path().join("vectors"), 4, "test-embedder")
+            .await
+            .expect("open store");
+        let cache_path = temp.path().join("cache");
+        MetadataCache::new(&cache_path).expect("cache");
+
+        let monitor = HealthMonitor::new(
+            None,
+            Some(Arc::new(store)),
+            temp.path().join("missing.snapshot"),
+        )
+        .with_metadata_cache(cache_path, "salt-a".to_string());
+        let coverage = monitor.check_coverage().await;
+
+        assert_eq!(coverage.files_cached, Some(0));
+        assert_eq!(coverage.files_with_vectors, Some(0));
+        assert!(
+            coverage
+                .message
+                .contains("nothing is indexed under this profile yet"),
+            "empty store must read as never-indexed, not as lost bookkeeping: {}",
+            coverage.message
+        );
+        assert_eq!(coverage.status, Status::Degraded);
     }
 
     #[test]
