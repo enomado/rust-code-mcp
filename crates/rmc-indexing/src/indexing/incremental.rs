@@ -338,6 +338,15 @@ impl IncrementalIndexer {
     pub async fn clear_all_data(&mut self) -> Result<()> {
         self.ensure_indexer().await?.clear_all_data().await
     }
+
+    /// Forget cache entries whose file has no vectors; see
+    /// [`UnifiedIndexer::forget_files_without_vectors`].
+    pub async fn forget_files_without_vectors(&mut self) -> Result<Vec<String>> {
+        self.ensure_indexer()
+            .await?
+            .forget_files_without_vectors()
+            .await
+    }
 }
 
 #[cfg(test)]

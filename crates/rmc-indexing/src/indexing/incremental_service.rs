@@ -20,6 +20,10 @@ pub struct IncrementalIndexRequest<'a> {
     pub snapshot_path: Option<&'a Path>,
     pub codebase_loc: Option<usize>,
     pub force_reindex: bool,
+    /// Repair `stale_skips` before indexing: forget the cache entries of files
+    /// that have no vectors, so the run rebuilds exactly those. Ignored when
+    /// `force_reindex` is set — that path clears everything anyway.
+    pub repair_coverage: bool,
 }
 
 /// Result of an incremental indexing run.
@@ -28,6 +32,8 @@ pub struct IncrementalIndexOutcome {
     pub stats: IndexStats,
     /// Total elapsed time for the facade call, including force-reindex cleanup.
     pub elapsed: Duration,
+    /// Files whose cache entry was dropped by the coverage repair, if requested.
+    pub repaired_files: Vec<String>,
 }
 
 /// Index a project through the indexing-owned incremental service boundary.
@@ -40,12 +46,17 @@ pub async fn index_project_incrementally(
 
 trait IncrementalIndexRunner {
     async fn clear_all_data(&mut self) -> Result<()>;
+    async fn forget_files_without_vectors(&mut self) -> Result<Vec<String>>;
     async fn index_with_change_detection(&mut self, codebase_path: &Path) -> Result<IndexStats>;
 }
 
 impl IncrementalIndexRunner for IncrementalIndexer {
     async fn clear_all_data(&mut self) -> Result<()> {
         IncrementalIndexer::clear_all_data(self).await
+    }
+
+    async fn forget_files_without_vectors(&mut self) -> Result<Vec<String>> {
+        IncrementalIndexer::forget_files_without_vectors(self).await
     }
 
     async fn index_with_change_detection(&mut self, codebase_path: &Path) -> Result<IndexStats> {
@@ -88,14 +99,7 @@ where
     let start = Instant::now();
 
     if request.force_reindex {
-        if let Some(snapshot_path) = request.snapshot_path {
-            if snapshot_path.exists() {
-                tracing::info!("Force reindex: deleting snapshot at {}", snapshot_path.display());
-                std::fs::remove_file(snapshot_path).with_context(|| {
-                    format!("Failed to delete snapshot at {}", snapshot_path.display())
-                })?;
-            }
-        }
+        remove_snapshot(request.snapshot_path, "Force reindex")?;
     }
 
     let mut indexer = factory.create(&request).await?;
@@ -105,6 +109,22 @@ where
         indexer.clear_all_data().await?;
     }
 
+    // Coverage repair runs BEFORE change detection and only without force,
+    // which would clear the same data wholesale a moment later.
+    let mut repaired_files = Vec::new();
+    if request.repair_coverage && !request.force_reindex {
+        repaired_files = indexer.forget_files_without_vectors().await?;
+
+        // Dropping cache entries is not enough on its own: change detection
+        // never looks at a file the Merkle snapshot considers unchanged, so
+        // the repaired files would not even reach `index_file`. Deleting the
+        // snapshot forces a full walk, where every other file is waved
+        // through cheaply by the stat check.
+        if !repaired_files.is_empty() {
+            remove_snapshot(request.snapshot_path, "Coverage repair")?;
+        }
+    }
+
     let stats = indexer
         .index_with_change_detection(request.codebase_path)
         .await?;
@@ -112,7 +132,21 @@ where
     Ok(IncrementalIndexOutcome {
         stats,
         elapsed: start.elapsed(),
+        repaired_files,
     })
+}
+
+/// Delete the Merkle snapshot so the next detection pass walks everything.
+fn remove_snapshot(snapshot_path: Option<&Path>, reason: &str) -> Result<()> {
+    let Some(snapshot_path) = snapshot_path else {
+        return Ok(());
+    };
+    if !snapshot_path.exists() {
+        return Ok(());
+    }
+    tracing::info!("{}: deleting snapshot at {}", reason, snapshot_path.display());
+    std::fs::remove_file(snapshot_path)
+        .with_context(|| format!("Failed to delete snapshot at {}", snapshot_path.display()))
 }
 
 #[cfg(test)]
@@ -132,6 +166,8 @@ mod tests {
         index_error: Option<&'static str>,
         clear_delay: Duration,
         stats: IndexStats,
+        /// Paths the fake reports as cached-but-vectorless.
+        stale_files: Vec<String>,
     }
 
     struct BuildRecord {
@@ -144,6 +180,7 @@ mod tests {
         snapshot_path: Option<PathBuf>,
         codebase_loc: Option<usize>,
         force_reindex: bool,
+        repair_coverage: bool,
     }
 
     #[derive(Clone, Default)]
@@ -174,6 +211,7 @@ mod tests {
                 snapshot_path: request.snapshot_path.map(Path::to_path_buf),
                 codebase_loc: request.codebase_loc,
                 force_reindex: request.force_reindex,
+                repair_coverage: request.repair_coverage,
             });
 
             Ok(FakeIndexer {
@@ -196,6 +234,12 @@ mod tests {
                 tokio::time::sleep(delay).await;
             }
             Ok(())
+        }
+
+        async fn forget_files_without_vectors(&mut self) -> Result<Vec<String>> {
+            let mut state = self.state.lock().unwrap();
+            state.events.push("forget".to_string());
+            Ok(state.stale_files.clone())
         }
 
         async fn index_with_change_detection(&mut self, codebase_path: &Path) -> Result<IndexStats> {
@@ -243,6 +287,7 @@ mod tests {
                 snapshot_path: Some(&snapshot_path),
                 codebase_loc: None,
                 force_reindex: true,
+                repair_coverage: false,
             },
             &factory,
         )
@@ -252,6 +297,165 @@ mod tests {
         let state = factory.state.lock().unwrap();
         assert!(!snapshot_path.exists());
         assert_eq!(outcome.stats.indexed_files, 2);
+        assert_eq!(
+            state.events,
+            vec![
+                "create".to_string(),
+                "clear".to_string(),
+                format!("index:{}", codebase_path.display())
+            ]
+        );
+    }
+
+    /// Build a request whose paths live under `temp_dir`, for the repair tests.
+    fn repair_request<'a>(
+        codebase_path: &'a Path,
+        cache_path: &'a Path,
+        tantivy_path: &'a Path,
+        snapshot_path: &'a Path,
+        backend: EmbeddingBackend,
+        embedder_identity: &'a str,
+        force_reindex: bool,
+    ) -> IncrementalIndexRequest<'a> {
+        IncrementalIndexRequest {
+            codebase_path,
+            cache_path,
+            tantivy_path,
+            collection_name: "repair_collection",
+            backend,
+            embedder_identity,
+            snapshot_path: Some(snapshot_path),
+            codebase_loc: None,
+            force_reindex,
+            repair_coverage: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn repair_forgets_stale_files_and_drops_snapshot_before_indexing() {
+        let temp_dir = TempDir::new().unwrap();
+        let codebase_path = temp_dir.path().join("codebase");
+        let cache_path = temp_dir.path().join("cache");
+        let tantivy_path = temp_dir.path().join("tantivy");
+        let snapshot_path = temp_dir.path().join("snapshot");
+        std::fs::create_dir(&codebase_path).unwrap();
+        std::fs::write(&snapshot_path, "old snapshot").unwrap();
+
+        let backend = test_backend();
+        let embedder_identity = backend.identity();
+        let factory = FakeFactory::default();
+        {
+            let mut state = factory.state.lock().unwrap();
+            state.stale_files = vec!["/repo/a.rs".to_string(), "/repo/b.rs".to_string()];
+        }
+
+        let outcome = index_project_incrementally_with_factory(
+            repair_request(
+                &codebase_path,
+                &cache_path,
+                &tantivy_path,
+                &snapshot_path,
+                backend,
+                &embedder_identity,
+                false,
+            ),
+            &factory,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.repaired_files, vec!["/repo/a.rs", "/repo/b.rs"]);
+
+        // The snapshot has to be gone, or change detection would never reach
+        // the repaired files — the forget alone would be a no-op.
+        assert!(!snapshot_path.exists());
+
+        let state = factory.state.lock().unwrap();
+        assert!(state.build.as_ref().unwrap().repair_coverage);
+        assert_eq!(
+            state.events,
+            vec![
+                "create".to_string(),
+                "forget".to_string(),
+                format!("index:{}", codebase_path.display())
+            ]
+        );
+        // Repair must not clear the index the way force does.
+        assert!(!state.events.contains(&"clear".to_string()));
+    }
+
+    #[tokio::test]
+    async fn repair_with_nothing_stale_keeps_the_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let codebase_path = temp_dir.path().join("codebase");
+        let cache_path = temp_dir.path().join("cache");
+        let tantivy_path = temp_dir.path().join("tantivy");
+        let snapshot_path = temp_dir.path().join("snapshot");
+        std::fs::create_dir(&codebase_path).unwrap();
+        std::fs::write(&snapshot_path, "old snapshot").unwrap();
+
+        let backend = test_backend();
+        let embedder_identity = backend.identity();
+        let factory = FakeFactory::default();
+
+        let outcome = index_project_incrementally_with_factory(
+            repair_request(
+                &codebase_path,
+                &cache_path,
+                &tantivy_path,
+                &snapshot_path,
+                backend,
+                &embedder_identity,
+                false,
+            ),
+            &factory,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.repaired_files.is_empty());
+        // Nothing to repair means nothing to pay for: keeping the snapshot
+        // keeps the run a fast no-change check instead of a full walk.
+        assert!(snapshot_path.exists());
+    }
+
+    #[tokio::test]
+    async fn force_reindex_skips_repair_entirely() {
+        let temp_dir = TempDir::new().unwrap();
+        let codebase_path = temp_dir.path().join("codebase");
+        let cache_path = temp_dir.path().join("cache");
+        let tantivy_path = temp_dir.path().join("tantivy");
+        let snapshot_path = temp_dir.path().join("snapshot");
+        std::fs::create_dir(&codebase_path).unwrap();
+        std::fs::write(&snapshot_path, "old snapshot").unwrap();
+
+        let backend = test_backend();
+        let embedder_identity = backend.identity();
+        let factory = FakeFactory::default();
+        {
+            let mut state = factory.state.lock().unwrap();
+            state.stale_files = vec!["/repo/a.rs".to_string()];
+        }
+
+        let outcome = index_project_incrementally_with_factory(
+            repair_request(
+                &codebase_path,
+                &cache_path,
+                &tantivy_path,
+                &snapshot_path,
+                backend,
+                &embedder_identity,
+                true,
+            ),
+            &factory,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.repaired_files.is_empty());
+
+        let state = factory.state.lock().unwrap();
+        assert!(!state.events.contains(&"forget".to_string()));
         assert_eq!(
             state.events,
             vec![
@@ -287,6 +491,7 @@ mod tests {
                 snapshot_path: Some(&snapshot_path),
                 codebase_loc: Some(42),
                 force_reindex: false,
+                repair_coverage: false,
             },
             &factory,
         )
@@ -333,6 +538,7 @@ mod tests {
                 snapshot_path: None,
                 codebase_loc: None,
                 force_reindex: true,
+                repair_coverage: false,
             },
             &factory,
         )
@@ -368,6 +574,7 @@ mod tests {
                 snapshot_path: None,
                 codebase_loc: None,
                 force_reindex: false,
+                repair_coverage: false,
             },
             &factory,
         )
@@ -393,6 +600,7 @@ mod tests {
                 snapshot_path: None,
                 codebase_loc: None,
                 force_reindex: true,
+                repair_coverage: false,
             },
             &factory,
         )
@@ -418,6 +626,7 @@ mod tests {
                 snapshot_path: None,
                 codebase_loc: None,
                 force_reindex: false,
+                repair_coverage: false,
             },
             &factory,
         )

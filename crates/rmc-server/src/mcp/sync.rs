@@ -279,6 +279,9 @@ impl SyncManager {
                 snapshot_path: None,
                 codebase_loc: None,
                 force_reindex: false,
+                // Background sync only chases file changes; repairing coverage
+                // is an explicit, user-triggered decision.
+                repair_coverage: false,
             })
             .await?;
             let stats = outcome.stats;

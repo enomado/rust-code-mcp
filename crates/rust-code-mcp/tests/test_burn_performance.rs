@@ -22,6 +22,7 @@ async fn index_burn_codebase(force: bool) -> Result<(String, std::time::Duration
     let params = IndexCodebaseParams {
         directory: "/home/molaco/Documents/burn".to_string(),
         force_reindex: Some(force),
+        repair_coverage: None,
         model: None,
         embedding_profile: None,
     };

@@ -21,6 +21,10 @@ pub struct IndexCodebaseParams {
     #[schemars(description = "Force full reindex even if already indexed (default: false)")]
     pub force_reindex: Option<bool>,
     #[schemars(
+        description = "Repair the `stale_skips` reported by health_check: files the metadata cache calls indexed while the vector store holds no vectors for them. Such files are skipped by every ordinary run, so they never come back on their own. This forgets their cache entries and re-embeds exactly those, leaving the rest of the index untouched — minutes, not the hour-plus of force_reindex. Ignored when force_reindex is set. Default: false."
+    )]
+    pub repair_coverage: Option<bool>,
+    #[schemars(
         description = "Optional legacy local Qwen3/CUDA model variant. One of: \"qwen3-0.6b\" (1024-dim), \"qwen3-4b\" (2560-dim), \"qwen3-8b\" (4096-dim). Picking a variant different from an existing index returns a version-mismatch error pointing to clear_cache."
     )]
     pub model: Option<String>,
@@ -148,6 +152,33 @@ fn format_index_codebase_result(
     )
 }
 
+/// Report what the coverage repair did, appended to the normal index summary.
+///
+/// An empty repair is worth saying out loud: it is the difference between
+/// "there was nothing to fix" and "the fix silently did nothing", and only the
+/// former is good news.
+fn format_repair_note(repaired: &[String]) -> String {
+    if repaired.is_empty() {
+        return "\n\nCoverage repair: nothing to repair — every cached file has vectors."
+            .to_string();
+    }
+
+    let sample: Vec<&str> = repaired.iter().take(5).map(String::as_str).collect();
+    let more = repaired.len().saturating_sub(sample.len());
+    let tail = if more > 0 {
+        format!("\n  … and {} more", more)
+    } else {
+        String::new()
+    };
+
+    format!(
+        "\n\nCoverage repair: dropped {} stale cache entries and re-embedded those files:\n  {}{}",
+        repaired.len(),
+        sample.join("\n  "),
+        tail
+    )
+}
+
 fn indexing_error_to_mcp(error: anyhow::Error, dir: &std::path::Path) -> McpError {
     // Keep the existing actionable version-mismatch message at the MCP
     // boundary while indexing owns the concrete indexer construction.
@@ -180,6 +211,7 @@ pub async fn index_codebase(
 ) -> Result<CallToolResult, McpError> {
     let dir = PathBuf::from(&params.directory);
     let force = params.force_reindex.unwrap_or(false);
+    let repair = params.repair_coverage.unwrap_or(false);
 
     // Validate directory
     if !dir.exists() {
@@ -197,13 +229,18 @@ pub async fn index_codebase(
     }
 
     let _workspace_lock = workspace_locks.lock_exclusive(&dir).await;
-    if force {
+    if force || repair {
         if let Some(search_cache) = search_cache {
             search_cache.invalidate_workspace(&dir);
         }
     }
 
-    tracing::info!("Indexing codebase: {} (force: {})", dir.display(), force);
+    tracing::info!(
+        "Indexing codebase: {} (force: {}, repair_coverage: {})",
+        dir.display(),
+        force,
+        repair
+    );
 
     // Resolve the embedding backend from the optional profile/model args.
     // This becomes the single source of truth for vector_size /
@@ -234,6 +271,7 @@ pub async fn index_codebase(
         snapshot_path: Some(&paths.snapshot_path),
         codebase_loc: None,
         force_reindex: force,
+        repair_coverage: repair,
     })
     .await
     .map_err(|error| indexing_error_to_mcp(error, &dir))?;
@@ -255,7 +293,7 @@ pub async fn index_codebase(
     // Format result. The resolved embedder identity is echoed verbatim
     // so a user who passed `model` (or relied on the default) can
     // confirm exactly which variant the index is bound to.
-    let result_text = format_index_codebase_result(
+    let mut result_text = format_index_codebase_result(
         stats,
         &params.directory,
         backend.profile.name(),
@@ -270,6 +308,10 @@ pub async fn index_codebase(
         outcome.elapsed,
     );
 
+    if repair && !force {
+        result_text.push_str(&format_repair_note(&outcome.repaired_files));
+    }
+
     Ok(CallToolResult::success(vec![Content::text(result_text)]))
 }
 
@@ -283,6 +325,7 @@ mod tests {
         let params = IndexCodebaseParams {
             directory: "/nonexistent/path".to_string(),
             force_reindex: None,
+            repair_coverage: None,
             model: None,
             embedding_profile: None,
         };
@@ -301,6 +344,7 @@ mod tests {
         let params = IndexCodebaseParams {
             directory: file_path.to_string_lossy().to_string(),
             force_reindex: None,
+            repair_coverage: None,
             model: None,
             embedding_profile: None,
         };
@@ -325,6 +369,7 @@ mod tests {
         let params = IndexCodebaseParams {
             directory: test_codebase.to_string_lossy().to_string(),
             force_reindex: None,
+            repair_coverage: None,
             model: None,
             embedding_profile: None,
         };
@@ -350,6 +395,7 @@ mod tests {
         let params1 = IndexCodebaseParams {
             directory: test_codebase.to_string_lossy().to_string(),
             force_reindex: None,
+            repair_coverage: None,
             model: None,
             embedding_profile: None,
         };
@@ -361,6 +407,7 @@ mod tests {
         let params2 = IndexCodebaseParams {
             directory: test_codebase.to_string_lossy().to_string(),
             force_reindex: Some(true),
+            repair_coverage: None,
             model: None,
             embedding_profile: None,
         };
@@ -462,6 +509,29 @@ mod tests {
         assert!(text.contains("clear_cache"));
         assert!(text.contains("/workspace/project"));
         assert!(!text.contains("Indexing failed"));
+    }
+
+    #[test]
+    fn repair_note_distinguishes_nothing_to_fix_from_a_silent_no_op() {
+        let text = format_repair_note(&[]);
+
+        assert!(text.contains("nothing to repair"));
+        assert!(text.contains("every cached file has vectors"));
+        assert!(!text.contains("dropped"));
+    }
+
+    #[test]
+    fn repair_note_lists_repaired_files_and_counts_the_rest() {
+        let repaired: Vec<String> = (0..7).map(|i| format!("/repo/file{i}.rs")).collect();
+
+        let text = format_repair_note(&repaired);
+
+        assert!(text.contains("dropped 7 stale cache entries"));
+        assert!(text.contains("/repo/file0.rs"));
+        assert!(text.contains("/repo/file4.rs"));
+        // Only the first five are spelled out; the rest are counted.
+        assert!(!text.contains("/repo/file5.rs"));
+        assert!(text.contains("… and 2 more"));
     }
 
     #[test]

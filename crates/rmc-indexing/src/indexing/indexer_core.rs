@@ -41,6 +41,7 @@ use crate::indexing::file_processor::FileProcessor;
 use crate::indexing::IndexingError;
 use crate::metadata_cache::MetadataCache;
 use rmc_engine::parser::RustParser;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -215,6 +216,17 @@ impl IndexerCore {
     /// Clear metadata cache
     pub(crate) fn clear_metadata_cache(&self) -> Result<(), IndexingError> {
         self.file_processor.clear_metadata_cache()
+    }
+
+    /// File paths the metadata cache considers already indexed, for this
+    /// embedder+chunking identity.
+    pub(crate) fn cached_paths(&self) -> Result<HashSet<String>, IndexingError> {
+        self.file_processor.cached_paths()
+    }
+
+    /// Drop one file's cache entry so the next run re-embeds it.
+    pub(crate) fn forget_file(&self, file_path: &Path) -> Result<(), IndexingError> {
+        self.file_processor.forget_file(file_path)
     }
 
     // --- Orchestration (uses FileProcessor + Chunker) ---

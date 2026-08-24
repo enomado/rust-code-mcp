@@ -8,6 +8,7 @@ use crate::indexing::IndexingError;
 use crate::metadata_cache::MetadataCache;
 use crate::security::SecretsScanner;
 use crate::security::SensitiveFileFilter;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Handles file filtering, security scanning, and change detection.
@@ -129,6 +130,27 @@ impl FileProcessor {
     /// Get reference to metadata cache
     pub(crate) fn metadata_cache(&self) -> &MetadataCache {
         &self.metadata_cache
+    }
+
+    /// File paths this processor's salt considers already indexed.
+    pub(crate) fn cached_paths(&self) -> Result<HashSet<String>, IndexingError> {
+        let keys = self
+            .metadata_cache
+            .list_files()
+            .map_err(|e| IndexingError::Cache(e.to_string()))?;
+        Ok(MetadataCache::paths_for_salt(keys, &self.cache_key_salt))
+    }
+
+    /// Drop this file's cache entry so the next run treats it as new.
+    ///
+    /// The cache entry is what makes `has_stat_changed` / `has_file_changed`
+    /// answer "unchanged"; removing it is the only way to make a file that is
+    /// byte-identical on disk be embedded again.
+    pub(crate) fn forget_file(&self, file_path: &Path) -> Result<(), IndexingError> {
+        let key = self.cache_key(file_path);
+        self.metadata_cache
+            .remove(&key)
+            .map_err(|e| IndexingError::Cache(e.to_string()))
     }
 
     /// Clear metadata cache
