@@ -191,6 +191,47 @@ fn two_clients_share_one_server_process() -> Result<()> {
     Ok(())
 }
 
+/// A killed daemon must clean up its socket file.
+///
+/// The client survives a stale socket: it removes it and starts a new one. But while the file
+/// is there, `--print-socket` plus `ls` show an address nobody listens on,
+/// i.e. the diagnostics lie exactly when someone comes to them.
+#[test]
+fn killed_daemon_removes_its_socket() -> Result<()> {
+    let dir = TempDir::new()?;
+    let socket = dir.path().join("probe.sock");
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_rust-code-mcp"))
+        .arg("--daemon")
+        .arg("--socket")
+        .arg(&socket)
+        .env("RUST_LOG", "error")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    wait_until(Duration::from_secs(60), || socket.exists())
+        .ok_or_else(|| anyhow!("daemon did not bind the socket"))?;
+
+    kill_pid(daemon.id());
+    let gone = wait_until(Duration::from_secs(30), || !socket.exists());
+    let _ = daemon.wait();
+    gone.ok_or_else(|| anyhow!("a stale {} remained after SIGTERM", socket.display()))?;
+    Ok(())
+}
+
+fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> Option<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if done() {
+            return Some(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
 /// Positive control: the switch must restore the old behavior.
 #[test]
 fn opt_out_serves_in_process() -> Result<()> {
