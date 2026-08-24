@@ -49,6 +49,7 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncWriteExt, copy};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{SignalKind, signal};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -467,9 +468,29 @@ pub async fn run_daemon(
     let live = Arc::new(AtomicUsize::new(0));
     let idle_since = Arc::new(AtomicI64::new(now_secs()));
 
+    // Сигналы обязаны вести к тому же выходу, что и простой: убитый `kill`-ом
+    // демон иначе оставляет файл сокета, и следующий клиент видит адрес, по
+    // которому никого нет. Клиент это переживает (снимет и поднимет заново), но
+    // диагностика — `--print-socket` плюс `ls` — начинает врать.
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
     loop {
-        match tokio::time::timeout(IDLE_TICK, listener.accept()).await {
-            Ok(Ok((stream, _addr))) => {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => Some(accepted),
+            _ = tokio::time::sleep(IDLE_TICK) => None,
+            _ = sigterm.recv() => {
+                tracing::info!("SIGTERM, shutting down");
+                break;
+            }
+            _ = sigint.recv() => {
+                tracing::info!("SIGINT, shutting down");
+                break;
+            }
+        };
+
+        match accepted {
+            Some(Ok((stream, _addr))) => {
                 let state = runtime.state();
                 let live = Arc::clone(&live);
                 let idle_since = Arc::clone(&idle_since);
@@ -485,11 +506,11 @@ pub async fn run_daemon(
                     }
                 });
             }
-            Ok(Err(e)) => {
+            Some(Err(e)) => {
                 tracing::error!("accept failed: {e}");
                 break;
             }
-            Err(_) => {}
+            None => {}
         }
 
         if !idle.is_zero()

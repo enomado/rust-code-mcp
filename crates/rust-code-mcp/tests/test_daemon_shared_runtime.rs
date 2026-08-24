@@ -191,6 +191,47 @@ fn two_clients_share_one_server_process() -> Result<()> {
     Ok(())
 }
 
+/// Убитый демон обязан убрать за собой файл сокета.
+///
+/// Клиент протухший сокет переживает — снимет и поднимет заново. Но пока файл
+/// лежит, `--print-socket` плюс `ls` показывают адрес, по которому никого нет,
+/// то есть диагностика врёт ровно в тот момент, когда за ней и приходят.
+#[test]
+fn killed_daemon_removes_its_socket() -> Result<()> {
+    let dir = TempDir::new()?;
+    let socket = dir.path().join("probe.sock");
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_rust-code-mcp"))
+        .arg("--daemon")
+        .arg("--socket")
+        .arg(&socket)
+        .env("RUST_LOG", "error")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    wait_until(Duration::from_secs(60), || socket.exists())
+        .ok_or_else(|| anyhow!("демон не забиндил сокет"))?;
+
+    kill_pid(daemon.id());
+    let gone = wait_until(Duration::from_secs(30), || !socket.exists());
+    let _ = daemon.wait();
+    gone.ok_or_else(|| anyhow!("после SIGTERM остался протухший {}", socket.display()))?;
+    Ok(())
+}
+
+fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> Option<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if done() {
+            return Some(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
 /// Позитивный контроль: выключатель обязан возвращать прежнее поведение.
 #[test]
 fn opt_out_serves_in_process() -> Result<()> {
