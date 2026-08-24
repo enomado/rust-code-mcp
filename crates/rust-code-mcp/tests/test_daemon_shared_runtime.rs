@@ -1,14 +1,16 @@
-//! Shared-daemon oracle: however many sessions connect to a project, the analysis
-//! lives in ONE process.
+//! The oracle for the shared daemon: however many sessions attach to a project,
+//! the analysis lives in ONE process.
 //!
-//! What is checked is not that the daemon came up but the sharing itself: `runtime_status` returns the pid
-//! of the process that actually serves the call. Two clients, one pid: the state is
-//! shared; two different pids: each session again drags its own copy of the RA context,
-//! i.e. exactly the regression the daemon was introduced for.
+//! What is checked is not "a daemon came up" but the sharing itself:
+//! `runtime_status` reports the pid of the process that actually served the call.
+//! Two clients, one pid — the state is shared; two different pids — every session
+//! is loading its own copy of the rust-analyzer context again, which is precisely
+//! the regression the daemon exists to prevent.
 //!
-//! The positive control is right here, as the second test: with `RMC_DAEMON=0` the pid must match
-//! the pid of the client itself. Without it the first test would only prove that two calls returned
-//! the same number, without telling that apart from both being computed in the wrong place.
+//! The positive control sits right next to it: with `RMC_DAEMON=0` the pid must
+//! equal the client's own. Without it the first test would only prove that two
+//! calls returned the same number, without distinguishing that from "both were
+//! served somewhere else entirely".
 
 #![cfg(unix)]
 
@@ -22,7 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-/// MCP client: the binary process plus a pipe to it.
+/// An MCP client: the binary plus a pipe to it.
 struct Session {
     child: Child,
     stdin: ChildStdin,
@@ -31,15 +33,15 @@ struct Session {
 }
 
 impl Session {
-    /// `socket_dir` is separate for each test: otherwise the run would attach to the daemon
-    /// of a live working session and test someone else's process.
+    /// `socket_dir` is per test: otherwise a run would attach to the daemon of a
+    /// live working session and assert about someone else's process.
     fn start(socket_dir: &Path, shared: bool) -> Result<Self> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rust-code-mcp"));
         command
             .env("RUST_LOG", "error")
             .env("RMC_DAEMON_DIR", socket_dir)
-            // The daemon must not outlive the run: the idle tick is 15 s, so
-            // an orphaned process exits on its own even if the test fails before kill.
+            // The daemon must not outlive the run: the idle tick is 15s, so an
+            // orphan exits on its own even if the test fails before the kill.
             .env("RMC_DAEMON_IDLE_SECS", "5")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -50,9 +52,9 @@ impl Session {
             command.env("RMC_DAEMON", "0");
         }
 
-        let mut child = command.spawn().context("failed to start the MCP client")?;
-        let stdout = child.stdout.take().context("stdout not captured")?;
-        let stdin = child.stdin.take().context("stdin not captured")?;
+        let mut child = command.spawn().context("failed to spawn the MCP client")?;
+        let stdout = child.stdout.take().context("child stdout was not piped")?;
+        let stdin = child.stdin.take().context("child stdin was not piped")?;
 
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -112,26 +114,26 @@ impl Session {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(anyhow!("no response for id {id}"));
+                return Err(anyhow!("timed out waiting for response id {id}"));
             }
             let line = match self.rx.recv_timeout(remaining) {
                 Ok(line) => line?,
                 Err(RecvTimeoutError::Timeout) => {
-                    return Err(anyhow!("no response for id {id}"));
+                    return Err(anyhow!("timed out waiting for response id {id}"));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(anyhow!("server closed stdout before responding to id {id}"));
+                    return Err(anyhow!("server closed stdout before response id {id}"));
                 }
             };
             let value: Value = serde_json::from_str(&line)
-                .with_context(|| format!("not a JSON-RPC line on stdout: {line:?}"))?;
+                .with_context(|| format!("stdout contained a non-JSON-RPC line: {line:?}"))?;
             if value.get("id").and_then(Value::as_u64) == Some(id) {
                 return Ok(value);
             }
         }
     }
 
-    /// pid of the process that ACTUALLY serves this session's calls.
+    /// The pid of the process that ACTUALLY serves this session's calls.
     fn serving_pid(&mut self) -> Result<u32> {
         let id = self.request(
             "tools/call",
@@ -165,6 +167,17 @@ fn kill_pid(pid: u32) {
     let _ = Command::new("kill").arg(pid.to_string()).status();
 }
 
+fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> Option<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if done() {
+            return Some(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
 #[test]
 fn two_clients_share_one_server_process() -> Result<()> {
     let socket_dir = TempDir::new()?;
@@ -176,12 +189,12 @@ fn two_clients_share_one_server_process() -> Result<()> {
 
     assert_eq!(
         first_pid, second_pid,
-        "two sessions served by different processes ⇒ each holds its own copy of the analysis"
+        "two sessions were served by different processes, so each holds its own copy of the analysis"
     );
     assert_ne!(
         first_pid,
         first.child.id(),
-        "call served by the client itself ⇒ the daemon did not come up, no sharing"
+        "the call was served by the client itself, so no daemon came up and nothing is shared"
     );
     assert_ne!(second_pid, second.child.id());
 
@@ -191,11 +204,11 @@ fn two_clients_share_one_server_process() -> Result<()> {
     Ok(())
 }
 
-/// A killed daemon must clean up its socket file.
+/// A killed daemon must remove its own socket file.
 ///
-/// The client survives a stale socket: it removes it and starts a new one. But while the file
-/// is there, `--print-socket` plus `ls` show an address nobody listens on,
-/// i.e. the diagnostics lie exactly when someone comes to them.
+/// Clients survive a stale socket — they clear it and start a new daemon. But
+/// while the file is there, `--print-socket` plus `ls` point at an address where
+/// nobody listens, so diagnostics lie exactly when someone comes to read them.
 #[test]
 fn killed_daemon_removes_its_socket() -> Result<()> {
     let dir = TempDir::new()?;
@@ -212,27 +225,16 @@ fn killed_daemon_removes_its_socket() -> Result<()> {
         .spawn()?;
 
     wait_until(Duration::from_secs(60), || socket.exists())
-        .ok_or_else(|| anyhow!("daemon did not bind the socket"))?;
+        .ok_or_else(|| anyhow!("the daemon never bound its socket"))?;
 
     kill_pid(daemon.id());
     let gone = wait_until(Duration::from_secs(30), || !socket.exists());
     let _ = daemon.wait();
-    gone.ok_or_else(|| anyhow!("a stale {} remained after SIGTERM", socket.display()))?;
+    gone.ok_or_else(|| anyhow!("SIGTERM left a stale {}", socket.display()))?;
     Ok(())
 }
 
-fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> Option<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if done() {
-            return Some(());
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    None
-}
-
-/// Positive control: the switch must restore the old behavior.
+/// Positive control: the opt-out must restore the previous behaviour.
 #[test]
 fn opt_out_serves_in_process() -> Result<()> {
     let socket_dir = TempDir::new()?;
@@ -243,7 +245,7 @@ fn opt_out_serves_in_process() -> Result<()> {
     assert_eq!(
         serving_pid,
         session.child.id(),
-        "with RMC_DAEMON=0 the session must be served by the client process itself"
+        "with RMC_DAEMON=0 the client process itself must serve the session"
     );
     Ok(())
 }

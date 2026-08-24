@@ -4,8 +4,8 @@
 // compile-time inference budget, not a runtime cost.
 #![recursion_limit = "512"]
 
-// One server per project instead of one per session: see `daemon`. Unix-only:
-// the transport is a unix socket; other platforms keep the old stdio.
+// One server per project instead of one per session; see `daemon`. Unix only —
+// the transport is a unix socket, other platforms keep the stdio server.
 #[cfg(unix)]
 mod daemon;
 
@@ -38,8 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(false)
         .init();
 
-    // The mode is parsed BEFORE the heavy startup: a shared-daemon client needs neither
-    // `ServerRuntime`, nor the EP probe, nor the background sync; it is a pipe between stdio and the socket.
+    // Resolve the mode before the expensive startup: a client of the shared
+    // daemon needs neither a `ServerRuntime`, nor the EP census probe, nor a
+    // background sync task — it is a pipe between stdio and the socket.
     #[cfg(unix)]
     let mode = {
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,8 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(mode) => mode,
             Err(e) => {
                 eprintln!("{e}\n\n{}", daemon::USAGE);
-                // Explicit coercion point: `main` returns `Box<dyn Error>` without
-                // `Send + Sync`, and without a typed let, inference carries over the type of the whole body.
+                // Explicit coercion site: `main` returns `Box<dyn Error>` without
+                // `Send + Sync`, and without the typed let inference takes the
+                // whole body with it.
                 let boxed: Box<dyn std::error::Error> = e;
                 return Err(boxed);
             }
@@ -66,8 +68,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         daemon::Mode::Client { socket } => {
-            // A daemon failure does not leave the session without a server: we fall back to
-            // in-process, exactly the old behavior.
+            // A failing daemon never leaves the session without a server: fall
+            // through to the previous in-process behaviour.
             match daemon::run_client(socket).await {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
