@@ -4,8 +4,8 @@
 // compile-time inference budget, not a runtime cost.
 #![recursion_limit = "512"]
 
-// Один сервер на проект вместо одного на сессию: см. `daemon`. Unix-only —
-// транспорт unix-сокетный, на остальных платформах остаётся прежний stdio.
+// One server per project instead of one per session; see `daemon`. Unix only —
+// the transport is a unix socket, other platforms keep the stdio server.
 #[cfg(unix)]
 mod daemon;
 
@@ -38,8 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(false)
         .init();
 
-    // Режим разбирается ДО тяжёлого старта: клиенту общего демона не нужны ни
-    // `ServerRuntime`, ни EP-проба, ни фоновый синк — он труба между stdio и сокетом.
+    // Resolve the mode before the expensive startup: a client of the shared
+    // daemon needs neither a `ServerRuntime`, nor the EP census probe, nor a
+    // background sync task — it is a pipe between stdio and the socket.
     #[cfg(unix)]
     let mode = {
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -47,8 +48,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(mode) => mode,
             Err(e) => {
                 eprintln!("{e}\n\n{}", daemon::USAGE);
-                // Явная точка приведения: `main` отдаёт `Box<dyn Error>` без
-                // `Send + Sync`, и без typed-let вывод уносит тип всего тела.
+                // Explicit coercion site: `main` returns `Box<dyn Error>` without
+                // `Send + Sync`, and without the typed let inference takes the
+                // whole body with it.
                 let boxed: Box<dyn std::error::Error> = e;
                 return Err(boxed);
             }
@@ -66,8 +68,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         daemon::Mode::Client { socket } => {
-            // Отказ демона не оставляет сессию без сервера: проваливаемся в
-            // in-process ровно к прежнему поведению.
+            // A failing daemon never leaves the session without a server: fall
+            // through to the previous in-process behaviour.
             match daemon::run_client(socket).await {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
@@ -134,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Демон: тот же рантайм, но много подключений вместо одной трубы stdio.
+    // Daemon: the same runtime, but many connections instead of one stdio pipe.
     #[cfg(unix)]
     if let daemon::Mode::Daemon { socket, idle } = &mode {
         let result = daemon::run_daemon(socket, *idle, &runtime).await;

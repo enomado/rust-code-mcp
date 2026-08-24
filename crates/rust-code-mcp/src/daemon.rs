@@ -1,35 +1,39 @@
-//! Один сервер на проект: демон на unix-сокете плюс прокси-клиент.
+//! One server per project: a unix-socket daemon plus a thin proxy client.
 //!
-//! # Зачем
+//! # Why
 //!
-//! Транспорт stdio связывает сервер с клиентом 1:1 по построению — одна труба,
-//! один процесс. Каждая сессия редактора/агента поднимала свой `rust-code-mcp`, а
-//! вместе с ним свою копию `SemanticService` (загруженный RA-контекст воркспейса,
-//! порядка полутора гигабайт на проект) и свой контекст ONNX/GPU. Восемь сессий по
-//! одному репозиторию — восемь копий одного и того же анализа.
+//! The stdio transport is 1:1 with its client by construction — one pipe, one
+//! process. Every editor window or agent session therefore spawned its own
+//! `rust-code-mcp`, and with it another `SemanticService` (the loaded
+//! rust-analyzer context for the workspace, ~2 GB) and another ONNX/GPU context.
+//! Measured on one developer machine: six live servers, 8.9 GB, all of them
+//! analyzing the same repository.
 //!
-//! При этом состояние сервера УЖЕ разделяемо и уже разложено по проектам:
-//! `RuntimeState` — набор `Arc`, `SemanticService` кэширует контексты в
-//! `HashMap<PathBuf, ProjectContext>`, а лок берётся по воркспейсу
-//! (`WorkspaceLockRegistry`), а не глобально. Не хватало ровно одного — транспорта,
-//! который умеет больше одного клиента.
+//! The runtime state was already shareable and already partitioned by project:
+//! `RuntimeState` is a bundle of `Arc`s, `SemanticService` caches contexts in a
+//! `HashMap<PathBuf, ProjectContext>`, and locking is per workspace
+//! (`WorkspaceLockRegistry`) rather than global. The only missing piece was a
+//! transport that accepts more than one client.
 //!
-//! Здесь он и появляется: демон слушает unix-сокет и на каждое подключение поднимает
-//! свой `SearchToolRouter` поверх ОБЩЕГО `RuntimeState`. Клиент — тот же бинарь без
-//! флагов: перекачивает stdin/stdout в сокет, а если демона нет — поднимает его сам.
+//! That is what this module adds: the daemon listens on a unix socket and serves
+//! each connection with its own `SearchToolRouter` on top of one shared
+//! `RuntimeState`. The client is the same binary with no arguments: it pumps
+//! stdin/stdout into the socket, and spawns the daemon if none is listening.
 //!
-//! # Ключ сокета — не только проект
+//! # The socket key is more than the project
 //!
-//! В ключ входят cwd, размер и mtime бинаря, и те env, что меняют поведение процесса
-//! (профиль эмбеддингов, фоновый синк, EP-перепись). Иначе после `cargo build` или со
-//! сменой профиля клиент молча приклеился бы к демону, который считает не то, что
-//! просили, — а выглядело бы это как «сервер врёт», не как «подключились не туда».
+//! It covers the working directory, the binary's size and mtime, and the env
+//! vars that change what the server computes. Otherwise a rebuilt binary — or a
+//! different configuration — would silently attach to a daemon that answers
+//! differently, and that reads as "the server is lying", not as "we connected to
+//! the wrong one".
 //!
-//! # Отказ демона никогда не оставляет клиента без сервера
+//! # A failing daemon never leaves a client without a server
 //!
-//! Любой сбой на пути «подключиться / поднять / дождаться» — это `Ok(false)` из
-//! [`run_client`], и вызывающий обслуживает сессию сам, in-process, ровно как до
-//! появления этого модуля. Демон — оптимизация памяти, а не новая точка отказа.
+//! Any failure along connect / spawn / wait returns `Ok(false)` from
+//! [`run_client`], and the caller serves the session in-process exactly as it did
+//! before this module existed. The daemon is a memory optimisation, not a new
+//! point of failure.
 
 use fs2::FileExt;
 use rmc_server::mcp::{
@@ -53,42 +57,49 @@ use tokio::signal::unix::{SignalKind, signal};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Выключатель всей схемы: `RMC_DAEMON=0` (`off`/`false`/`no`) возвращает поведение
-/// «сервер живёт внутри процесса-клиента».
+/// Opt out of the whole scheme: `RMC_DAEMON=0` (`off`/`false`/`no`) keeps the
+/// server inside the client process, as it was before.
 pub const DAEMON_ENV: &str = "RMC_DAEMON";
-/// Каталог сокетов. По умолчанию `$XDG_RUNTIME_DIR/rust-code-mcp`.
+/// Directory holding sockets and daemon logs. Defaults to
+/// `$XDG_RUNTIME_DIR/rust-code-mcp`.
 pub const DAEMON_DIR_ENV: &str = "RMC_DAEMON_DIR";
-/// Сколько демон живёт без единого подключения, секунды. `0` — вечно.
+/// How long a daemon stays alive with no clients, in seconds. `0` means forever.
 pub const IDLE_ENV: &str = "RMC_DAEMON_IDLE_SECS";
 
-/// Полчаса: достаточно, чтобы пережить паузу между вопросами в сессии, и мало,
-/// чтобы закрытый редактор не держал полтора гигабайта до конца дня.
+/// Env vars that change what the server computes, and therefore which daemon a
+/// client belongs to. Extend this list whenever a new behaviour-changing knob is
+/// added, or clients configured differently will end up sharing one server.
+const KEYED_ENV: [&str; 3] = [EMBEDDING_PROFILE_ENV, BACKGROUND_SYNC_ENV, EP_CENSUS_ENV];
+
+/// Half an hour: long enough to survive a pause between questions in a session,
+/// short enough that a closed editor does not hold gigabytes until end of day.
 const DEFAULT_IDLE_SECS: u64 = 1800;
-/// Шаг проверки простоя. Он же потолок задержки выхода после последнего клиента.
+/// Idle-check interval, and therefore the upper bound on how late the daemon
+/// exits after its last client leaves.
 const IDLE_TICK: Duration = Duration::from_secs(15);
-/// Потолок ожидания поднимающегося демона. Щедрый намеренно: при `RMC_EP_CENSUS=1`
-/// старт упирается в блокирующую GPU-пробу. Ждём не вслепую — если процесс умер
-/// раньше, ожидание обрывается его кодом возврата, а не таймаутом.
+/// Upper bound on waiting for a daemon to come up. Deliberately generous, since
+/// startup may include model initialisation. The wait is not blind: if the
+/// process dies earlier, its exit status ends the wait instead of the timeout.
 const SPAWN_WAIT: Duration = Duration::from_secs(90);
 const SPAWN_POLL: Duration = Duration::from_millis(50);
 
-/// Как запущен процесс. Разбирается ДО тяжёлого старта: клиенту не нужны ни
-/// `ServerRuntime`, ни EP-проба, ни фоновый синк — он труба.
+/// How this process was started. Resolved *before* the expensive startup: a
+/// client needs neither a `ServerRuntime` nor a background sync task — it is a pipe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// Сервер внутри этого процесса поверх stdio — поведение до появления демона.
+    /// Server inside this process over stdio — the behaviour before the daemon.
     InProcess,
-    /// Демон: слушает сокет, обслуживает много подключений одним `RuntimeState`.
+    /// Daemon: listens on a socket, serves many clients from one `RuntimeState`.
     Daemon { socket: PathBuf, idle: Duration },
-    /// Клиент: stdin/stdout ↔ сокет, с подъёмом демона при необходимости.
+    /// Client: stdin/stdout ↔ socket, spawning the daemon when needed.
     Client { socket: PathBuf },
-    /// `--print-socket`: напечатать путь сокета и выйти (диагностика).
+    /// `--print-socket`: print the resolved socket path and exit (diagnostics).
     PrintSocket { socket: PathBuf },
     /// `--help`.
     Help,
 }
 
-/// Разбор аргументов и env. `args` — без имени программы.
+/// Parse arguments and env. `args` excludes the program name.
 pub fn resolve_mode(args: &[String]) -> Result<Mode, BoxError> {
     let mut socket: Option<PathBuf> = None;
     let mut idle: Option<Duration> = None;
@@ -100,7 +111,7 @@ pub fn resolve_mode(args: &[String]) -> Result<Mode, BoxError> {
             "--help" | "-h" => return Ok(Mode::Help),
             "--daemon" | "--client" | "--in-process" | "--print-socket" => {
                 if let Some(prev) = explicit {
-                    return Err(format!("режимы {prev} и {arg} несовместимы").into());
+                    return Err(format!("modes {prev} and {arg} are mutually exclusive").into());
                 }
                 explicit = Some(match arg.as_str() {
                     "--daemon" => "--daemon",
@@ -112,16 +123,16 @@ pub fn resolve_mode(args: &[String]) -> Result<Mode, BoxError> {
             "--socket" => {
                 let value = it
                     .next()
-                    .ok_or_else(|| BoxError::from("--socket требует путь"))?;
+                    .ok_or_else(|| BoxError::from("--socket requires a path"))?;
                 socket = Some(PathBuf::from(value));
             }
             "--idle-secs" => {
                 let value = it
                     .next()
-                    .ok_or_else(|| BoxError::from("--idle-secs требует число"))?;
+                    .ok_or_else(|| BoxError::from("--idle-secs requires a number"))?;
                 idle = Some(Duration::from_secs(value.parse::<u64>()?));
             }
-            other => return Err(format!("неизвестный аргумент {other}").into()),
+            other => return Err(format!("unknown argument {other}").into()),
         }
     }
 
@@ -142,19 +153,20 @@ pub fn resolve_mode(args: &[String]) -> Result<Mode, BoxError> {
 }
 
 pub const USAGE: &str = "\
-rust-code-mcp — MCP-сервер по Rust-коду.
+rust-code-mcp — an MCP server for Rust codebases.
 
-Без аргументов: клиент общего демона этого проекта (демон поднимается сам).
+With no arguments: a client of this project's shared daemon, which is started
+on demand.
 
-  --client            то же явно
-  --daemon            стать демоном: слушать сокет, обслуживать много клиентов
-  --in-process        сервер внутри этого процесса поверх stdio (как было раньше)
-  --print-socket      напечатать путь сокета этого проекта и выйти
-  --socket <PATH>     путь сокета вместо вычисленного по проекту
-  --idle-secs <N>     демон выходит после N секунд без подключений (0 — никогда)
+  --client            the same, explicitly
+  --daemon            become the daemon: listen on a socket, serve many clients
+  --in-process        run the server in this process over stdio (previous behaviour)
+  --print-socket      print this project's socket path and exit
+  --socket <PATH>     use this socket instead of the one derived from the project
+  --idle-secs <N>     daemon exits after N seconds with no clients (0 = never)
 
-Env: RMC_DAEMON=0 — всегда in-process; RMC_DAEMON_DIR — каталог сокетов;
-     RMC_DAEMON_IDLE_SECS — то же, что --idle-secs.
+Env: RMC_DAEMON=0 forces in-process; RMC_DAEMON_DIR sets the socket directory;
+     RMC_DAEMON_IDLE_SECS is the same as --idle-secs.
 ";
 
 fn daemon_disabled() -> bool {
@@ -175,8 +187,8 @@ fn idle_from_env() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// Каталог сокетов. `$XDG_RUNTIME_DIR` предпочтителен: он приватный (0700),
-/// на tmpfs и чистится при выходе из системы вместе с осиротевшими сокетами.
+/// Where sockets live. `$XDG_RUNTIME_DIR` is preferred: it is private, on tmpfs,
+/// and cleaned out at logout together with any orphaned sockets.
 fn socket_dir() -> Result<PathBuf, BoxError> {
     if let Ok(dir) = std::env::var(DAEMON_DIR_ENV) {
         return Ok(PathBuf::from(dir));
@@ -192,15 +204,16 @@ fn socket_dir() -> Result<PathBuf, BoxError> {
 
 fn ensure_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
-    // Сокет — точка входа в анализ чужого кода: каталог только владельцу.
+    // The socket is an entry point into analysing someone's code: owner only.
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
-/// Ключ демона: проект + всё, что меняет смысл ответов сервера.
+/// The daemon key: the project plus everything that changes what answers mean.
 ///
-/// Бинарь входит размером и mtime, а не хэшем содержимого: пересборка обязана
-/// дать НОВЫЙ демон (иначе клиент нового кода приклеится к старому серверу), а
-/// читать 60 мегабайт на каждом старте ради этого незачем.
+/// The binary contributes its size and mtime rather than a content hash: a
+/// rebuild must produce a *new* daemon (otherwise a client built from new code
+/// would be served by the old server), and reading tens of megabytes on every
+/// startup to establish that is not worth it.
 fn workspace_key() -> Result<String, BoxError> {
     let cwd = std::env::current_dir()?;
     let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
@@ -228,14 +241,11 @@ fn workspace_key() -> Result<String, BoxError> {
     Ok(key_from_parts(&cwd, &exe, exe_len, exe_mtime, &env))
 }
 
-/// Env, которые меняют смысл ответов сервера, а значит и адрес демона.
-const KEYED_ENV: [&str; 3] = [EMBEDDING_PROFILE_ENV, BACKGROUND_SYNC_ENV, EP_CENSUS_ENV];
-
-/// Чистая часть ключа: всё влияющее приходит аргументами.
+/// The pure part of the key: everything that matters arrives as an argument.
 ///
-/// Вынесено из [`workspace_key`] не ради красоты, а ради тестируемости: проверять
-/// «ключ разъезжается по профилю» через `set_var` — значит гонять глобальный env
-/// параллельно с другими тестами и получать красноту, не связанную с ключом.
+/// Split out of [`workspace_key`] for testability rather than tidiness: checking
+/// "the key changes with configuration" through `set_var` means mutating global
+/// env in parallel with other tests, which fails for reasons unrelated to keys.
 fn key_from_parts(
     cwd: &Path,
     exe: &Path,
@@ -272,13 +282,13 @@ fn log_path(socket: &Path) -> PathBuf {
     socket.with_extension("log")
 }
 
-/// Файловый лок вокруг «проверить / снести протухшее / поднять / дождаться».
+/// A file lock around "check / clear a stale socket / spawn / wait".
 ///
-/// Без него две сессии, стартовавшие одновременно, обе не найдут сокета и обе
-/// поднимут демона — то есть ровно та лишняя копия памяти, ради устранения
-/// которой всё это и написано.
+/// Without it, two sessions starting at the same moment both find no socket and
+/// both spawn a daemon — which is exactly the duplicated memory this module
+/// exists to remove.
 struct SpawnLock {
-    _file: File,
+    file: File,
 }
 
 impl SpawnLock {
@@ -290,13 +300,13 @@ impl SpawnLock {
             .truncate(false)
             .open(path)?;
         file.lock_exclusive()?;
-        Ok(Self { _file: file })
+        Ok(Self { file })
     }
 }
 
 impl Drop for SpawnLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self._file);
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -304,10 +314,11 @@ async fn try_connect(socket: &Path) -> Option<UnixStream> {
     UnixStream::connect(socket).await.ok()
 }
 
-/// Клиент: обслужить сессию через общий демон.
+/// Client: serve this session through the shared daemon.
 ///
-/// `Ok(true)` — сессия отработала через демон и завершилась. `Ok(false)` — демона
-/// получить не удалось; вызывающий обязан обслужить сессию сам (in-process).
+/// `Ok(true)` — the session ran through the daemon and finished. `Ok(false)` —
+/// no daemon could be reached or started, and the caller must serve the session
+/// itself, in-process.
 pub async fn run_client(socket: &Path) -> Result<bool, BoxError> {
     if let Some(stream) = try_connect(socket).await {
         tracing::info!("connected to shared daemon at {}", socket.display());
@@ -330,12 +341,13 @@ pub async fn run_client(socket: &Path) -> Result<bool, BoxError> {
         }
     };
 
-    // Повторная проверка под локом: пока мы ждали лок, демон мог подняться.
+    // Re-check under the lock: a daemon may have come up while we waited for it.
     let stream = match try_connect(socket).await {
         Some(stream) => Some(stream),
         None => {
-            // Файл сокета есть, а подключиться нельзя ⇒ демон умер, не убрав за
-            // собой. Снимаем сами: bind поверх живого файла даёт EADDRINUSE.
+            // The socket file exists but refuses connections, so the daemon died
+            // without cleaning up. Remove it ourselves: binding over a live file
+            // fails with EADDRINUSE.
             if socket.exists() {
                 let _ = fs::remove_file(socket);
             }
@@ -373,17 +385,17 @@ fn spawn_daemon(socket: &Path) -> io::Result<Child> {
         .arg(socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        // stderr демона — в файл рядом с сокетом: иначе диагностика общего
-        // процесса теряется вместе с породившей его сессией.
+        // The daemon's stderr goes to a file next to the socket: otherwise the
+        // diagnostics of a shared process die with the session that spawned it.
         .stderr(Stdio::from(log))
-        // Своя process group: Ctrl-C в сессии клиента не должен валить сервер,
-        // которым пользуются другие сессии.
+        // Its own process group, so Ctrl-C in one client's session does not take
+        // down a server other sessions are using.
         .process_group(0);
     cmd.spawn()
 }
 
-/// Ждать, пока демон забиндит сокет. Обрывается досрочно, если процесс умер —
-/// иначе отказ старта (например, провал EP-пробы) стоил бы полутора минут тишины.
+/// Wait for the daemon to bind. Ends early if the process dies, so a failed
+/// startup costs a moment rather than the full timeout.
 async fn wait_for_daemon(socket: &Path, mut child: Child) -> Option<UnixStream> {
     let deadline = tokio::time::Instant::now() + SPAWN_WAIT;
     loop {
@@ -413,10 +425,10 @@ async fn wait_for_daemon(socket: &Path, mut child: Child) -> Option<UnixStream> 
     }
 }
 
-/// Труба stdin/stdout ↔ сокет.
+/// Pump stdin/stdout ↔ socket.
 ///
-/// `select`, а не `join`: соединение закрывает демон, и ждать при этом EOF на
-/// stdin бессмысленно — он может не прийти никогда.
+/// `select`, not `join`: the daemon is the side that closes the connection, and
+/// waiting for EOF on stdin after that would hang — it may never arrive.
 async fn proxy(stream: UnixStream) -> io::Result<()> {
     let (mut from_daemon, mut to_daemon) = stream.into_split();
     let mut stdin = tokio::io::stdin();
@@ -444,7 +456,7 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Демон: слушать сокет, обслуживать подключения одним общим `RuntimeState`.
+/// Daemon: listen on the socket, serve every connection from one `RuntimeState`.
 pub async fn run_daemon(
     socket: &Path,
     idle: Duration,
@@ -455,7 +467,7 @@ pub async fn run_daemon(
     }
     let listener = UnixListener::bind(socket).map_err(|e| {
         BoxError::from(format!(
-            "не удалось забиндить {}: {e} (живой демон уже держит сокет?)",
+            "cannot bind {}: {e} (is a live daemon already holding it?)",
             socket.display()
         ))
     })?;
@@ -468,10 +480,10 @@ pub async fn run_daemon(
     let live = Arc::new(AtomicUsize::new(0));
     let idle_since = Arc::new(AtomicI64::new(now_secs()));
 
-    // Сигналы обязаны вести к тому же выходу, что и простой: убитый `kill`-ом
-    // демон иначе оставляет файл сокета, и следующий клиент видит адрес, по
-    // которому никого нет. Клиент это переживает (снимет и поднимет заново), но
-    // диагностика — `--print-socket` плюс `ls` — начинает врать.
+    // Signals must reach the same exit path as an idle timeout. A daemon killed
+    // outright leaves its socket file behind; clients survive that (they clear it
+    // and start a new one), but `--print-socket` plus `ls` then point at an
+    // address where nobody listens — diagnostics lying exactly when consulted.
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
@@ -500,7 +512,7 @@ pub async fn run_daemon(
                     if let Err(e) = serve_connection(stream, state).await {
                         tracing::warn!("connection ended with error: {e}");
                     }
-                    // Отсчёт простоя начинается с ухода ПОСЛЕДНЕГО клиента.
+                    // The idle countdown starts when the *last* client leaves.
                     if live.fetch_sub(1, Ordering::SeqCst) == 1 {
                         idle_since.store(now_secs(), Ordering::SeqCst);
                     }
@@ -522,8 +534,8 @@ pub async fn run_daemon(
         }
     }
 
-    // Убрать за собой: иначе следующий клиент найдёт файл, получит отказ в
-    // подключении и потратит цикл на снятие протухшего сокета.
+    // Clean up, so the next client does not find a file, get refused, and spend a
+    // round trip clearing a stale socket.
     let _ = fs::remove_file(socket);
     Ok(())
 }
@@ -581,57 +593,57 @@ mod tests {
         assert!(resolve_mode(&owned).is_err());
     }
 
-    fn key(cwd: &str, exe: &str, len: u64, mtime: u128, profile: &str) -> String {
+    fn key(cwd: &str, exe: &str, len: u64, mtime: u128, sync: &str) -> String {
         key_from_parts(
             Path::new(cwd),
             Path::new(exe),
             len,
             mtime,
-            &[(EMBEDDING_PROFILE_ENV, profile.to_string())],
+            &[(BACKGROUND_SYNC_ENV, sync.to_string())],
         )
     }
 
     #[test]
     fn key_is_stable_for_same_inputs() {
         assert_eq!(
-            key("/repo", "/bin/mcp", 10, 20, "gpu"),
-            key("/repo", "/bin/mcp", 10, 20, "gpu")
+            key("/repo", "/bin/mcp", 10, 20, "1"),
+            key("/repo", "/bin/mcp", 10, 20, "1")
         );
     }
 
-    /// Ключ обязан разъезжаться по профилю: демон, поднятый под другим профилем
-    /// эмбеддингов, считает не то, что просит новый клиент.
+    /// Configuration must split daemons: a server started with different
+    /// behaviour-changing env does not answer what the new client is asking for.
     #[test]
     fn key_depends_on_keyed_env() {
         assert_ne!(
-            key("/repo", "/bin/mcp", 10, 20, "gpu"),
-            key("/repo", "/bin/mcp", 10, 20, "cpu")
+            key("/repo", "/bin/mcp", 10, 20, "1"),
+            key("/repo", "/bin/mcp", 10, 20, "0")
         );
     }
 
-    /// Разные проекты — разные демоны, иначе «один на проект» превращается в
-    /// «один на всё» и профиль соседнего репозитория протекает сюда.
+    /// Different projects, different daemons — otherwise "one per project" turns
+    /// into "one for everything".
     #[test]
     fn key_depends_on_project() {
         assert_ne!(
-            key("/repo-a", "/bin/mcp", 10, 20, "gpu"),
-            key("/repo-b", "/bin/mcp", 10, 20, "gpu")
+            key("/repo-a", "/bin/mcp", 10, 20, "1"),
+            key("/repo-b", "/bin/mcp", 10, 20, "1")
         );
     }
 
-    /// Пересборка бинаря обязана дать новый сокет: иначе клиент нового кода
-    /// молча обслуживается старым сервером.
+    /// A rebuilt binary must get a new socket, or a client built from new code is
+    /// silently served by the old server.
     #[test]
     fn key_depends_on_binary_identity() {
         assert_ne!(
-            key("/repo", "/bin/mcp", 10, 20, "gpu"),
-            key("/repo", "/bin/mcp", 10, 21, "gpu"),
-            "другой mtime бинаря — другой демон"
+            key("/repo", "/bin/mcp", 10, 20, "1"),
+            key("/repo", "/bin/mcp", 10, 21, "1"),
+            "a different binary mtime means a different daemon"
         );
         assert_ne!(
-            key("/repo", "/bin/mcp", 10, 20, "gpu"),
-            key("/repo", "/bin/mcp", 11, 20, "gpu"),
-            "другой размер бинаря — другой демон"
+            key("/repo", "/bin/mcp", 10, 20, "1"),
+            key("/repo", "/bin/mcp", 11, 20, "1"),
+            "a different binary size means a different daemon"
         );
     }
 }
