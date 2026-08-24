@@ -446,6 +446,50 @@ impl UnifiedIndexer {
         Ok(())
     }
 
+    /// Forget cache entries whose file has no vectors in the store.
+    ///
+    /// These are the files `monitoring::health` reports as `stale_skips`: the
+    /// metadata cache says "done", the vector store holds nothing for them.
+    /// The cache entry is written only after a successful upsert, so this state
+    /// means the vectors were lost afterwards (a run killed mid-flight, a
+    /// collection rebuilt underneath). Whatever the cause, the pair is now
+    /// self-sustaining — the cache entry makes every later run skip the file,
+    /// so the vectors are never rebuilt.
+    ///
+    /// Removing just those entries is what makes repair cheap: the rest of the
+    /// tree keeps its cache and is waved through by the stat check, so only
+    /// these files are re-embedded. Returns the paths that were forgotten.
+    pub async fn forget_files_without_vectors(&mut self) -> Result<Vec<String>> {
+        let cached = self.core.cached_paths()?;
+        let indexed = self
+            .vector_store
+            .indexed_file_paths()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list indexed files: {}", e))?;
+
+        let mut stale: Vec<String> = cached
+            .into_iter()
+            .filter(|path| !indexed.contains(path))
+            .collect();
+        stale.sort();
+
+        for path in &stale {
+            self.core.forget_file(Path::new(path))?;
+            tracing::debug!("Forgot stale cache entry: {}", path);
+        }
+
+        if stale.is_empty() {
+            tracing::info!("Coverage repair: no cached files are missing vectors");
+        } else {
+            tracing::info!(
+                "Coverage repair: forgot {} cache entries with no vectors",
+                stale.len()
+            );
+        }
+
+        Ok(stale)
+    }
+
     /// Get access to the Tantivy index for searching
     pub fn tantivy_index(&self) -> &Index {
         self.tantivy.index()

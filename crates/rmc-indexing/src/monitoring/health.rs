@@ -158,18 +158,7 @@ impl ComponentHealth {
 fn read_cached_paths(cache_path: &PathBuf, salt: &str) -> Result<HashSet<String>, String> {
     let cache = MetadataCache::new(cache_path).map_err(|e| e.to_string())?;
     let files = cache.list_files().map_err(|e| e.to_string())?;
-    Ok(cached_paths_for_salt(files, salt))
-}
-
-/// Strip the salt prefix, keeping only keys that carry it.
-fn cached_paths_for_salt(keys: Vec<String>, salt: &str) -> HashSet<String> {
-    if salt.is_empty() {
-        return keys.into_iter().collect();
-    }
-    let prefix = format!("{}::", salt);
-    keys.into_iter()
-        .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
-        .collect()
+    Ok(MetadataCache::paths_for_salt(files, salt))
 }
 
 /// Health monitor for the search system
