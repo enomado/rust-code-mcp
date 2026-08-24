@@ -82,6 +82,10 @@ fn test_index_codebase_force_reindex_stdout_is_json_only() -> Result<()> {
     let mut child = ChildGuard {
         child: Command::new(env!("CARGO_BIN_EXE_rust-code-mcp"))
             .env("RUST_LOG", "error")
+            // Проверяется именно stdio-путь внутри процесса. Без опт-аута тест
+            // ушёл бы через общий демон и заодно оставил бы его с индексом
+            // временного каталога, который сам же удаляет в `Drop`.
+            .env("RMC_DAEMON", "0")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

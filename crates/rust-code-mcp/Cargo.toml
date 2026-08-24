@@ -7,9 +7,14 @@ edition = "2024"
 rmc-server = { path = "../rmc-server" }
 
 rmcp = { workspace = true }
-tokio = { workspace = true }
+# net/time/io-util — транспорт общего демона (unix-сокет, ожидание старта, прокси).
+tokio = { workspace = true, features = ["net", "time", "io-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Лок вокруг «поднять демона»: без него две одновременные сессии поднимут двух.
+fs2 = "0.4"
+# Ключ сокета (проект + env + версия бинаря).
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # Examples and integration tests moved here with the executable package, so they

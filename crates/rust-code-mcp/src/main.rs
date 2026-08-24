@@ -4,6 +4,11 @@
 // compile-time inference budget, not a runtime cost.
 #![recursion_limit = "512"]
 
+// Один сервер на проект вместо одного на сессию: см. `daemon`. Unix-only —
+// транспорт unix-сокетный, на остальных платформах остаётся прежний stdio.
+#[cfg(unix)]
+mod daemon;
+
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENABLED_VALUES, BACKGROUND_SYNC_ENV, EP_CENSUS_ENV, ServerRuntime,
     automatic_embedding_profile_name, cuda_capable_features_compiled, parse_background_sync_env,
@@ -32,6 +37,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
+
+    // Режим разбирается ДО тяжёлого старта: клиенту общего демона не нужны ни
+    // `ServerRuntime`, ни EP-проба, ни фоновый синк — он труба между stdio и сокетом.
+    #[cfg(unix)]
+    let mode = {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        match daemon::resolve_mode(&args) {
+            Ok(mode) => mode,
+            Err(e) => {
+                eprintln!("{e}\n\n{}", daemon::USAGE);
+                // Явная точка приведения: `main` отдаёт `Box<dyn Error>` без
+                // `Send + Sync`, и без typed-let вывод уносит тип всего тела.
+                let boxed: Box<dyn std::error::Error> = e;
+                return Err(boxed);
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    match &mode {
+        daemon::Mode::Help => {
+            print!("{}", daemon::USAGE);
+            return Ok(());
+        }
+        daemon::Mode::PrintSocket { socket } => {
+            println!("{}", socket.display());
+            return Ok(());
+        }
+        daemon::Mode::Client { socket } => {
+            // Отказ демона не оставляет сессию без сервера: проваливаемся в
+            // in-process ровно к прежнему поведению.
+            match daemon::run_client(socket).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    tracing::info!("shared daemon unavailable; serving this session in-process")
+                }
+                Err(e) => tracing::warn!("shared daemon client failed: {e}; serving in-process"),
+            }
+        }
+        daemon::Mode::Daemon { .. } | daemon::Mode::InProcess => {}
+    }
 
     tracing::info!("Starting MCP Server...");
 
@@ -86,6 +132,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Background sync task disabled; set {}=1 to enable",
             BACKGROUND_SYNC_ENV
         );
+    }
+
+    // Демон: тот же рантайм, но много подключений вместо одной трубы stdio.
+    #[cfg(unix)]
+    if let daemon::Mode::Daemon { socket, idle } = &mode {
+        let result = daemon::run_daemon(socket, *idle, &runtime).await;
+        let shutdown = runtime.shutdown_gracefully(Duration::from_secs(10)).await;
+        tracing::info!("Runtime shutdown after daemon exit: {:?}", shutdown);
+        return result.map_err(|e| -> Box<dyn std::error::Error> { e });
     }
 
     let service = match SearchTool::with_server_runtime(&runtime)

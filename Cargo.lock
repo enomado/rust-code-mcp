@@ -7468,6 +7468,7 @@ dependencies = [
  "cargo_metadata",
  "directories",
  "fastembed",
+ "fs2",
  "futures",
  "glob",
  "heed",
