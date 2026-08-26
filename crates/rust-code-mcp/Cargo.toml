@@ -85,13 +85,25 @@ migraphx = ["rmc-server/migraphx"]
 directml = ["rmc-server/directml"]
 # mimalloc allocator instead of the system one.
 #
-# Why: glibc does not return to the kernel the arenas fragmented by the salsa database of
-# rust-analyzer; a daemon with an EMPTY runtime held 4.9 GB (measurement and numbers in
-# `rmc_server::mcp::memory`). mimalloc returns memory by itself, on decay, and supports
-# a forced collection.
+# 🚨 MEASURED AND LOST: enable only with a new measurement under your own workload.
+#
+# The same work (loading RA over a workspace of ~4000 files, 13
+# definitions + 120 references), three builds, RSS in MB:
+#
+#             | start |  peak RA | AFTER unload
+#   glibc+trim|  2311 |     2466 |  1357
+#   mimalloc  |  2334 |     3535 |  2763
+#   +purge0   |  2337 |     3558 |  2666
+#
+# That is, glibc with `malloc_trim` settles TWICE as low. mimalloc reserves
+# more aggressively (peak a gigabyte higher) and holds more even with
+# `MIMALLOC_PURGE_DELAY=0`, which otherwise works: there it returned 860 MB
+# by itself, without our call.
+#
+# The feature is kept because the verdict is tied to THIS workload and this machine:
+# under a different profile (many workspaces, long lifetime, a different allocation stream)
+# the picture may flip. But the default is the system allocator.
 #
 # Why mimalloc and not jemalloc: `tikv-jemalloc-sys` does not build on
-# Windows, and the server is needed there too. A feature, not the default: replacing the global
-# allocator is a deployment-level decision, and its cost on your machine should be
-# seen by measurement, not inherited silently.
+# Windows, and the server is needed there too.
 mimalloc = ["dep:mimalloc", "rmc-server/mimalloc"]
