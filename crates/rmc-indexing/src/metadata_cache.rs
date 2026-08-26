@@ -8,7 +8,26 @@ use sha2::{Digest, Sha256};
 use sled::Db;
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+
+/// How long [`MetadataCache::new`] waits out a lock still held by a handle
+/// that is on its way out, and how often it retries inside that budget.
+///
+/// Sized to cover thread scheduling, not to outwait a working indexer: a
+/// cache that is genuinely busy stays an error, so the caller can report it
+/// instead of stalling behind someone else's write.
+const LOCK_WAIT_BUDGET: Duration = Duration::from_millis(250);
+const LOCK_WAIT_STEP: Duration = Duration::from_millis(10);
+
+/// Whether a failed open is lock contention rather than a broken cache.
+///
+/// sled flattens this into an `Io` error whose kind is `Other`, so the
+/// underlying `WouldBlock` survives only in the message — matching the text
+/// is all that is left. Anything else (corruption, permissions, no space) must
+/// keep propagating immediately: retrying those just delays the real report.
+fn is_lock_contention(error: &sled::Error) -> bool {
+    matches!(error, sled::Error::Io(io) if io.to_string().contains("could not acquire lock"))
+}
 
 /// Metadata for a single indexed file
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -76,13 +95,34 @@ pub(crate) struct MetadataCache {
 
 impl MetadataCache {
     /// Open or create a metadata cache at the given path
+    ///
+    /// sled holds an exclusive file lock, and it outlives the `Db` handle by a
+    /// moment: background threads still hold the file when `drop` returns. So
+    /// an ordinary open-write-close-reopen sequence can lose the lock race on
+    /// its own previous handle, and the wider the machine is loaded the more
+    /// often it does — this surfaced as a flaky coverage probe, failing on a
+    /// different test each parallel run with `WouldBlock` on the reopen.
+    ///
+    /// A bounded retry closes that window without inventing a queue: past
+    /// [`LOCK_WAIT_BUDGET`] the error is returned, and a health probe reports
+    /// "unknown" rather than fighting a running indexer for the lock.
     pub(crate) fn new(path: &Path) -> Result<Self, sled::Error> {
         // Ensure parent directories exist (sled only creates the final directory)
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let db = sled::open(path)?;
-        Ok(Self { db })
+
+        let mut waited = Duration::ZERO;
+        loop {
+            match sled::open(path) {
+                Ok(db) => return Ok(Self { db }),
+                Err(e) if is_lock_contention(&e) && waited < LOCK_WAIT_BUDGET => {
+                    std::thread::sleep(LOCK_WAIT_STEP);
+                    waited += LOCK_WAIT_STEP;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Get cached metadata for a file
@@ -183,6 +223,53 @@ impl MetadataCache {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A cache held open by someone else must still FAIL to open, and inside
+    /// the wait budget rather than whenever the OS feels like it. Without this
+    /// half of the check the retry could quietly become an unbounded wait, and
+    /// a health probe would hang behind a running indexer instead of saying
+    /// "unknown".
+    #[test]
+    fn a_cache_held_by_a_live_handle_fails_within_the_wait_budget() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("cache");
+        let holder = MetadataCache::new(&path).expect("first open");
+
+        let started = std::time::Instant::now();
+        let contended = MetadataCache::new(&path);
+        let waited = started.elapsed();
+
+        let error = contended.err().expect("second open must fail while held");
+        assert!(
+            is_lock_contention(&error),
+            "expected lock contention, got: {error:?}"
+        );
+        assert!(
+            waited < LOCK_WAIT_BUDGET * 4,
+            "gave up after {waited:?}, budget is {LOCK_WAIT_BUDGET:?}"
+        );
+
+        // Positive control: the same path opens once the holder is gone, so
+        // the assertion above is about the lock and not about a bad path.
+        drop(holder);
+        MetadataCache::new(&path).expect("reopen after release");
+    }
+
+    /// The retry must not swallow real failures: a path that cannot be a
+    /// database has to come back as an error immediately, not after the
+    /// budget.
+    #[test]
+    fn a_broken_cache_path_is_not_mistaken_for_lock_contention() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("not-a-dir");
+        std::fs::write(&path, b"i am a file, not a sled directory").unwrap();
+
+        let error = MetadataCache::new(&path).err().expect("must fail");
+        assert!(
+            !is_lock_contention(&error),
+            "a broken path must not be retried as contention: {error:?}"
+        );
+    }
 
     #[test]
     fn test_file_metadata_creation() {
