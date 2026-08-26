@@ -9,9 +9,18 @@
 #[cfg(unix)]
 mod daemon;
 
+// Under the `mimalloc` feature every allocation in the process — including
+// rust-analyzer's salsa database, which is what actually fills the heap — goes
+// through mimalloc instead of the system allocator. The reason is in the
+// feature's comment in Cargo.toml; the short version is that glibc keeps its
+// fragmented arenas and mimalloc gives them back.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENABLED_VALUES, BACKGROUND_SYNC_ENV, EP_CENSUS_ENV, ServerRuntime,
-    automatic_embedding_profile_name, cuda_capable_features_compiled, parse_background_sync_env,
+    automatic_embedding_profile_name, gpu_backends_compiled, parse_background_sync_env,
     probe_ep_census_on_startup,
 };
 use rmc_server::tools::SearchTool;
@@ -90,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let background_sync_env = std::env::var(BACKGROUND_SYNC_ENV).ok();
     let background_sync_enabled = parse_background_sync_env(background_sync_env.as_deref());
     tracing::info!(
-        "MCP startup defaults: background sync {} ({}='{}'; enabled only for {}, case-insensitive); automatic/background embedding profile default {}; CUDA-capable features compiled: {}",
+        "MCP startup defaults: background sync {} ({}='{}'; enabled only for {}, case-insensitive); automatic/background embedding profile default {}; GPU backends compiled: {}",
         if background_sync_enabled {
             "enabled"
         } else {
@@ -100,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         background_sync_env.as_deref().unwrap_or("<unset>"),
         BACKGROUND_SYNC_ENABLED_VALUES,
         automatic_embedding_profile_name(),
-        cuda_capable_features_compiled(),
+        gpu_backends_compiled(),
     );
 
     // Проба «на чём реально считается граф» — по ручке RMC_EP_CENSUS.
