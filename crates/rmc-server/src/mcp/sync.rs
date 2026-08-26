@@ -25,6 +25,18 @@ fn normalize_directory(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
+/// Whether a discovered index belongs to the profile background sync maintains.
+///
+/// Compared by profile name rather than by identity string: a legacy identity
+/// decodes into the same built-in profile, and matching on the raw string
+/// would drop such an index out of background sync for no real reason.
+fn is_automatic_profile_backend(
+    backend: &EmbeddingBackend,
+    automatic: &EmbeddingBackend,
+) -> bool {
+    backend.profile.name() == automatic.profile.name()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SyncManagerStatus {
     pub tracked_count: usize,
@@ -174,7 +186,7 @@ impl SyncManager {
     /// periodic sync cycles. An in-flight workspace sync is allowed to finish.
     pub async fn run_until_shutdown(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         tracing::info!(
-            "Starting background sync with {}s interval; automatic/default profile {}; local Qwen3/CUDA profiles are skipped in background sync",
+            "Starting background sync with {}s interval; automatic/default profile {}; other profiles' indexes on disk are left to explicit commands, and local Qwen3/CUDA profiles are skipped entirely",
             self.interval.as_secs(),
             automatic_embedding_profile_name(),
         );
@@ -244,6 +256,18 @@ impl SyncManager {
 
         let _workspace_lock = self.workspace_locks.lock_exclusive(dir).await;
 
+        // Background sync maintains the automatic profile's index and nothing
+        // else. A directory can carry several indexes at once — typically a
+        // current GPU one plus a stale CPU one left over from an earlier
+        // default — and chasing all of them means the slow profile burns the
+        // machine on vectors no search ever reads: same model, same dim, but
+        // ~80x apart in throughput (260 vs 3 chunks/s measured on ONNX
+        // migraphx vs CPU). Other profiles stay reachable through an explicit
+        // index_codebase call with `embedding_profile`.
+        let automatic_backend =
+            EmbeddingBackend::from_profile_name(automatic_embedding_profile_name())
+                .map_err(|e| anyhow::anyhow!("automatic embedding profile is unusable: {e}"))?;
+
         let indexes = ProjectPaths::indexed_profiles(dir)
             .map_err(|msg| anyhow::anyhow!(msg))?;
         if indexes.is_empty() {
@@ -258,6 +282,17 @@ impl SyncManager {
             let backend = indexed.backend;
             let paths = indexed.paths;
             let stored_identity = indexed.stored_identity;
+
+            if !is_automatic_profile_backend(&backend, &automatic_backend) {
+                tracing::info!(
+                    "Skipping background sync for {} profile {} because background sync maintains only the automatic profile {}; use an explicit indexing command with embedding_profile=\"{}\" to update it",
+                    dir.display(),
+                    backend.profile.name(),
+                    automatic_backend.profile.name(),
+                    backend.profile.name(),
+                );
+                continue;
+            }
 
             if !is_background_embedding_backend(&backend) {
                 tracing::info!(
@@ -490,6 +525,40 @@ mod tests {
         assert!(is_background_embedding_backend(&onnx_gpu_backend));
         assert!(is_background_embedding_backend(&cpu_backend));
         assert!(is_background_embedding_backend(&remote_backend));
+    }
+
+    /// A directory keeps every index ever built for it, so discovery returns
+    /// the stale ones too. Background sync must maintain only the automatic
+    /// profile: a leftover CPU index next to a live GPU one is ~80x slower per
+    /// chunk and feeds a collection no search reads.
+    #[test]
+    fn background_sync_maintains_only_the_automatic_profile() {
+        let gpu_backend =
+            rmc_engine::embeddings::EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
+        let cpu_backend =
+            rmc_engine::embeddings::EmbeddingBackend::from_profile_name("local-cpu-small")
+                .unwrap();
+
+        assert!(is_automatic_profile_backend(&gpu_backend, &gpu_backend));
+        assert!(!is_automatic_profile_backend(&cpu_backend, &gpu_backend));
+        // Symmetric: with a CPU default it is the GPU index that is left alone.
+        assert!(is_automatic_profile_backend(&cpu_backend, &cpu_backend));
+        assert!(!is_automatic_profile_backend(&gpu_backend, &cpu_backend));
+    }
+
+    /// The stale-profile filter must not be confused with the Qwen3/CUDA one:
+    /// both CPU and ONNX-GPU pass `is_background_embedding_backend`, so only
+    /// the automatic-profile check separates them.
+    #[test]
+    fn stale_cpu_index_passes_the_qwen3_filter_and_is_stopped_by_the_profile_check() {
+        let gpu_backend =
+            rmc_engine::embeddings::EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
+        let cpu_backend =
+            rmc_engine::embeddings::EmbeddingBackend::from_profile_name("local-cpu-small")
+                .unwrap();
+
+        assert!(is_background_embedding_backend(&cpu_backend));
+        assert!(!is_automatic_profile_backend(&cpu_backend, &gpu_backend));
     }
 
     #[tokio::test]
