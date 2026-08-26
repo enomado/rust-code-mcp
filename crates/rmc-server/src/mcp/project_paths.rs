@@ -179,12 +179,19 @@ mod tests {
         .unwrap();
     }
 
+    /// Asserts the LINK — no explicit profile means the automatic one — not a
+    /// literal name. `RMC_EMBEDDING_PROFILE` legitimately moves that name, and
+    /// a machine with the GPU profile exported would otherwise fail a suite
+    /// over a setting that is working as intended. The literal default lives
+    /// in `defaults::profile_env_absent_or_blank_falls_back_to_cpu_default`,
+    /// which takes the env value as an argument instead of reading it.
     #[test]
-    fn resolve_embedding_backend_defaults_to_automatic_cpu_profile() {
+    fn resolve_embedding_backend_without_a_profile_uses_the_automatic_one() {
+        let automatic = crate::mcp::defaults::automatic_embedding_backend();
         let backend = resolve_embedding_backend_for_mcp(None, Path::new(".")).unwrap();
 
-        assert_eq!(backend.profile.name(), "local-cpu-small");
-        assert_eq!(backend.dim(), 384);
+        assert_eq!(backend.profile.name(), automatic.profile.name());
+        assert_eq!(backend.dim(), automatic.dim());
     }
 
     #[test]

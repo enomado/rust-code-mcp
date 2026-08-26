@@ -206,7 +206,7 @@ fn cpu_profile_on_gpu_build(compiled_backends: &[&str], automatic: &EmbeddingBac
 /// Text of the startup warning for [`cpu_profile_on_gpu_build`], or
 /// `None` when there is nothing to warn about.
 pub fn cpu_profile_on_gpu_build_warning() -> Option<String> {
-    let automatic = EmbeddingBackend::from_profile_name(automatic_embedding_profile_name()).ok()?;
+    let automatic = automatic_embedding_backend();
     if !cpu_profile_on_gpu_build(rmc_engine::embeddings::GPU_BACKENDS_COMPILED, &automatic) {
         return None;
     }

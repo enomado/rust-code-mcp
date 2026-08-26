@@ -563,12 +563,18 @@ mod tests {
         assert!(parse_variant("minilm").is_err());
     }
 
+    /// Same reasoning as
+    /// `project_paths::resolve_embedding_backend_without_a_profile_uses_the_automatic_one`:
+    /// the claim here is "neither profile nor model given ⇒ the automatic
+    /// profile", and pinning its literal name would make the suite fail on any
+    /// machine that exports `RMC_EMBEDDING_PROFILE`.
     #[test]
-    fn resolve_backend_without_profile_or_model_uses_automatic_cpu_default() {
+    fn resolve_backend_without_profile_or_model_uses_the_automatic_profile() {
+        let automatic = crate::mcp::defaults::automatic_embedding_backend();
         let backend = resolve_backend(None, None, std::path::Path::new(".")).unwrap();
 
-        assert_eq!(backend.profile.name(), "local-cpu-small");
-        assert_eq!(backend.dim(), 384);
+        assert_eq!(backend.profile.name(), automatic.profile.name());
+        assert_eq!(backend.dim(), automatic.dim());
     }
 
     #[test]
