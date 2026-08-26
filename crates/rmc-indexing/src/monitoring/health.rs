@@ -31,6 +31,67 @@ pub struct HealthStatus {
     /// Index coverage: does the store actually hold what the indexer
     /// believes it already indexed?
     pub coverage: CoverageHealth,
+    /// Index freshness: does the index still describe the code on disk?
+    pub freshness: FreshnessHealth,
+}
+
+/// Freshness report — the answer to "is this index *current*?".
+///
+/// The gap this exists for: every other component answers a question about
+/// the index's own internals, and none of them ever looks at the working
+/// tree. `merkle` reports that a snapshot file EXISTS; `coverage` reports
+/// that everything the cache claims is indexed HAS vectors. Both stay green
+/// while the developer edits code all day, because the comparison against
+/// disk happens nowhere except inside `index_codebase` — which is the one
+/// place that also fixes it.
+///
+/// The consequence is a probe that structurally cannot fail for the most
+/// common real failure. Observed on `rust_app` (2026-08-25): `health_check`
+/// reported healthy with `coverage 3983/3983`, and the very next
+/// `index_codebase` reindexed 133 changed files. Nothing was broken — the
+/// index was simply 133 files behind, and no measurement existed that could
+/// say so.
+///
+/// The verdict is content-based, not timestamp-based (see
+/// [`FileSystemMerkle::detect_disk_changes`]), so a rebuild or a `git
+/// checkout` that touches mtimes without changing bytes does not raise a
+/// false alarm.
+#[derive(Debug, Clone, Serialize)]
+pub struct FreshnessHealth {
+    /// Freshness status
+    pub status: Status,
+    /// Human-readable summary
+    pub message: String,
+    /// Files on disk that the snapshot has never seen
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_added: Option<usize>,
+    /// Files whose content differs from the snapshot
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_modified: Option<usize>,
+    /// Files the snapshot tracks that are gone from disk
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_deleted: Option<usize>,
+    /// A few example paths, tagged with what happened to them
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<String>,
+}
+
+impl FreshnessHealth {
+    /// Freshness could not be measured (no project directory, no snapshot).
+    ///
+    /// Degraded, never healthy — for the same reason as
+    /// [`CoverageHealth::unknown`]: "we did not look" must not read as "we
+    /// looked and it is fine".
+    fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            status: Status::Degraded,
+            message: message.into(),
+            files_added: None,
+            files_modified: None,
+            files_deleted: None,
+            examples: Vec::new(),
+        }
+    }
 }
 
 /// Coverage report — the answer to "is this index complete?", which
@@ -170,6 +231,10 @@ pub struct HealthMonitor {
     /// its keys are prefixed with (the chunking identity). Absent for a
     /// system-wide probe, where there is no single project to speak of.
     metadata_cache: Option<(PathBuf, String)>,
+    /// Working tree of the project being checked. Without it there is no
+    /// "current state of the code" to compare the snapshot against, and
+    /// freshness stays unmeasured.
+    project_root: Option<PathBuf>,
 }
 
 impl HealthMonitor {
@@ -184,7 +249,19 @@ impl HealthMonitor {
             vector_store,
             merkle_path,
             metadata_cache: None,
+            project_root: None,
         }
+    }
+
+    /// Point the monitor at the project's working tree, enabling the
+    /// freshness check.
+    ///
+    /// Must be the same root the snapshot was built from — both sides walk
+    /// with `traversal::collect_project_rust_files`, and a different root
+    /// would report the whole project as added and deleted at once.
+    pub fn with_project_root(mut self, root: PathBuf) -> Self {
+        self.project_root = Some(root);
+        self
     }
 
     /// Point the monitor at the project's metadata cache, enabling the
@@ -202,16 +279,22 @@ impl HealthMonitor {
     /// Perform comprehensive health check
     pub async fn check_health(&self) -> HealthStatus {
         // Run all checks in parallel
-        let (bm25_health, vector_health, merkle_health, coverage) = tokio::join!(
+        let (bm25_health, vector_health, merkle_health, coverage, freshness) = tokio::join!(
             self.check_bm25(),
             self.check_vector(),
             self.check_merkle(),
-            self.check_coverage()
+            self.check_coverage(),
+            self.check_freshness()
         );
 
         // Determine overall status
-        let overall =
-            self.calculate_overall_status(&bm25_health, &vector_health, &merkle_health, &coverage);
+        let overall = self.calculate_overall_status(
+            &bm25_health,
+            &vector_health,
+            &merkle_health,
+            &coverage,
+            &freshness,
+        );
 
         HealthStatus {
             overall,
@@ -219,6 +302,7 @@ impl HealthMonitor {
             vector: vector_health,
             merkle: merkle_health,
             coverage,
+            freshness,
         }
     }
 
@@ -419,6 +503,99 @@ impl HealthMonitor {
         }
     }
 
+    /// Check index freshness (see [`FreshnessHealth`])
+    ///
+    /// Cost is one stat per project file plus a read of the files whose mtime
+    /// moved — tens of milliseconds on a clean tree, seconds right after a
+    /// branch switch. Deliberately paid: the alternative is the probe that
+    /// cannot fail, which is what this replaces.
+    async fn check_freshness(&self) -> FreshnessHealth {
+        let Some(root) = &self.project_root else {
+            return FreshnessHealth::unknown(
+                "Freshness unknown: no project directory (system-wide check; pass 'directory')",
+            );
+        };
+
+        let merkle = match FileSystemMerkle::load_snapshot(&self.merkle_path) {
+            Ok(Some(merkle)) => merkle,
+            Ok(None) => {
+                return FreshnessHealth::unknown(format!(
+                    "Freshness unknown: no Merkle snapshot at {} — nothing to compare the working tree against (project never indexed under this profile?)",
+                    self.merkle_path.display()
+                ));
+            }
+            Err(e) => {
+                return FreshnessHealth::unknown(format!(
+                    "Freshness unknown: cannot read Merkle snapshot at {}: {}",
+                    self.merkle_path.display(),
+                    e
+                ));
+            }
+        };
+
+        let changes = match merkle.detect_disk_changes(root) {
+            Ok(changes) => changes,
+            Err(e) => {
+                return FreshnessHealth::unknown(format!(
+                    "Freshness unknown: cannot compare {} against the snapshot: {}",
+                    root.display(),
+                    e
+                ));
+            }
+        };
+
+        let (added, modified, deleted) = (
+            changes.added.len(),
+            changes.modified.len(),
+            changes.deleted.len(),
+        );
+
+        // Tagged examples: "which files" is useless for triage without
+        // "what happened to them" — a deleted file and a new one call for
+        // different reactions.
+        let examples: Vec<String> = changes
+            .modified
+            .iter()
+            .map(|p| format!("modified: {}", p.display()))
+            .chain(changes.added.iter().map(|p| format!("added: {}", p.display())))
+            .chain(
+                changes
+                    .deleted
+                    .iter()
+                    .map(|p| format!("deleted: {}", p.display())),
+            )
+            .take(10)
+            .collect();
+
+        let (status, message) = if changes.is_empty() {
+            (
+                Status::Healthy,
+                format!(
+                    "Index is current: all {} tracked files match the working tree",
+                    merkle.file_count()
+                ),
+            )
+        } else {
+            (
+                Status::Degraded,
+                format!(
+                    "Index is STALE: {} modified, {} added, {} deleted since the last indexing run — \
+                     search and symbol answers still describe the old code. Fix: a plain index_codebase run",
+                    modified, added, deleted
+                ),
+            )
+        };
+
+        FreshnessHealth {
+            status,
+            message,
+            files_added: Some(added),
+            files_modified: Some(modified),
+            files_deleted: Some(deleted),
+            examples,
+        }
+    }
+
     /// Calculate overall system status from component statuses
     fn calculate_overall_status(
         &self,
@@ -426,6 +603,7 @@ impl HealthMonitor {
         vector: &ComponentHealth,
         merkle: &ComponentHealth,
         coverage: &CoverageHealth,
+        freshness: &FreshnessHealth,
     ) -> Status {
         // Critical: both search engines must work
         let search_unhealthy =
@@ -436,10 +614,13 @@ impl HealthMonitor {
         }
 
         // Degraded: one search engine down OR merkle issues OR an
-        // index that is silently incomplete. The last one is the whole
-        // point of the coverage check: without it a half-indexed store
-        // answers "healthy" and quietly returns partial search results.
+        // index that is silently incomplete OR one that no longer
+        // describes the code. The last two are the whole point of the
+        // coverage and freshness checks: without them a half-indexed or
+        // days-old store answers "healthy" and quietly returns partial or
+        // obsolete search results.
         let has_degraded = coverage.status != Status::Healthy
+            || freshness.status != Status::Healthy
             || bm25.status == Status::Degraded
             || vector.status == Status::Degraded
             || merkle.status == Status::Degraded
@@ -487,6 +668,18 @@ mod tests {
         }
     }
 
+    /// Freshness in the "checked and current" state, for status-algebra tests.
+    fn freshness_ok() -> FreshnessHealth {
+        FreshnessHealth {
+            status: Status::Healthy,
+            message: "ok".to_string(),
+            files_added: Some(0),
+            files_modified: Some(0),
+            files_deleted: Some(0),
+            examples: Vec::new(),
+        }
+    }
+
     #[test]
     fn test_overall_status_calculation() {
         let monitor = HealthMonitor {
@@ -494,6 +687,7 @@ mod tests {
             vector_store: None,
             merkle_path: PathBuf::from("/tmp/merkle.snapshot"),
             metadata_cache: None,
+            project_root: None,
         };
 
         // All healthy
@@ -502,6 +696,7 @@ mod tests {
             &ComponentHealth::healthy("ok", None),
             &ComponentHealth::healthy("ok", None),
             &coverage_ok(),
+            &freshness_ok(),
         );
         assert_eq!(all_healthy, Status::Healthy);
 
@@ -511,6 +706,7 @@ mod tests {
             &ComponentHealth::healthy("ok", None),
             &ComponentHealth::healthy("ok", None),
             &coverage_ok(),
+            &freshness_ok(),
         );
         assert_eq!(one_degraded, Status::Degraded);
 
@@ -520,6 +716,7 @@ mod tests {
             &ComponentHealth::unhealthy("down"),
             &ComponentHealth::healthy("ok", None),
             &coverage_ok(),
+            &freshness_ok(),
         );
         assert_eq!(both_down, Status::Unhealthy);
 
@@ -529,8 +726,28 @@ mod tests {
             &ComponentHealth::healthy("ok", None),
             &ComponentHealth::healthy("ok", None),
             &coverage_ok(),
+            &freshness_ok(),
         );
         assert_eq!(one_down, Status::Degraded);
+
+        // A stale index alone degrades the verdict. This is the regression
+        // the freshness component exists for: everything else is green and
+        // the answers are still obsolete.
+        let stale = monitor.calculate_overall_status(
+            &ComponentHealth::healthy("ok", None),
+            &ComponentHealth::healthy("ok", None),
+            &ComponentHealth::healthy("ok", None),
+            &coverage_ok(),
+            &FreshnessHealth {
+                status: Status::Degraded,
+                message: "stale".to_string(),
+                files_added: Some(0),
+                files_modified: Some(133),
+                files_deleted: Some(0),
+                examples: Vec::new(),
+            },
+        );
+        assert_eq!(stale, Status::Degraded);
     }
 
     /// Build a store holding one vector for `file_with_vectors`, and a
@@ -710,6 +927,134 @@ mod tests {
         assert_eq!(coverage.status, Status::Degraded);
     }
 
+    /// A project with one file, indexed: snapshot on disk, tree untouched.
+    fn indexed_project(temp: &TempDir) -> (PathBuf, PathBuf) {
+        let root = temp.path().join("proj");
+        std::fs::create_dir_all(root.join("src")).expect("create src");
+        std::fs::write(root.join("src/lib.rs"), "pub fn one() {}\n").expect("write");
+
+        let snapshot_path = temp.path().join("merkle.snapshot");
+        FileSystemMerkle::from_directory(&root)
+            .expect("build merkle")
+            .save_snapshot(&snapshot_path)
+            .expect("save snapshot");
+
+        (root, snapshot_path)
+    }
+
+    #[tokio::test]
+    async fn freshness_is_healthy_when_the_tree_matches_the_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let (root, snapshot_path) = indexed_project(&temp);
+
+        let freshness = HealthMonitor::new(None, None, snapshot_path)
+            .with_project_root(root)
+            .check_freshness()
+            .await;
+
+        assert_eq!(freshness.status, Status::Healthy);
+        assert_eq!(freshness.files_modified, Some(0));
+        assert_eq!(freshness.files_added, Some(0));
+        assert_eq!(freshness.files_deleted, Some(0));
+    }
+
+    /// The defect this component exists for: an edit after indexing left every
+    /// other component green, so `health_check` could not report it at all.
+    #[tokio::test]
+    async fn freshness_catches_an_edit_made_after_indexing() {
+        let temp = TempDir::new().unwrap();
+        let (root, snapshot_path) = indexed_project(&temp);
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn one() {}\npub fn two() {}\n")
+            .expect("edit");
+        std::fs::write(root.join("src/extra.rs"), "pub fn three() {}\n").expect("add");
+
+        let freshness = HealthMonitor::new(None, None, snapshot_path)
+            .with_project_root(root)
+            .check_freshness()
+            .await;
+
+        assert_eq!(freshness.status, Status::Degraded);
+        assert_eq!(freshness.files_modified, Some(1));
+        assert_eq!(freshness.files_added, Some(1));
+        assert!(
+            freshness.examples.iter().any(|e| e.starts_with("modified: ")),
+            "examples must say what happened to each file: {:?}",
+            freshness.examples
+        );
+    }
+
+    #[tokio::test]
+    async fn freshness_catches_a_file_deleted_after_indexing() {
+        let temp = TempDir::new().unwrap();
+        let (root, snapshot_path) = indexed_project(&temp);
+
+        std::fs::remove_file(root.join("src/lib.rs")).expect("delete");
+
+        let freshness = HealthMonitor::new(None, None, snapshot_path)
+            .with_project_root(root)
+            .check_freshness()
+            .await;
+
+        assert_eq!(freshness.status, Status::Degraded);
+        assert_eq!(freshness.files_deleted, Some(1));
+    }
+
+    /// Timestamps must not decide. A rebuild or `git checkout` moves mtimes
+    /// across the whole tree without changing a byte; a probe that reported
+    /// that as "stale" would be ignored within a day.
+    #[tokio::test]
+    async fn freshness_ignores_a_touched_but_unchanged_file() {
+        let temp = TempDir::new().unwrap();
+        let (root, snapshot_path) = indexed_project(&temp);
+
+        // Rewrite the same bytes: content identical, mtime moved.
+        let path = root.join("src/lib.rs");
+        let indexed_at = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let same = std::fs::read(&path).expect("read");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, &same).expect("rewrite");
+        assert_ne!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            indexed_at,
+            "positive control: the rewrite must actually move the mtime, \
+             otherwise this test passes without exercising the hash path"
+        );
+
+        let freshness = HealthMonitor::new(None, None, snapshot_path)
+            .with_project_root(root)
+            .check_freshness()
+            .await;
+
+        assert_eq!(freshness.status, Status::Healthy, "{}", freshness.message);
+    }
+
+    #[tokio::test]
+    async fn freshness_without_a_snapshot_is_degraded_not_healthy() {
+        let temp = TempDir::new().unwrap();
+
+        let freshness = HealthMonitor::new(None, None, temp.path().join("missing.snapshot"))
+            .with_project_root(temp.path().to_path_buf())
+            .check_freshness()
+            .await;
+
+        assert_eq!(freshness.status, Status::Degraded);
+        assert_eq!(freshness.files_modified, None);
+    }
+
+    #[tokio::test]
+    async fn freshness_without_a_project_root_is_degraded_not_healthy() {
+        let temp = TempDir::new().unwrap();
+        let (_root, snapshot_path) = indexed_project(&temp);
+
+        let freshness = HealthMonitor::new(None, None, snapshot_path)
+            .check_freshness()
+            .await;
+
+        assert_eq!(freshness.status, Status::Degraded);
+        assert!(freshness.message.contains("pass 'directory'"));
+    }
+
     #[test]
     fn coverage_without_metadata_cache_is_degraded_not_healthy() {
         let coverage = CoverageHealth::unknown("no cache");
@@ -725,6 +1070,7 @@ mod tests {
             vector: ComponentHealth::healthy("Vector operational", Some(42)),
             merkle: ComponentHealth::healthy("Merkle snapshot exists (2048 bytes)", None),
             coverage: coverage_ok(),
+            freshness: freshness_ok(),
         };
 
         let json = serde_json::to_string_pretty(&status).unwrap();

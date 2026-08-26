@@ -10,7 +10,7 @@ use anyhow::Result;
 use rs_merkle::{Hasher, MerkleTree};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -203,6 +203,89 @@ impl FileSystemMerkle {
             modified,
             deleted,
         }
+    }
+
+    /// Compare this snapshot against what is on disk **right now**.
+    ///
+    /// [`detect_changes`](Self::detect_changes) answers the same question but
+    /// needs a second tree, and building one means reading and SHA-256-hashing
+    /// every file in the project. That is the indexer's job; a health probe
+    /// must not pay it. This walks the same file set (one walker, see
+    /// [`traversal`](crate::indexing) ), stats each entry, and reads only the
+    /// files whose mtime moved away from the snapshot.
+    ///
+    /// Content still decides the verdict: a file that was touched but not
+    /// edited — `git checkout`, a rebuild, `touch` — is re-hashed and reported
+    /// unchanged. So there are no false "stale" answers from timestamps alone,
+    /// which matters because this verdict is what tells an operator to spend an
+    /// indexing run.
+    ///
+    /// A file that walks fine but cannot be read is reported as modified: we
+    /// cannot prove it unchanged, and silently calling it clean is exactly the
+    /// kind of vacuous pass this whole module exists to abolish.
+    pub fn detect_disk_changes(&self, root: &Path) -> Result<ChangeSet> {
+        let (files, walk_errors) = collect_project_rust_files(root);
+
+        if walk_errors > 0 {
+            tracing::warn!(
+                "Encountered {} errors while walking {} for freshness, continuing with accessible files",
+                walk_errors,
+                root.display()
+            );
+        }
+
+        let mut added = Vec::new();
+        let mut modified = Vec::new();
+        let mut on_disk = HashSet::with_capacity(files.len());
+
+        for path in files {
+            let node = match self.file_to_node.get(&path) {
+                Some(node) => node,
+                None => {
+                    on_disk.insert(path.clone());
+                    added.push(path);
+                    continue;
+                }
+            };
+            on_disk.insert(path.clone());
+
+            // Fast path: an untouched mtime means untouched content. Writing a
+            // file always moves it, so this can only miss a change made with a
+            // deliberately restored timestamp.
+            let stamp_unchanged = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .map(|modified| modified == node.last_modified)
+                .unwrap_or(false);
+            if stamp_unchanged {
+                continue;
+            }
+
+            match std::fs::read(&path) {
+                Ok(content) if Sha256Hasher::hash(&content) == node.content_hash => {}
+                Ok(_) => modified.push(path),
+                Err(e) => {
+                    tracing::warn!("Cannot read {} for freshness: {}", path.display(), e);
+                    modified.push(path);
+                }
+            }
+        }
+
+        let mut deleted: Vec<PathBuf> = self
+            .file_to_node
+            .keys()
+            .filter(|path| !on_disk.contains(*path))
+            .cloned()
+            .collect();
+
+        added.sort();
+        modified.sort();
+        deleted.sort();
+
+        Ok(ChangeSet {
+            added,
+            modified,
+            deleted,
+        })
     }
 
     /// Save snapshot to disk
