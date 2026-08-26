@@ -173,10 +173,45 @@ pub fn cuda_capable_features_compiled() -> bool {
     rmc_engine::embeddings::CUDA_CAPABLE_FEATURES_COMPILED
 }
 
+/// GPU backends compiled into this binary, rendered for the startup line.
+///
+/// `"none"` means CPU-only for real, on every vendor — unlike the
+/// CUDA-only flag it replaces.
+pub fn gpu_backends_compiled() -> String {
+    let backends = rmc_engine::embeddings::GPU_BACKENDS_COMPILED;
+    if backends.is_empty() {
+        "none".to_string()
+    } else {
+        backends.join(",")
+    }
+}
+
+/// Может ли этот бэкенд считать в ФОНЕ, без человека у клавиатуры.
+///
+/// # Что здесь решается
+///
+/// Фоновый sync — единственная работа сервера, которую никто не запускал
+/// осознанно. Поэтому вопрос не «потянет ли машина», а «переживёт ли молчащий
+/// автомат отказ этого рантайма». Отсюда две границы, и они разные:
+///
+/// - **ONNX-рантаймы (CPU и локальный GPU) — да.** Это одна и та же лёгкая
+///   модель (bge-small, 384 измерения) на одном и том же графе, разница лишь
+///   в execution provider'е. Локальный GPU пускается в фон с тех пор, как
+///   не-финитные векторы ROCm EP закрыты гейтом в
+///   `EmbeddingGenerator::guard_finite`: до гейта автомат мог месяцами тихо
+///   писать в индекс NaN'ы, и это было бы неотличимо от «поиск стал хуже».
+/// - **Qwen3 на CUDA — нет.** Это модель от 0.6B до 8B: автоматический старт
+///   такой сессии каждые пять минут занимает VRAM у того, кто за машиной
+///   сейчас работает. Ограничение здесь про РЕСУРС, а не про корректность,
+///   поэтому гейт на NaN его не снимает; явные команды с этим профилем
+///   работают как работали.
 pub(crate) fn is_background_embedding_backend(backend: &EmbeddingBackend) -> bool {
     matches!(
         backend.runtime,
-        EmbeddingRuntime::LocalFastembedOnnxCpu | EmbeddingRuntime::OpenRouter
+        EmbeddingRuntime::LocalFastembedOnnxCpu
+            | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+            | EmbeddingRuntime::LocalFastembedOnnxDirectml
+            | EmbeddingRuntime::OpenRouter
     )
 }
 
