@@ -20,7 +20,8 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENABLED_VALUES, BACKGROUND_SYNC_ENV, EP_CENSUS_ENV, ServerRuntime,
-    automatic_embedding_profile_name, gpu_backends_compiled, parse_background_sync_env,
+    automatic_embedding_profile_name, cpu_profile_on_gpu_build_warning, gpu_backends_compiled,
+    parse_background_sync_env,
     probe_ep_census_on_startup,
 };
 use rmc_server::tools::SearchTool;
@@ -111,6 +112,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         automatic_embedding_profile_name(),
         gpu_backends_compiled(),
     );
+
+    // Собран под GPU, а считать будет на CPU — сказать вслух. Отказом это
+    // делать нельзя (фича сборки не обещает ORT с нужным EP в рантайме), но и
+    // молчать нельзя: разница ~80x, а выглядит просто как «медленно».
+    if let Some(warning) = cpu_profile_on_gpu_build_warning() {
+        tracing::warn!("{warning}");
+    }
 
     // Проба «на чём реально считается граф» — по ручке RMC_EP_CENSUS.
     //

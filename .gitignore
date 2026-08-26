@@ -16,3 +16,15 @@
 .claude
 .codex
 .test/
+
+# Собранный бинарь и его бэкапы: 300 МБ каждый, копируются в корень репо,
+# потому что именно оттуда его берут .mcp.json и ~/.codex/config.toml.
+/rust-code-mcp
+/rust-code-mcp.bak-*
+/rust-code-mcp.prev-*
+# Второй target под замер аллокаторов (фича mimalloc).
+/target-mimalloc/
+# Локальные данные и кэши: векторы, кэш модели эмбеддера, замеры.
+/vectors/
+/.cache_bench/
+.fastembed_cache/
