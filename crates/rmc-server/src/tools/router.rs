@@ -210,7 +210,7 @@ impl SearchToolRouter {
 
     /// Check system health status
     #[tool(
-        description = "Check the health status of the code search system (BM25, Vector store, Merkle tree)"
+        description = "Check the health status of the code search system (BM25, Vector store, Merkle tree, index coverage and freshness). Pass 'directory': without it neither coverage nor freshness can be judged."
     )]
     async fn health_check(
         &self,

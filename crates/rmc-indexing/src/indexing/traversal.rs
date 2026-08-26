@@ -33,7 +33,7 @@ pub(crate) fn is_skipped_dir_name(name: &str) -> bool {
 /// Unreadable entries are counted rather than fatal: a single permission
 /// error must not make the whole tree unindexable. The caller decides
 /// whether to warn — both call sites do.
-pub(crate) fn collect_project_rust_files(root: &Path) -> (Vec<PathBuf>, usize) {
+pub fn collect_project_rust_files(root: &Path) -> (Vec<PathBuf>, usize) {
     let mut rust_files = Vec::new();
     let mut walk_errors = 0;
 

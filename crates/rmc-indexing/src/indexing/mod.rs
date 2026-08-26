@@ -30,5 +30,6 @@ pub use project_paths::{
     IndexingProjectPaths,
 };
 pub use search::open_bm25_search;
+pub use traversal::collect_project_rust_files;
 pub use tantivy_adapter::TantivyAdapter;
 pub use unified::{IndexFileResult, IndexStats, UnifiedIndexer};

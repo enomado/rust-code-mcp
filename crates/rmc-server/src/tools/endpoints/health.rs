@@ -56,7 +56,7 @@ async fn open_vector_store_for_health(
 
 /// Check system health status
 #[tool(
-    description = "Check the health status of the code search system (BM25, Vector store, Merkle tree)"
+    description = "Check the health status of the code search system (BM25, Vector store, Merkle tree, index coverage and freshness). Pass 'directory': without it neither coverage nor freshness can be judged."
 )]
 pub(crate) async fn health_check(
     Parameters(HealthCheckParams {
@@ -134,6 +134,11 @@ pub(crate) async fn health_check(
     if let Some((cache_path, chunking_identity)) = coverage_inputs {
         monitor = monitor.with_metadata_cache(cache_path, chunking_identity);
     }
+    // Freshness needs the working tree itself — the snapshot alone only says
+    // what the code looked like at index time, never what it looks like now.
+    if let Some(ref dir) = directory {
+        monitor = monitor.with_project_root(std::path::PathBuf::from(dir));
+    }
 
     // Run health check
     let health = monitor.check_health().await;
@@ -194,7 +199,11 @@ pub(crate) async fn health_check(
     response.push_str("- Unhealthy: Both BM25 and Vector search are down\n");
     response.push_str("- Coverage: files the indexer will SKIP as unchanged, but for which the store holds no vectors.\n");
     response.push_str("  Non-zero `stale_skips` = index silently incomplete (a run died halfway); fix with index_codebase force_reindex: true.\n");
-    response.push_str("\nNote: Merkle snapshots are directory-specific. Use 'directory' parameter for accurate check.\n");
+    response.push_str("- Freshness: does the index still describe the code ON DISK? Compares the snapshot against the\n");
+    response.push_str("  working tree by CONTENT, so a rebuild or branch switch that only moves mtimes is not an alarm.\n");
+    response.push_str("  Non-zero counts = answers describe old code; fix with a plain index_codebase run.\n");
+    response.push_str("\nNote: Merkle snapshots are directory-specific, and both coverage and freshness need a project.\n");
+    response.push_str("Without 'directory' this reports on system-wide components only and cannot judge either one.\n");
 
     if let Some(ref dir) = directory {
         response.push_str(&format!("\nChecked project: {}\n", dir));
