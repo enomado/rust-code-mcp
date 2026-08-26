@@ -15,6 +15,8 @@ tracing-subscriber = { workspace = true }
 fs2 = "0.4"
 # Socket key (project + env + binary version).
 sha2 = { workspace = true }
+# Global allocator behind the `mimalloc` feature; see its comment below.
+mimalloc = { version = "0.1", optional = true }
 
 [dev-dependencies]
 # Examples and integration tests moved here with the executable package, so they
@@ -81,3 +83,15 @@ migraphx = ["rmc-server/migraphx"]
 # GPU on Windows (DirectML). Requires an ORT built with the DirectML EP: the DLL from NuGet
 # `Microsoft.ML.OnnxRuntime.DirectML`; no ROCm needed, it runs on DX12.
 directml = ["rmc-server/directml"]
+# mimalloc allocator instead of the system one.
+#
+# Why: glibc does not return to the kernel the arenas fragmented by the salsa database of
+# rust-analyzer; a daemon with an EMPTY runtime held 4.9 GB (measurement and numbers in
+# `rmc_server::mcp::memory`). mimalloc returns memory by itself, on decay, and supports
+# a forced collection.
+#
+# Why mimalloc and not jemalloc: `tikv-jemalloc-sys` does not build on
+# Windows, and the server is needed there too. A feature, not the default: replacing the global
+# allocator is a deployment-level decision, and its cost on your machine should be
+# seen by measurement, not inherited silently.
+mimalloc = ["dep:mimalloc", "rmc-server/mimalloc"]
