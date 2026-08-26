@@ -18,7 +18,9 @@ use tracing;
 
 use rmc_engine::embeddings::EmbeddingBackend;
 
-use super::defaults::{automatic_embedding_profile_name, is_background_embedding_backend};
+use super::defaults::{
+    automatic_embedding_backend, automatic_embedding_profile_name, is_background_embedding_backend,
+};
 use super::workspace_locks::WorkspaceLockRegistry;
 
 fn normalize_directory(dir: &Path) -> PathBuf {
@@ -264,9 +266,7 @@ impl SyncManager {
         // ~80x apart in throughput (260 vs 3 chunks/s measured on ONNX
         // migraphx vs CPU). Other profiles stay reachable through an explicit
         // index_codebase call with `embedding_profile`.
-        let automatic_backend =
-            EmbeddingBackend::from_profile_name(automatic_embedding_profile_name())
-                .map_err(|e| anyhow::anyhow!("automatic embedding profile is unusable: {e}"))?;
+        let automatic_backend = automatic_embedding_backend();
 
         let indexes = ProjectPaths::indexed_profiles(dir)
             .map_err(|msg| anyhow::anyhow!(msg))?;
