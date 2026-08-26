@@ -90,7 +90,7 @@ impl SyncManager {
     ) -> bool {
         if !is_background_embedding_backend(backend) {
             tracing::info!(
-                "Not tracking {} for background sync because profile {} uses local CUDA; explicit foreground commands remain supported",
+                "Not tracking {} for background sync because profile {} runs a local Qwen3/CUDA model; explicit foreground commands remain supported",
                 dir.display(),
                 backend.profile.name(),
             );
@@ -174,7 +174,7 @@ impl SyncManager {
     /// periodic sync cycles. An in-flight workspace sync is allowed to finish.
     pub async fn run_until_shutdown(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         tracing::info!(
-            "Starting background sync with {}s interval; automatic/default profile {}; local CUDA profiles are skipped in background sync",
+            "Starting background sync with {}s interval; automatic/default profile {}; local Qwen3/CUDA profiles are skipped in background sync",
             self.interval.as_secs(),
             automatic_embedding_profile_name(),
         );
@@ -261,7 +261,7 @@ impl SyncManager {
 
             if !is_background_embedding_backend(&backend) {
                 tracing::info!(
-                    "Skipping background sync for {} profile {} because automatic/background sync only runs CPU or remote embedding profiles; use an explicit indexing command with embedding_profile=\"{}\" for local CUDA updates",
+                    "Skipping background sync for {} profile {} because automatic/background sync runs ONNX (CPU or local GPU) and remote embedding profiles only; use an explicit indexing command with embedding_profile=\"{}\" for local Qwen3/CUDA updates",
                     dir.display(),
                     backend.profile.name(),
                     backend.profile.name(),
@@ -468,11 +468,17 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// The line runs between MODELS, not between CPU and GPU: a local Qwen3
+    /// on CUDA is kept out because an unattended session takes VRAM from
+    /// whoever is at the machine, while the ONNX GPU profile is the same
+    /// small model as the CPU one on a different execution provider.
     #[test]
-    fn background_sync_rejects_local_cuda_profiles() {
-        let gpu_backend =
+    fn background_sync_rejects_local_qwen3_cuda_profiles() {
+        let qwen3_cuda_backend =
             rmc_engine::embeddings::EmbeddingBackend::from_profile_name("local-gpu-small")
                 .unwrap();
+        let onnx_gpu_backend =
+            rmc_engine::embeddings::EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
         let cpu_backend =
             rmc_engine::embeddings::EmbeddingBackend::from_profile_name("local-cpu-small")
                 .unwrap();
@@ -480,32 +486,32 @@ mod tests {
             rmc_engine::embeddings::EmbeddingBackend::from_profile_name("openrouter-qwen3-8b")
                 .unwrap();
 
-        assert!(!is_background_embedding_backend(&gpu_backend));
+        assert!(!is_background_embedding_backend(&qwen3_cuda_backend));
+        assert!(is_background_embedding_backend(&onnx_gpu_backend));
         assert!(is_background_embedding_backend(&cpu_backend));
         assert!(is_background_embedding_backend(&remote_backend));
     }
 
     #[tokio::test]
-    async fn background_sync_tracking_skips_local_cuda_profiles() {
+    async fn background_sync_tracking_skips_local_qwen3_cuda_profiles() {
         let sync_manager = SyncManager::with_defaults(300);
         let temp_dir = tempfile::tempdir().unwrap();
-        let gpu_backend =
+        let qwen3_cuda_backend =
             rmc_engine::embeddings::EmbeddingBackend::from_profile_name("local-gpu-small")
                 .unwrap();
-        let cpu_backend =
-            rmc_engine::embeddings::EmbeddingBackend::from_profile_name("local-cpu-small")
-                .unwrap();
+        let onnx_gpu_backend =
+            rmc_engine::embeddings::EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
 
         assert!(
             !sync_manager
-                .track_directory_for_backend(temp_dir.path().to_path_buf(), &gpu_backend)
+                .track_directory_for_backend(temp_dir.path().to_path_buf(), &qwen3_cuda_backend)
                 .await
         );
         assert!(sync_manager.get_tracked_directories().await.is_empty());
 
         assert!(
             sync_manager
-                .track_directory_for_backend(temp_dir.path().to_path_buf(), &cpu_backend)
+                .track_directory_for_backend(temp_dir.path().to_path_buf(), &onnx_gpu_backend)
                 .await
         );
         assert_eq!(sync_manager.get_tracked_directories().await.len(), 1);

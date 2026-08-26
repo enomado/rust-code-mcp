@@ -173,10 +173,45 @@ pub fn cuda_capable_features_compiled() -> bool {
     rmc_engine::embeddings::CUDA_CAPABLE_FEATURES_COMPILED
 }
 
+/// GPU backends compiled into this binary, rendered for the startup line.
+///
+/// `"none"` means CPU-only for real, on every vendor — unlike the
+/// CUDA-only flag it replaces.
+pub fn gpu_backends_compiled() -> String {
+    let backends = rmc_engine::embeddings::GPU_BACKENDS_COMPILED;
+    if backends.is_empty() {
+        "none".to_string()
+    } else {
+        backends.join(",")
+    }
+}
+
+/// Whether this backend can compute in the BACKGROUND, without a human at the keyboard.
+///
+/// # What is decided here
+///
+/// Background sync is the only server work that nobody started
+/// deliberately. So the question is not 'can the machine handle it' but 'will a silent
+/// automaton survive this runtime failing'. Hence two boundaries, and they differ:
+///
+/// - **ONNX runtimes (CPU and local GPU) — yes.** It is one and the same light
+///   model (bge-small, 384 dimensions) on one and the same graph, the only difference
+///   being the execution provider. The local GPU is allowed in the background since
+///   non-finite vectors from the ROCm EP were closed off by the gate in
+///   `EmbeddingGenerator::guard_finite`: before the gate the automaton could silently
+///   write NaNs into the index for months, indistinguishable from 'search got worse'.
+/// - **Qwen3 on CUDA — no.** It is a 0.6B to 8B model: automatically starting
+///   such a session every five minutes takes VRAM away from whoever is working at the machine
+///   right now. The restriction here is about RESOURCES, not correctness,
+///   so the NaN gate does not lift it; explicit commands with this profile
+///   work as before.
 pub(crate) fn is_background_embedding_backend(backend: &EmbeddingBackend) -> bool {
     matches!(
         backend.runtime,
-        EmbeddingRuntime::LocalFastembedOnnxCpu | EmbeddingRuntime::OpenRouter
+        EmbeddingRuntime::LocalFastembedOnnxCpu
+            | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+            | EmbeddingRuntime::LocalFastembedOnnxDirectml
+            | EmbeddingRuntime::OpenRouter
     )
 }
 
