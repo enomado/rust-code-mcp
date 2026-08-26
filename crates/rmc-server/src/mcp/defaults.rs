@@ -186,6 +186,41 @@ pub fn gpu_backends_compiled() -> String {
     }
 }
 
+/// Built with a GPU backend, while the automatic profile is a CPU one.
+///
+/// Not an error: a build feature does not promise that ORT with this EP is present at runtime, and
+/// the CPU default honestly works everywhere — so [`DEFAULT_AUTOMATIC_EMBEDDING_PROFILE`]
+/// stays CPU, and GPU is enabled explicitly.
+///
+/// But staying silent is not acceptable either. The mismatch costs ~80x on THE SAME model
+/// (2.6-3.3 chunks/s vs 221-261 on migraphx), and in the logs it looks like
+/// normal operation: no refusal, no warning — just slow. This is exactly how
+/// a codex client without `env` ran background work on CPU for months until it was found via
+/// 580% CPU. Forgetting the variable in a new client is easy, so the forgetfulness
+/// must be VISIBLE at startup.
+fn cpu_profile_on_gpu_build(compiled_backends: &[&str], automatic: &EmbeddingBackend) -> bool {
+    !compiled_backends.is_empty()
+        && matches!(automatic.runtime, EmbeddingRuntime::LocalFastembedOnnxCpu)
+}
+
+/// Text of the startup warning for [`cpu_profile_on_gpu_build`], or
+/// `None` when there is nothing to warn about.
+pub fn cpu_profile_on_gpu_build_warning() -> Option<String> {
+    let automatic = EmbeddingBackend::from_profile_name(automatic_embedding_profile_name()).ok()?;
+    if !cpu_profile_on_gpu_build(rmc_engine::embeddings::GPU_BACKENDS_COMPILED, &automatic) {
+        return None;
+    }
+
+    Some(format!(
+        "This binary is built with GPU backends ({}) but the automatic/background embedding profile is {}, which runs on CPU: \
+         background indexing will be roughly two orders of magnitude slower on the same model. \
+         Set {}=local-gpu-bge for the GPU profile, or ignore this if the CPU profile is deliberate.",
+        gpu_backends_compiled(),
+        automatic.profile.name(),
+        EMBEDDING_PROFILE_ENV,
+    ))
+}
+
 /// Whether this backend can compute in the BACKGROUND, without a human at the keyboard.
 ///
 /// # What is decided here
@@ -233,6 +268,20 @@ mod tests {
         assert!(parse_background_sync_env(Some("true")));
         assert!(parse_background_sync_env(Some("YES")));
         assert!(parse_background_sync_env(Some(" on ")));
+    }
+
+    /// A GPU build quietly running the CPU profile is the failure this warns
+    /// about; a CPU build doing the same is simply correct, and warning there
+    /// would train the reader to skip the line.
+    #[test]
+    fn cpu_profile_is_only_worth_warning_about_on_a_gpu_build() {
+        let cpu = EmbeddingBackend::from_profile_name("local-cpu-small").unwrap();
+        let gpu = EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
+
+        assert!(cpu_profile_on_gpu_build(&["migraphx"], &cpu));
+        assert!(!cpu_profile_on_gpu_build(&[], &cpu));
+        assert!(!cpu_profile_on_gpu_build(&["migraphx"], &gpu));
+        assert!(!cpu_profile_on_gpu_build(&[], &gpu));
     }
 
     #[test]

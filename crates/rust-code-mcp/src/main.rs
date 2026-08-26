@@ -20,7 +20,8 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENABLED_VALUES, BACKGROUND_SYNC_ENV, EP_CENSUS_ENV, ServerRuntime,
-    automatic_embedding_profile_name, gpu_backends_compiled, parse_background_sync_env,
+    automatic_embedding_profile_name, cpu_profile_on_gpu_build_warning, gpu_backends_compiled,
+    parse_background_sync_env,
     probe_ep_census_on_startup,
 };
 use rmc_server::tools::SearchTool;
@@ -111,6 +112,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         automatic_embedding_profile_name(),
         gpu_backends_compiled(),
     );
+
+    // Built for GPU but going to compute on CPU: say so out loud. This cannot be
+    // a refusal (the build feature does not promise an ORT with the needed EP at runtime), but
+    // staying silent is not acceptable either: the difference is ~80x, and it just looks 'slow'.
+    if let Some(warning) = cpu_profile_on_gpu_build_warning() {
+        tracing::warn!("{warning}");
+    }
 
     // Probe of where the graph actually runs, behind the RMC_EP_CENSUS switch.
     //
