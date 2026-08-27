@@ -50,19 +50,28 @@ sled = "0.34"          # Embedded key-value store for metadata cache
 sha2 = "0.10"          # SHA-256 file hashing
 directories = "5"      # Cross-platform config/data directories
 
-# Phase 2: Rust code parsing with rust-analyzer syntax
-ra_ap_syntax = "0.0.330"
-
-# IDE integration for semantic analysis (find_definition, find_references)
-ra_ap_ide = "0.0.330"
-ra_ap_ide_db = "0.0.330"
-"ra_ap_load-cargo" = "0.0.330"
-ra_ap_project_model = "0.0.330"
-ra_ap_vfs = "0.0.330"
-ra_ap_paths = "0.0.330"
-ra_ap_hir = "0.0.330"
-ra_ap_hir_def = "0.0.330"
-ra_ap_base_db = "0.0.330"
+# Phase 2/RA: rust-analyzer — НЕ с crates.io, а из локального форка
+# (воркти `bur` = свежий апстрим + наши правки: cross-parent move в
+# willRenameFiles и «move item to another module», они живут в ide/ide-db/syntax).
+#
+# ⚠ Почему path, а НЕ `[patch.crates-io]`: в репозитории RA пакеты зовутся без
+# префикса (`base-db`, а не `ra_ap_base_db`) И версия у ВСЕХ — `0.0.0`. Патч
+# обязан удовлетворять требованию версии, `0.0.0` против `0.0.330` не сходится,
+# поэтому патч отваливается независимо от `package = ...`. Path-зависимость
+# требования версии не проверяет — это единственная форма, которая работает.
+#
+# Ключ слева = имя, под которым крейт виден в коде (`use ra_ap_ide::…`),
+# `package` = настоящее имя пакета в форке. Путь относительный: раскладка ~/t/.
+ra_ap_syntax = { path = "../rust-analyzer-bur/crates/syntax", package = "syntax" }
+ra_ap_ide = { path = "../rust-analyzer-bur/crates/ide", package = "ide" }
+ra_ap_ide_db = { path = "../rust-analyzer-bur/crates/ide-db", package = "ide-db" }
+"ra_ap_load-cargo" = { path = "../rust-analyzer-bur/crates/load-cargo", package = "load-cargo" }
+ra_ap_project_model = { path = "../rust-analyzer-bur/crates/project-model", package = "project-model" }
+ra_ap_vfs = { path = "../rust-analyzer-bur/crates/vfs", package = "vfs" }
+ra_ap_paths = { path = "../rust-analyzer-bur/crates/paths", package = "paths" }
+ra_ap_hir = { path = "../rust-analyzer-bur/crates/hir", package = "hir" }
+ra_ap_hir_def = { path = "../rust-analyzer-bur/crates/hir-def", package = "hir-def" }
+ra_ap_base_db = { path = "../rust-analyzer-bur/crates/base-db", package = "base-db" }
 
 # Persisted hypergraph store
 heed = "0.22.1"
