@@ -842,6 +842,169 @@ pub fn first() {
         );
     }
 
+    /// Where does a loaded rust-analyzer database actually keep its bytes?
+    ///
+    /// The RSS cycle test above answers "does it leak"; this one answers "what
+    /// is it holding". It asks salsa itself — `Database::memory_usage()`, built
+    /// because `base-db` enables the `salsa_unstable` feature — for a per
+    /// ingredient breakdown, and prints it sorted by bytes.
+    ///
+    /// # 🚨 What this measurement can and cannot see
+    ///
+    /// Salsa reports three numbers per ingredient: the number of instances, the
+    /// *stack* size of their fields, and its own metadata. Heap behind those
+    /// fields is only counted when the query declares `heap_size = <fn>` — and
+    /// **rust-analyzer declares it nowhere** (zero occurrences across all its
+    /// crates as of the 2026-08-26 upstream). Every heavy memo in rust-analyzer
+    /// is a `Vec`/`Arc`/`Box` behind a small struct, so the heap is exactly
+    /// where the gigabytes are and exactly what stays invisible here.
+    ///
+    /// So read the output as *counts and shapes*, not as a memory budget: an
+    /// ingredient with millions of instances is the suspect even when its
+    /// stack column is small. Turning a suspect into a number takes one
+    /// `heap_size = <fn>` attribute on that query in the rust-analyzer fork.
+    /// The printed "accounted for" percentage is the honest measure of how much
+    /// of the process this table explains; when someone adds `heap_size`
+    /// upstream (or we do), that percentage is what should climb.
+    ///
+    /// # Running it
+    ///
+    /// ```text
+    /// RMC_SALSA_MEMORY_PROJECT=/home/sc/t/bur/rust_app \
+    ///   cargo test -p rmc-server --features migraphx -- --ignored --nocapture salsa_ingredient
+    /// ```
+    ///
+    /// `RMC_SALSA_MEMORY_TOP` (default 25) caps how many rows are printed.
+    #[test]
+    #[ignore = "needs a real workspace in RMC_SALSA_MEMORY_PROJECT and minutes to run"]
+    fn salsa_ingredient_memory_breakdown_names_the_suspects() {
+        use ra_ap_ide_db::base_db::salsa;
+
+        let Ok(project) = std::env::var("RMC_SALSA_MEMORY_PROJECT") else {
+            panic!(
+                "set RMC_SALSA_MEMORY_PROJECT to a cargo workspace root; without one this test \
+                 would measure nothing and pass, which is worse than not running"
+            );
+        };
+        let project = PathBuf::from(project);
+        let top = env_usize("RMC_SALSA_MEMORY_TOP", 25);
+
+        let mut service = SemanticService::new();
+        // A real query, not a bare load: an empty database has nothing memoized
+        // and every row would read as zero.
+        let found = service
+            .symbol_search(&project, "main", 16)
+            .expect("symbol search on the probe workspace");
+        let rss_kib = crate::mcp::memory::rss_kib().expect("RSS readable on linux");
+
+        let canonical = project
+            .canonicalize()
+            .expect("canonicalize the probe project");
+        let host = &service
+            .projects
+            .get(&canonical)
+            .expect("the query above must have cached a context for this path")
+            .host;
+        // `memory_usage` is implemented on `dyn Database`, not on the trait, so
+        // the unsize coercion here is required rather than stylistic.
+        let db: &dyn salsa::Database = host.raw_database();
+        let info = db.memory_usage();
+
+        /// One row of the breakdown, already flattened across salsa's two
+        /// families (input/interned structs and memoized query results).
+        struct Row {
+            family: &'static str,
+            name: &'static str,
+            count: usize,
+            stack: usize,
+            metadata: usize,
+            heap: Option<usize>,
+            page: Option<String>,
+        }
+
+        let mut rows: Vec<Row> = info
+            .structs
+            .iter()
+            .map(|ingredient| Row {
+                family: "struct",
+                name: ingredient.debug_name(),
+                count: ingredient.count(),
+                stack: ingredient.size_of_fields(),
+                metadata: ingredient.size_of_metadata(),
+                heap: ingredient.heap_size_of_fields(),
+                page: ingredient.page_info().map(|page| format!("{page:?}")),
+            })
+            .chain(info.queries.values().map(|ingredient| Row {
+                family: "query",
+                name: ingredient.debug_name(),
+                count: ingredient.count(),
+                stack: ingredient.size_of_fields(),
+                metadata: ingredient.size_of_metadata(),
+                heap: ingredient.heap_size_of_fields(),
+                page: None,
+            }))
+            .collect();
+
+        let bytes_of = |row: &Row| row.stack + row.metadata + row.heap.unwrap_or(0);
+        rows.sort_by(|a, b| bytes_of(b).cmp(&bytes_of(a)).then(b.count.cmp(&a.count)));
+
+        let accounted: usize = rows.iter().map(bytes_of).sum();
+        let with_heap = rows.iter().filter(|row| row.heap.is_some()).count();
+        let instances: usize = rows.iter().map(|row| row.count).sum();
+
+        println!(
+            "{} symbol(s) found; RSS {} MB; {} ingredients, {} instances total",
+            found.len(),
+            rss_kib / 1024,
+            rows.len(),
+            instances,
+        );
+        println!(
+            "accounted for {} MB = {:.1}% of RSS; {} of {} ingredients report heap size",
+            accounted / (1024 * 1024),
+            100.0 * accounted as f64 / (rss_kib as f64 * 1024.0),
+            with_heap,
+            rows.len(),
+        );
+        println!(
+            "{:<8} {:<52} {:>12} {:>12} {:>12} {:>12}",
+            "family", "ingredient", "count", "stack KiB", "meta KiB", "heap KiB"
+        );
+        for row in rows.iter().take(top) {
+            println!(
+                "{:<8} {:<52} {:>12} {:>12} {:>12} {:>12}{}",
+                row.family,
+                row.name,
+                row.count,
+                row.stack / 1024,
+                row.metadata / 1024,
+                row.heap
+                    .map_or("-".to_string(), |heap| (heap / 1024).to_string()),
+                row.page
+                    .as_deref()
+                    .map_or(String::new(), |page| format!("  {page}")),
+            );
+        }
+
+        assert!(
+            !rows.is_empty(),
+            "a database that answered a symbol search must have memoized something; an empty \
+             breakdown means the measurement, not the database, is broken"
+        );
+        // The gap between this table and RSS is the finding, not a defect: it is
+        // the heap that salsa cannot see without `heap_size`. If the table ever
+        // covers the process, this assert fires and the conclusion above — "read
+        // counts, not bytes" — has to be revisited.
+        assert!(
+            accounted < rss_kib as usize * 1024,
+            "the breakdown accounts for {} MB of a {} MB process — salsa is not supposed to be \
+             able to see that much without `heap_size` on the queries; re-check the arithmetic \
+             before trusting it",
+            accounted / (1024 * 1024),
+            rss_kib / 1024,
+        );
+    }
+
     fn env_usize(name: &str, default: usize) -> usize {
         std::env::var(name)
             .ok()
