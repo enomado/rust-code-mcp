@@ -63,6 +63,12 @@ pub use token_lengths::{EmbeddingTextLen, EmbeddingTokenCounter};
 
 pub const CUDA_CAPABLE_FEATURES_COMPILED: bool = cfg!(feature = "embeddings-cuda");
 
+/// Вкомпилирован ли GPU-путь через MIGraphX EP (линуксовый профиль `local-gpu-bge`).
+pub const MIGRAPHX_FEATURES_COMPILED: bool = cfg!(feature = "embeddings-migraphx");
+
+/// Вкомпилирован ли GPU-путь через DirectML EP (виндовый профиль `local-dml-bge`).
+pub const DIRECTML_FEATURES_COMPILED: bool = cfg!(feature = "embeddings-directml");
+
 use crate::chunker::{ChunkId, CodeChunk};
 use std::sync::Arc;
 
