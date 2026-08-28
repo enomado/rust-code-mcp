@@ -46,10 +46,14 @@ line = p.stdout.readline()
 print(f"elapsed: {time.time()-t0:.1f}s")
 try:
     resp = json.loads(line)
+    # 🚨 ЦЕЛИКОМ, без среза. Раньше тут стоял `[:2000]`, и ответ обрезался
+    # МОЛЧА, посреди строки: шапка говорила «Found 35 reference(s)», а списком
+    # приезжало 17 — то есть пробник врал ровно тем же способом, который им
+    # же и ловят. Нужно короче — пайпом в head, это видно в команде.
     for c in resp.get("result", {}).get("content", []):
-        print(c.get("text", "")[:2000])
+        print(c.get("text", ""))
     if "error" in resp:
         print("ERROR:", resp["error"])
 except Exception:
-    print("raw:", line[:2000])
+    print("raw:", line)
 p.terminate()
