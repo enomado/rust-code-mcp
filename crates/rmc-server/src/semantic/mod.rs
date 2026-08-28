@@ -1417,21 +1417,56 @@ pub fn first() {
              {heap_before:?} -> {heap_after:?} (cap {DECLARED_CAP}); RSS {} MB",
             crate::mcp::memory::rss_kib().unwrap_or(0) / 1024,
         );
+
+        // What the collection actually freed, per query. The table above says
+        // where the memory *is*; this says how much of it a collection can take
+        // back, which is the other half of arguing about a capacity — and it is
+        // not derivable from the first, because only the LRU-capped queries
+        // shed anything at all.
+        let mut freed: Vec<(&str, usize)> = rows
+            .iter()
+            .filter_map(|row| {
+                let before = row.heap?;
+                let after = row_of(&after_rows, row.name).map(|(_, heap)| heap)??;
+                before.checked_sub(after).filter(|freed| *freed > 0).map(|freed| (row.name, freed))
+            })
+            .collect();
+        freed.sort_by_key(|&(_, freed)| std::cmp::Reverse(freed));
+        println!("freed by the collection:");
+        for (query, freed) in &freed {
+            println!("  {:<50} {:>9} KiB", query, freed / 1024);
+        }
+        if freed.is_empty() {
+            println!("  (nothing — every instrumented ingredient kept every byte)");
+        }
         // Why the *slot count* cannot be the oracle: evicting a memo sets its
         // value to `None` and keeps the slot (`function/memo.rs`, `map_memo`), so
         // the count is unchanged whether eviction ran or not. What does move is
-        // the reported heap: a memo with no value reports `Some(0)`, a live one
-        // reports `None` while rust-analyzer declares no `heap_size` anywhere. So
-        // `None -> Some(0)` on this ingredient means "at least one value was
-        // actually dropped", and it is the only allocator-independent signal
+        // the reported heap, and it is the only allocator-independent signal
         // available — RSS cannot serve, because glibc need not return the pages.
-        assert_eq!(
-            heap_after,
-            Some(0),
+        //
+        // The shape of that signal depends on the fork declaring `heap_size` on
+        // this query. Before it did, a live memo reported `None` and an evicted
+        // one `Some(0)`, so the whole test could say was "at least one value went
+        // away". With the option in place the ingredient reports real bytes, and
+        // the same question is answered by a strict drop — with the size of the
+        // drop printed above, which the old encoding could never show.
+        let describe_missing_option = || {
+            format!(
+                "`{CAPPED_QUERY}` reports no heap size, so this test cannot tell an evicted memo \
+                 from a live one. The `heap_size` option on that query is gone — most likely an \
+                 upstream rebase dropped it from the rust-analyzer fork (see \
+                 `hir-def/src/expr_store/heap_size.rs`)"
+            )
+        };
+        let heap_before = heap_before.unwrap_or_else(|| panic!("{}", describe_missing_option()));
+        let heap_after = heap_after.unwrap_or_else(|| panic!("{}", describe_missing_option()));
+        assert!(
+            heap_after < heap_before,
             "`{CAPPED_QUERY}` holds {after} memo slots against a capacity of {DECLARED_CAP}, and \
-             after a garbage collection not one of them has had its value dropped (heap still \
-             {heap_before:?}): the capacity is declared but nothing enforces it, which is exactly \
-             the defect this whole chain exists to fix"
+             after a garbage collection it still owns every byte it did before ({heap_before}): \
+             the capacity is declared but nothing enforces it, which is exactly the defect this \
+             whole chain exists to fix"
         );
     }
 
