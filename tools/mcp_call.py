@@ -46,10 +46,14 @@ line = p.stdout.readline()
 print(f"elapsed: {time.time()-t0:.1f}s")
 try:
     resp = json.loads(line)
+    # 🚨 IN FULL, no slicing. There used to be `[:2000]` here, and the response was truncated
+    # SILENTLY, mid-line: the header said 'Found 35 reference(s)', while the list
+    # delivered 17, i.e. the probe lied in exactly the way it is meant
+    # to catch. Need it shorter? Pipe into head, so it is visible in the command.
     for c in resp.get("result", {}).get("content", []):
-        print(c.get("text", "")[:2000])
+        print(c.get("text", ""))
     if "error" in resp:
         print("ERROR:", resp["error"])
 except Exception:
-    print("raw:", line[:2000])
+    print("raw:", line)
 p.terminate()
