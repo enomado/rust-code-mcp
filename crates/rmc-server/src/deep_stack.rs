@@ -18,7 +18,11 @@
 //! caller can guard against. The work therefore carries its own stack instead
 //! of depending on whoever spawned it.
 
+use std::sync::{Arc, Mutex};
+
 use rmcp::ErrorData as McpError;
+
+use crate::semantic::SemanticService;
 
 /// Stack for the analysis thread.
 ///
@@ -60,6 +64,38 @@ where
         .map_err(|_| McpError::internal_error(format!("{what}: analysis thread panicked"), None))
 }
 
+/// Run work against the shared [`SemanticService`] on the analysis thread.
+///
+/// Every semantic call loads or queries a rust-analyzer workspace, so every one
+/// of them belongs on [`run_analysis`]'s stack for the reason in this module's
+/// header. This is the single door to the service from an async context so that
+/// the choice is made once rather than at each call site: taking the mutex
+/// inline in an `async fn` gets the 2 MiB worker stack *and* blocks the runtime
+/// for the duration of the analysis, and both are easy to reintroduce by
+/// accident when the lock is one `.lock()` away.
+///
+/// The closure receives the locked service and reports its own failures, so a
+/// caller keeps its own error wording rather than inheriting one from here. A
+/// poisoned mutex is the only failure this adds.
+pub(crate) async fn with_semantic<T, F>(
+    semantic: &Arc<Mutex<SemanticService>>,
+    what: &'static str,
+    work: F,
+) -> Result<T, McpError>
+where
+    F: FnOnce(&mut SemanticService) -> Result<T, McpError> + Send + 'static,
+    T: Send + 'static,
+{
+    let semantic = Arc::clone(semantic);
+    run_analysis(what, move || {
+        let mut service = semantic.lock().map_err(|error| {
+            McpError::internal_error(format!("Failed to acquire lock: {}", error), None)
+        })?;
+        work(&mut service)
+    })
+    .await?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +132,69 @@ mod tests {
             .await
             .expect("deep recursion completes");
         assert!(total > 0, "the recursion must actually have run");
+    }
+
+    fn test_semantic() -> Arc<Mutex<SemanticService>> {
+        Arc::new(Mutex::new(SemanticService::new()))
+    }
+
+    #[tokio::test]
+    async fn semantic_work_leaves_the_runtime_worker() {
+        // The regression this guards is a call site taking the mutex inline in
+        // an `async fn`: that runs rust-analyzer on the worker's 2 MiB stack,
+        // which is what aborted the whole server. The thread name is how that
+        // choice becomes observable from the closure.
+        let semantic = test_semantic();
+        let thread_name = with_semantic(&semantic, "test", |_| {
+            Ok(std::thread::current().name().map(str::to_string))
+        })
+        .await
+        .expect("semantic work runs");
+        assert_eq!(thread_name.as_deref(), Some("rmc-analysis"));
+    }
+
+    #[tokio::test]
+    async fn semantic_work_gets_the_deep_stack_too() {
+        // Positive control end to end: the same frame chain that a worker
+        // thread cannot hold must complete through the semantic door.
+        fn burn(depth: usize, sink: &mut u64) -> u64 {
+            let block = [0xCDu8; 8192];
+            *sink = sink.wrapping_add(block[depth % block.len()] as u64);
+            if depth == 0 {
+                *sink
+            } else {
+                burn(depth - 1, sink)
+            }
+        }
+
+        let semantic = test_semantic();
+        let total = with_semantic(&semantic, "test", |_| {
+            let mut sink = 0;
+            Ok(burn(1000, &mut sink))
+        })
+        .await
+        .expect("deep recursion completes");
+        assert!(total > 0, "the recursion must actually have run");
+    }
+
+    #[tokio::test]
+    async fn a_poisoned_semantic_mutex_is_reported_rather_than_panicking() {
+        let semantic = test_semantic();
+        let poisoner = Arc::clone(&semantic);
+        // Poison the mutex the way a panicking analysis would.
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("fresh mutex");
+            panic!("poison the semantic mutex");
+        })
+        .join();
+
+        let outcome: Result<(), McpError> = with_semantic(&semantic, "test", |_| Ok(())).await;
+        let error = outcome.expect_err("a poisoned mutex must surface as an error");
+        assert!(
+            error.message.contains("Failed to acquire lock"),
+            "unexpected error message: {}",
+            error.message
+        );
     }
 
     #[tokio::test]

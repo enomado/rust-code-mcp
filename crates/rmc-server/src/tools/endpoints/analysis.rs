@@ -91,6 +91,7 @@ use tracing;
 
 use rmc_engine::parser::RustParser;
 
+use crate::deep_stack::with_semantic;
 use crate::semantic::SemanticService;
 
 fn validate_cargo_project_directory(project_path: &Path) -> Result<(), McpError> {
@@ -110,7 +111,10 @@ fn validate_cargo_project_directory(project_path: &Path) -> Result<(), McpError>
 
     if !project_path.join("Cargo.toml").is_file() {
         return Err(McpError::invalid_params(
-            format!("directory is not a Cargo project: {}", project_path.display()),
+            format!(
+                "directory is not a Cargo project: {}",
+                project_path.display()
+            ),
             None,
         ));
     }
@@ -128,13 +132,20 @@ pub(crate) async fn find_definition_with_semantic(
     let project_path = Path::new(directory);
     validate_cargo_project_directory(project_path)?;
 
-    tracing::debug!("Searching for definition of '{}' (exact={})", symbol_name, exact);
+    tracing::debug!(
+        "Searching for definition of '{}' (exact={})",
+        symbol_name,
+        exact
+    );
 
-    let locations = semantic
-        .lock()
-        .map_err(|e| McpError::internal_error(format!("Failed to acquire lock: {}", e), None))?
-        .symbol_search_with_exact(project_path, symbol_name, 50, exact)
-        .map_err(|e| McpError::internal_error(format!("Symbol search failed: {}", e), None))?;
+    let project = project_path.to_path_buf();
+    let symbol = symbol_name.to_string();
+    let locations = with_semantic(semantic, "find_definition", move |service| {
+        service
+            .symbol_search_with_exact(&project, &symbol, 50, exact)
+            .map_err(|e| McpError::internal_error(format!("Symbol search failed: {}", e), None))
+    })
+    .await?;
 
     if locations.is_empty() {
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -167,13 +178,20 @@ pub(crate) async fn find_references_with_semantic(
     let project_path = Path::new(directory);
     validate_cargo_project_directory(project_path)?;
 
-    tracing::debug!("Searching for references to '{}' (exact={})", symbol_name, exact);
+    tracing::debug!(
+        "Searching for references to '{}' (exact={})",
+        symbol_name,
+        exact
+    );
 
-    let locations = semantic
-        .lock()
-        .map_err(|e| McpError::internal_error(format!("Failed to acquire lock: {}", e), None))?
-        .find_references_by_name_with_exact(project_path, symbol_name, exact)
-        .map_err(|e| McpError::internal_error(format!("Find references failed: {}", e), None))?;
+    let project = project_path.to_path_buf();
+    let symbol = symbol_name.to_string();
+    let locations = with_semantic(semantic, "find_references", move |service| {
+        service
+            .find_references_by_name_with_exact(&project, &symbol, exact)
+            .map_err(|e| McpError::internal_error(format!("Find references failed: {}", e), None))
+    })
+    .await?;
 
     if locations.is_empty() {
         Ok(CallToolResult::success(vec![Content::text(format!(
@@ -211,7 +229,9 @@ pub(crate) async fn rename_symbol_with_semantic(
 
     tracing::debug!("Previewing rename '{}' → '{}'", symbol_name, new_name);
 
-    let preview = match (file_path, line, column) {
+    // Argument validation stays on the caller's thread: it is the cheap half,
+    // and rejecting a malformed request must not cost an analysis thread.
+    let position = match (file_path, line, column) {
         (Some(file_path), Some(line), Some(column)) => {
             if line == 0 || column == 0 {
                 return Err(McpError::invalid_params(
@@ -227,24 +247,9 @@ pub(crate) async fn rename_symbol_with_semantic(
                 project_path.join(input_path)
             };
 
-            semantic
-                .lock()
-                .map_err(|e| McpError::internal_error(format!("Failed to acquire lock: {}", e), None))?
-                .rename_by_position(
-                    project_path,
-                    &resolved_file_path,
-                    line,
-                    column,
-                    symbol_name,
-                    new_name,
-                )
-                .map_err(rename_mcp_error)?
+            Some((resolved_file_path, line, column))
         }
-        (None, None, None) => semantic
-            .lock()
-            .map_err(|e| McpError::internal_error(format!("Failed to acquire lock: {}", e), None))?
-            .rename_by_name(project_path, symbol_name, new_name)
-            .map_err(rename_mcp_error)?,
+        (None, None, None) => None,
         _ => {
             return Err(McpError::invalid_params(
                 "file_path, line, and column must be provided together for position-based rename",
@@ -252,6 +257,20 @@ pub(crate) async fn rename_symbol_with_semantic(
             ));
         }
     };
+
+    let project = project_path.to_path_buf();
+    let symbol = symbol_name.to_string();
+    let new = new_name.to_string();
+    let preview = with_semantic(semantic, "rename_symbol", move |service| {
+        match position {
+            Some((file, line, column)) => {
+                service.rename_by_position(&project, &file, line, column, &symbol, &new)
+            }
+            None => service.rename_by_name(&project, &symbol, &new),
+        }
+        .map_err(rename_mcp_error)
+    })
+    .await?;
 
     if preview.edits.is_empty() && preview.file_moves.is_empty() {
         return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -273,7 +292,10 @@ pub(crate) async fn rename_symbol_with_semantic(
     }
 
     if !preview.file_moves.is_empty() {
-        out.push_str(&format!("\nFile system changes ({}):\n", preview.file_moves.len()));
+        out.push_str(&format!(
+            "\nFile system changes ({}):\n",
+            preview.file_moves.len()
+        ));
         for mv in &preview.file_moves {
             out.push_str(&format!("  {}\n", mv));
         }
@@ -642,15 +664,12 @@ mod tests {
 name = "rename_param_test"
 version = "0.1.0"
 edition = "2021"
-"#.trim_start(),
+"#
+            .trim_start(),
         )
         .expect("write manifest");
         fs::create_dir_all(dir.path().join("src")).expect("create src dir");
-        fs::write(
-            dir.path().join("src/lib.rs"),
-            "pub trait Engine {}\n",
-        )
-        .expect("write lib");
+        fs::write(dir.path().join("src/lib.rs"), "pub trait Engine {}\n").expect("write lib");
         dir
     }
 
