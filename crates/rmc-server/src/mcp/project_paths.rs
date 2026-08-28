@@ -72,25 +72,17 @@ pub(crate) fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".rust-code-mcp"))
 }
 
-/// Name of the embedding profile selected by default for THIS process.
+/// Embedding backend for a tool call.
 ///
 /// Priority: explicit tool parameter > `RMC_EMBEDDING_PROFILE` > built-in
-/// `local-cpu-small`. The variable is needed because the index, BM25 and the collection name
-/// are keyed by the embedder identity: a server started on a non-default profile
-/// would, without it, answer every call WITHOUT the parameter from SOMEONE ELSE'S (empty) index,
-/// and that would look not like a refusal but like nothing being found.
-pub(crate) const EMBEDDING_PROFILE_ENV: &str = "RMC_EMBEDDING_PROFILE";
-
+/// `local-cpu-small`. The environment switch is read NOT by this resolver but by
+/// [`automatic_embedding_backend`], once per process: the default profile is
+/// a property of how the server was started, not of the request.
 pub(crate) fn resolve_embedding_backend_for_mcp(
     embedding_profile: Option<&str>,
     directory: &Path,
 ) -> Result<EmbeddingBackend, McpError> {
-    let from_env = std::env::var(EMBEDDING_PROFILE_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let requested = embedding_profile.or(from_env.as_deref());
-
-    if let Some(profile) = requested {
+    if let Some(profile) = embedding_profile {
         let profile = resolve_profile(profile, directory)
             .map_err(|msg| McpError::invalid_params(msg, None))?;
         return Ok(EmbeddingBackend::from_profile(profile));
