@@ -1,6 +1,10 @@
 //! Semantic code analysis using rust-analyzer
 
 mod loader;
+/// Pricing an LRU capacity at both ends — bytes handed back against the time the
+/// next query pays for them. Measurement only, so it ships with the tests.
+#[cfg(test)]
+mod lru_sweep;
 mod position;
 mod rename;
 
@@ -515,12 +519,13 @@ impl SemanticService {
         evicted
     }
 
-    /// Get or load project (lazy loading)
-    fn get_or_load(&mut self, project_path: &Path) -> Result<()> {
-        self.get_or_load_kind(project_path, LoadKind::Fast)
-    }
-
     /// Get or load project with full workspace dependency edges.
+    ///
+    /// The only entry point left: `find_definition` was the last served path on
+    /// a `Fast` context and moved off it, because "which context am I on"
+    /// decided whether it could see `#[cfg(test)]` and that depended on call
+    /// order. `LoadKind::Fast` stays for the upgrade machinery it is the source
+    /// half of — nothing requests it any more.
     fn get_or_load_full(&mut self, project_path: &Path) -> Result<()> {
         self.get_or_load_kind(project_path, LoadKind::Full)
     }
@@ -674,15 +679,24 @@ impl SemanticService {
 
     /// Search for symbols by name with optional full-name filtering.
     ///
-    /// # Why a `Fast` context still answers
+    /// # Why this needs the same `Full` context references do
     ///
-    /// Unlike `find_references_by_name_with_exact`, this one does not need the
-    /// dependency edges a `Fast` load throws away: a declaration lives in
-    /// exactly one crate, and every workspace member's own sources are loaded
-    /// either way. What `Fast` does cost here is the same as everywhere else —
-    /// `cfg(test)` is off, so a type declared inside a `#[cfg(test)]` module is
-    /// not in the module tree and cannot be found. That is the pre-existing
-    /// behaviour for every kind of symbol, not something the field path adds.
+    /// A declaration lives in exactly one crate, so this one never needed the
+    /// dependency edges — and it ran on `Fast` for that reason. What that
+    /// overlooked is that `Fast` also has `set_test` off, which takes every
+    /// `#[cfg(test)]` module out of the tree: "where is this test declared"
+    /// answered *no definition found* for a test that exists.
+    ///
+    /// And it did so **only sometimes**. `get_or_load` does not downgrade a
+    /// context already loaded as `Full`, so after any `find_references` call in
+    /// the same session this one silently got the full tree and started finding
+    /// what it had just denied. Measured 2026-08-28 on a 4000-file workspace:
+    /// the same query, the same session, answered "no definition found" and then
+    /// the file and line. An answer that depends on which questions came before
+    /// it is worse than a blind spot — a blind spot at least reproduces.
+    ///
+    /// The load is shared, not doubled: `find_references` pays for the same
+    /// upgrade, and whichever runs first pays it once.
     pub(crate) fn symbol_search_with_exact(
         &mut self,
         project_path: &Path,
@@ -690,7 +704,7 @@ impl SemanticService {
         limit: usize,
         exact: bool,
     ) -> Result<Vec<Location>> {
-        self.get_or_load(project_path)?;
+        self.get_or_load_full(project_path)?;
 
         let canonical = project_path.canonicalize()?;
         let ctx = self.projects.get(&canonical)
@@ -704,6 +718,30 @@ impl SemanticService {
             limit,
             exact,
         )
+    }
+
+    /// The symbol index's own answer, with the source sweep not run.
+    ///
+    /// Only the survey of "which kinds does the index carry" uses this; the
+    /// served path always keeps the sweep behind it. The context is the same
+    /// `Full` one the served path loads, so the survey measures the index the
+    /// tool actually queries.
+    #[cfg(test)]
+    pub(crate) fn index_only_search(
+        &mut self,
+        project_path: &Path,
+        symbol_name: &str,
+        limit: usize,
+    ) -> Result<Vec<Location>> {
+        self.get_or_load_full(project_path)?;
+
+        let canonical = project_path.canonicalize()?;
+        let ctx = self
+            .projects
+            .get(&canonical)
+            .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
+
+        position::index_only_search(&ctx.host, &ctx.vfs, symbol_name, limit)
     }
 
     /// Find all references to symbols matching a name
@@ -822,35 +860,16 @@ impl SemanticService {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-
-    /// Keeps the process-global salsa sweep away from tests holding an analysis.
-    ///
-    /// `collect_garbage` frees memory belonging to *every* context in the
-    /// process, not only the one under test — see the `unsafe` sweep it calls.
-    /// A peer test mid-query when that lands does not fail an assertion, it
-    /// takes a SIGSEGV and kills the whole test binary, so the failure surfaces
-    /// as "the suite crashed" with no clue which pair collided.
-    ///
-    /// Loading tests hold the read side, so they still run alongside each
-    /// other; the sweep takes the write side and runs alone. Making the whole
-    /// group serial would cost minutes for a hazard that is only between the
-    /// sweep and everyone else.
-    static SWEEP: RwLock<()> = RwLock::new(());
 
     /// "I am holding a loaded analysis — do not sweep under me."
     ///
-    /// Poisoning is stepped over deliberately: a panic in some other test says
-    /// nothing about whether this one may hold an analysis, and turning it into
-    /// a second failure would only bury the first.
-    fn holding_an_analysis() -> RwLockReadGuard<'static, ()> {
-        SWEEP.read().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    /// This is the *production* gate, not a lock of its own: see
+    /// [`crate::deep_stack::test_holding_an_analysis`] for why a second one
+    /// beside it was the bug rather than the protection.
+    use crate::deep_stack::test_holding_an_analysis as holding_an_analysis;
 
     /// "I am the sweep."
-    fn sweeping_alone() -> RwLockWriteGuard<'static, ()> {
-        SWEEP.write().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
+    use crate::deep_stack::test_sweeping_alone as sweeping_alone;
 
     #[test]
     fn rename_preview_includes_workspace_reverse_dependencies() {
@@ -1354,6 +1373,249 @@ pub fn a_local_of_the_same_name() -> u32 {
             found[0].file_path.ends_with("oracle_lib/src/lib.rs"),
             "the declaring crate's lib must be the answer, got {found:?}"
         );
+    }
+
+    /// One crate declaring one of every kind a caller might reasonably type
+    /// into `find_definition`, each under a name used nowhere else.
+    ///
+    /// Every surveyed candidate lives at module scope and outside
+    /// `#[cfg(test)]`, so that none of them can come back absent for the
+    /// cfg-gating reason instead of the one under study. The one item that *is*
+    /// behind `#[cfg(test)]` is there to test exactly that gating, and the
+    /// survey does not ask about it.
+    fn kind_survey_workspace(root: &Path) {
+        write_file(
+            &root.join("Cargo.toml"),
+            r#"
+[package]
+name = "kind_survey"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+        );
+        write_file(
+            &root.join("src/lib.rs"),
+            r#"
+pub const KIND_CONST: u32 = 1;
+pub static KIND_STATIC: u32 = 2;
+pub type KindAlias = u32;
+
+pub struct KindStruct {
+    pub kind_field: u32,
+}
+
+pub struct KindTuple(pub u32);
+
+pub union KindUnion {
+    pub kind_union_field: u32,
+}
+
+pub enum KindEnum {
+    KindVariant,
+    KindStructVariant { kind_variant_field: u32 },
+}
+
+pub trait KindTrait {
+    const KIND_TRAIT_CONST: u32;
+    type KindAssocType;
+    fn kind_trait_method(&self) -> u32;
+}
+
+impl KindStruct {
+    pub const KIND_ASSOC_CONST: u32 = 3;
+
+    pub fn kind_impl_method(&self) -> u32 {
+        self.kind_field
+    }
+}
+
+impl KindTrait for KindStruct {
+    const KIND_TRAIT_CONST: u32 = 4;
+    type KindAssocType = u32;
+
+    fn kind_trait_method(&self) -> u32 {
+        self.kind_field
+    }
+}
+
+pub mod kind_module {
+    pub fn kind_module_fn() {}
+}
+
+macro_rules! kind_macro {
+    () => {
+        pub fn kind_generated() {}
+    };
+}
+
+kind_macro!();
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn kind_test_fn() {}
+}
+"#,
+        );
+    }
+
+    /// What the symbol index carries and what it does not — measured, one row
+    /// per kind, rather than inferred from the two kinds that were looked at.
+    ///
+    /// This is the mutant "turn the sweep off and ask for the definition" made
+    /// permanent: `index_only_search` is the served path with the rescue removed,
+    /// so a `false` here is a kind that answers *no definition found* whenever
+    /// the sweep does not cover it. The sweep's accept list is `Field | Variant`,
+    /// so every `false` row that is neither is a live blind spot, not a covered
+    /// one.
+    ///
+    /// The guess this replaces held for exactly one of its two halves: fields are
+    /// absent, enum variants are not.
+    #[test]
+    fn which_kinds_the_symbol_index_carries() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        kind_survey_workspace(root);
+
+        // Sorted by name so the table reads as a table; the value is "the index
+        // answered with at least one exact match".
+        let candidates = [
+            ("KIND_ASSOC_CONST", "associated const, inherent impl"),
+            ("KIND_CONST", "module-scope const"),
+            ("KIND_STATIC", "module-scope static"),
+            ("KIND_TRAIT_CONST", "associated const, trait"),
+            ("KindAlias", "type alias"),
+            ("KindAssocType", "associated type"),
+            ("KindEnum", "enum"),
+            ("KindStruct", "struct"),
+            ("KindStructVariant", "struct-shaped enum variant"),
+            ("KindTrait", "trait"),
+            ("KindTuple", "tuple struct"),
+            ("KindUnion", "union"),
+            ("KindVariant", "unit enum variant"),
+            ("kind_field", "struct field"),
+            ("kind_generated", "fn produced by macro expansion"),
+            ("kind_impl_method", "inherent method"),
+            ("kind_macro", "macro_rules! macro"),
+            ("kind_module", "module"),
+            ("kind_module_fn", "fn inside a submodule"),
+            ("kind_trait_method", "trait method declaration"),
+            ("kind_union_field", "union field"),
+            ("kind_variant_field", "field of a struct-shaped variant"),
+        ];
+
+        let mut service = SemanticService::new();
+        let measured: Vec<(&str, bool)> = candidates
+            .iter()
+            .map(|(name, _what)| {
+                let found = service
+                    .index_only_search(root, name, 8)
+                    .expect("query the index");
+                (*name, !found.is_empty())
+            })
+            .collect();
+
+        let expected: Vec<(&str, bool)> = vec![
+            ("KIND_ASSOC_CONST", true),
+            ("KIND_CONST", true),
+            ("KIND_STATIC", true),
+            ("KIND_TRAIT_CONST", true),
+            ("KindAlias", true),
+            ("KindAssocType", true),
+            ("KindEnum", true),
+            ("KindStruct", true),
+            ("KindStructVariant", true),
+            ("KindTrait", true),
+            ("KindTuple", true),
+            ("KindUnion", true),
+            ("KindVariant", true),
+            ("kind_field", false),
+            ("kind_generated", true),
+            ("kind_impl_method", true),
+            ("kind_macro", true),
+            ("kind_module", true),
+            ("kind_module_fn", true),
+            ("kind_trait_method", true),
+            ("kind_union_field", false),
+            ("kind_variant_field", false),
+        ];
+
+        assert_eq!(
+            measured, expected,
+            "the index's coverage changed — a row flipping to false is a new \
+             blind spot, and one flipping to true means the sweep is carrying \
+             weight it no longer needs to"
+        );
+    }
+
+    /// A definition behind `#[cfg(test)]` must be found by the first question
+    /// asked, not only by one that follows a `find_references`.
+    ///
+    /// `find_definition` used to run on a `Fast` context, where `set_test` is
+    /// off and a test module is not in the tree — so it answered *no definition
+    /// found* for a test that exists. What made that a bug rather than a limit:
+    /// `get_or_load` does not downgrade an already-`Full` context, so the very
+    /// same query answered correctly once anything else in the session had asked
+    /// for references. Measured on a real workspace, both answers minutes apart.
+    ///
+    /// Hence the shape of this test — one service, nothing asked before, the
+    /// query cold. Run it after a reference lookup and it passes either way.
+    #[test]
+    fn a_definition_behind_cfg_test_is_found_by_the_first_question() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        kind_survey_workspace(root);
+
+        let mut service = SemanticService::new();
+        let found = service
+            .symbol_search_with_exact(root, "kind_test_fn", 8, true)
+            .expect("query definition");
+
+        assert_eq!(
+            found.len(),
+            1,
+            "the test fn is declared once and must be found on a cold service, \
+             got {found:?}"
+        );
+    }
+
+    /// Every kind the index does not carry must be one the sweep does, or the
+    /// tool still answers *no definition found* for something that exists.
+    ///
+    /// The survey above names three: a struct field, a union field, and a field
+    /// of a struct-shaped enum variant. All three are `SymbolKind::Field`, which
+    /// is what makes one accept list enough — but "rust-analyzer labels a union
+    /// field a field" is an assumption about someone else's code, so it is
+    /// checked here rather than reasoned about.
+    ///
+    /// A tuple struct's field is deliberately absent from both lists: it is
+    /// named `0`, so there is no identifier to ask about and no query that could
+    /// come up short.
+    #[test]
+    fn the_sweep_covers_every_kind_the_index_misses() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        kind_survey_workspace(root);
+
+        let mut service = SemanticService::new();
+        for name in ["kind_field", "kind_union_field", "kind_variant_field"] {
+            let found = service
+                .symbol_search_with_exact(root, name, 8, true)
+                .expect("query definition");
+
+            assert_eq!(
+                found.len(),
+                1,
+                "`{name}` is declared exactly once and the served path must say \
+                 so, got {found:?}"
+            );
+        }
     }
 
     /// Negative control for the definition sweep, the twin of the one guarding

@@ -290,16 +290,25 @@ pub(crate) fn symbol_search(
 /// # The blind spot this covers
 ///
 /// The symbol index carries module-scope declarations plus impl and trait
-/// members — a **struct field** is not in it. So "where is this field declared"
+/// members — a **field** is not in it. So "where is this field declared"
 /// answered *no definition found*, the same words a misspelled name gets, and
 /// the same words that read as "there is no such thing". When the index
 /// produces no full-name match, the sources are asked directly, exactly as
 /// `find_references_by_name` does — same sweep, same guard against a
 /// same-spelled local.
 ///
-/// Enum variants were expected to share the field's fate and do not: an oracle
-/// with the sweep disabled still finds one, so the index does carry them. They
-/// stay in the sweep's accept list as a backstop, not as its reason to exist.
+/// # What else the index does not carry: nothing, measured
+///
+/// One of every kind a caller might name was put to the index with the sweep
+/// switched off (`which_kinds_the_symbol_index_carries`). Absent: a struct
+/// field, a union field, a field of a struct-shaped enum variant — all three
+/// `SymbolKind::Field`, all three already inside the sweep's accept list.
+/// Present, some of them against expectation: enum variants, associated consts
+/// and types, `macro_rules!` macros, and items a macro expansion produced.
+///
+/// So the blind spot is *fields*, and it is closed. A tuple struct's field has
+/// no identifier to ask about — it is named `0` — so it is outside the question
+/// rather than an answer to it.
 pub(crate) fn symbol_search_with_exact(
     host: &AnalysisHost,
     vfs: &Vfs,
@@ -310,19 +319,7 @@ pub(crate) fn symbol_search_with_exact(
 ) -> Result<Vec<Location>> {
     let analysis = host.analysis();
 
-    let query = Query::new(symbol_name.to_string());
-    let results = analysis
-        .symbol_search(query, limit)
-        .context("symbol_search query failed")?;
-
-    let mut locations = results
-        .iter()
-        .map(|target| {
-            let mut location = nav_target_to_location(vfs, &analysis, target)?;
-            location.exact = location.name == symbol_name;
-            Ok(location)
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut locations = index_matches(&analysis, vfs, symbol_name, limit)?;
 
     if !locations.iter().any(|location| location.exact) {
         collect_by_token_scan(
@@ -341,6 +338,50 @@ pub(crate) fn symbol_search_with_exact(
     // the caller's cap is on the answer, not on either source of it.
     ranked.truncate(limit);
     Ok(ranked)
+}
+
+/// What rust-analyzer's symbol index alone answers for a name.
+///
+/// Split out from the search so the index can be questioned on its own: the
+/// sweep runs only when the index produced no exact match, which means the
+/// search's answer conflates "the index carries this kind" with "the sweep
+/// rescued it". Which kinds the index actually carries is a fact worth being
+/// able to measure rather than guess — the guess about enum variants was half
+/// wrong (see `symbol_search_with_exact`).
+fn index_matches(
+    analysis: &Analysis,
+    vfs: &Vfs,
+    symbol_name: &str,
+    limit: usize,
+) -> Result<Vec<Location>> {
+    let query = Query::new(symbol_name.to_string());
+    let results = analysis
+        .symbol_search(query, limit)
+        .context("symbol_search query failed")?;
+
+    results
+        .iter()
+        .map(|target| {
+            let mut location = nav_target_to_location(vfs, analysis, target)?;
+            location.exact = location.name == symbol_name;
+            Ok(location)
+        })
+        .collect()
+}
+
+/// The index's answer with the sweep deliberately not run — the mutant that
+/// tells which kinds the index carries, kept in the source rather than applied
+/// by hand to a working tree each time the question comes up.
+#[cfg(test)]
+pub(crate) fn index_only_search(
+    host: &AnalysisHost,
+    vfs: &Vfs,
+    symbol_name: &str,
+    limit: usize,
+) -> Result<Vec<Location>> {
+    let analysis = host.analysis();
+    let matches = index_matches(&analysis, vfs, symbol_name, limit)?;
+    Ok(rank_and_filter_exact(matches, true))
 }
 
 /// Collapse repeats of one position, keeping the first — which, after ranking,
@@ -408,10 +449,11 @@ pub(crate) fn find_references_by_name_with_exact(
     }
 
     // The symbol index carries module-scope declarations plus impl and trait
-    // members. It does NOT carry struct fields, and `SymbolCollector` skips
-    // enum variants outright — so a field name matches nothing above and the
+    // members. It does NOT carry fields — a struct's, a union's, or a
+    // struct-shaped variant's — so a field name matches nothing above and the
     // answer would be an empty list, which reads exactly like "nobody touches
-    // this field". Ask the source instead.
+    // this field". Ask the source instead. (Enum variants were expected to
+    // share this fate and measurably do not; see `symbol_search_with_exact`.)
     if !resolved_the_name {
         collect_by_token_scan(
             &analysis,
@@ -546,8 +588,10 @@ fn collect_by_token_scan(
 /// Whether a resolved definition is the thing the token sweep went looking for.
 ///
 /// The name has to match, and so does the *kind*: the sweep exists for what
-/// rust-analyzer's symbol index does not surface — struct fields for certain,
-/// enum variants as a backstop — so anything else found under a matching
+/// rust-analyzer's symbol index does not surface — every named **field**, be it
+/// a struct's, a union's or a struct-shaped enum variant's; enum variants
+/// themselves are a backstop, the index does carry them — so anything else
+/// found under a matching
 /// identifier is a different entity that happens to share a spelling. A local
 /// `let radius_override = 7;` declares a name equal to the field's, and
 /// counting it and its uses inflated a four-read field to six — silently, which
