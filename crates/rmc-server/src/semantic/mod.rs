@@ -138,6 +138,98 @@ pub struct SemanticServiceStatus {
     pub projects: Vec<SemanticProjectStatus>,
 }
 
+/// One salsa ingredient's line in a memory report — a query's memo table or an
+/// interned/tracked struct's storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IngredientMemory {
+    /// `query` or `struct`.
+    pub family: &'static str,
+    /// For a query this is the *query* name (`<SelfTy>::<fn>`), which is what
+    /// an LRU capacity is addressed by. salsa keeps it in the map key and puts
+    /// the result *type* in `debug_name`, so reading the values alone loses the
+    /// only label that can be acted on.
+    pub name: &'static str,
+    /// The result type, beside a query name: two queries can return the same
+    /// shape, and the shape is what hints at the heap behind it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub produces: Option<&'static str>,
+    pub count: usize,
+    pub stack_bytes: usize,
+    pub metadata_bytes: usize,
+    /// Present only where the query declares a `heap_size` function, and a
+    /// lower bound where it does. Absent means "not measured", never "empty".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heap_bytes: Option<usize>,
+    /// Page fill statistics, for the interned families that keep their slots in
+    /// pages. Says how much of the reserved space is actually in use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
+}
+
+impl IngredientMemory {
+    /// What this ingredient is known to cost. Unmeasured heap counts as zero
+    /// rather than being guessed at, which is why a report prints this against
+    /// RSS instead of presenting it as the whole.
+    fn bytes(&self) -> usize {
+        self.stack_bytes + self.metadata_bytes + self.heap_bytes.unwrap_or(0)
+    }
+}
+
+/// What one loaded analysis is holding, ingredient by ingredient.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectMemoryReport {
+    pub project: String,
+    /// Resident set of the whole process — the daemon, not this project alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rss_kib: Option<u64>,
+    pub ingredients: usize,
+    /// How many of them report a heap size at all. The rest are counted, not
+    /// weighed.
+    pub ingredients_reporting_heap: usize,
+    pub instances: usize,
+    pub accounted_bytes: usize,
+    /// Sorted by known bytes, largest first; truncated to the caller's `top`.
+    pub rows: Vec<IngredientMemory>,
+}
+
+/// Flatten salsa's two families — interned/tracked structs and query memo
+/// tables — into one list, sorted by what it can see.
+fn ingredient_rows(host: &AnalysisHost) -> Vec<IngredientMemory> {
+    use ra_ap_ide_db::base_db::salsa;
+
+    // `memory_usage` is implemented on `dyn Database`, not on the trait, so the
+    // unsize coercion here is required rather than stylistic.
+    let db: &dyn salsa::Database = host.raw_database();
+    let info = db.memory_usage();
+
+    let mut rows: Vec<IngredientMemory> = info
+        .structs
+        .iter()
+        .map(|ingredient| IngredientMemory {
+            family: "struct",
+            name: ingredient.debug_name(),
+            produces: None,
+            count: ingredient.count(),
+            stack_bytes: ingredient.size_of_fields(),
+            metadata_bytes: ingredient.size_of_metadata(),
+            heap_bytes: ingredient.heap_size_of_fields(),
+            page: ingredient.page_info().map(|page| format!("{page:?}")),
+        })
+        .chain(info.queries.iter().map(|(query, ingredient)| IngredientMemory {
+            family: "query",
+            name: query,
+            produces: Some(ingredient.debug_name()),
+            count: ingredient.count(),
+            stack_bytes: ingredient.size_of_fields(),
+            metadata_bytes: ingredient.size_of_metadata(),
+            heap_bytes: ingredient.heap_size_of_fields(),
+            page: None,
+        }))
+        .collect();
+    rows.sort_by(|a, b| b.bytes().cmp(&a.bytes()).then(b.count.cmp(&a.count)));
+    rows
+}
+
 /// Push the current contents of `paths` into an already-loaded analysis.
 ///
 /// Fails rather than skips when a file cannot be mapped into the analysis: the
@@ -311,6 +403,63 @@ impl SemanticService {
             ctx.host.trigger_garbage_collection();
         }
         self.projects.len()
+    }
+
+    /// Per-ingredient memory of one *already loaded* analysis.
+    ///
+    /// # Why it refuses to load the project
+    ///
+    /// The question this answers is "what is this daemon holding", and a daemon
+    /// worth asking about has been alive for hours. Loading the project here to
+    /// answer would build a fresh database and report *that* — a floor, not a
+    /// portrait, and one indistinguishable from the real thing in the output.
+    /// So an unloaded path is an error naming what is loaded instead.
+    ///
+    /// # How to read the numbers
+    ///
+    /// `heap_bytes` is present only for the queries whose fork declares a
+    /// `heap_size` function, and it is a lower bound there (see
+    /// `syntax::heap_size`). Everything else reports `count`, `stack_bytes` and
+    /// `metadata_bytes` only — enough to say which memos are numerous, never
+    /// how many bytes they are worth. `accounted_bytes` against RSS is printed
+    /// precisely so the gap cannot be mistaken for a full budget.
+    pub(crate) fn memory_breakdown(&self, project: &Path, top: usize) -> Result<ProjectMemoryReport> {
+        let canonical = project
+            .canonicalize()
+            .with_context(|| format!("resolving {}", project.display()))?;
+        let ctx = self.projects.get(&canonical).ok_or_else(|| {
+            let loaded: Vec<String> = self
+                .projects
+                .keys()
+                .map(|path| path.display().to_string())
+                .collect();
+            anyhow::anyhow!(
+                "no analysis is loaded for {}; this reports what a live daemon is holding and \
+                 will not load a project to answer, because a database built for the question \
+                 measures a cold start rather than the daemon. Loaded: {}",
+                canonical.display(),
+                if loaded.is_empty() { "nothing".to_owned() } else { loaded.join(", ") }
+            )
+        })?;
+
+        let mut rows = ingredient_rows(&ctx.host);
+        let instances = rows.iter().map(|row| row.count).sum();
+        let accounted_bytes = rows.iter().map(IngredientMemory::bytes).sum();
+        let ingredients = rows.len();
+        let ingredients_reporting_heap = rows.iter().filter(|row| row.heap_bytes.is_some()).count();
+        if top > 0 {
+            rows.truncate(top);
+        }
+
+        Ok(ProjectMemoryReport {
+            project: canonical.display().to_string(),
+            rss_kib: crate::mcp::memory::rss_kib(),
+            ingredients,
+            ingredients_reporting_heap,
+            instances,
+            accounted_bytes,
+            rows,
+        })
     }
 
     /// Mark `canonical` as the most recently used context.
@@ -545,19 +694,44 @@ impl SemanticService {
     }
 
     /// Find all references to symbols matching a name with optional exact filtering.
+    ///
+    /// # Why this needs a `Full` context
+    ///
+    /// A `Fast` context is loaded with `no_deps: true`, and `cargo metadata
+    /// --no-deps` omits the resolve graph entirely — so rust-analyzer gets the
+    /// workspace's packages with **no dependency edges between them**, and a
+    /// call from one member crate into another is not a reference it can see.
+    /// `set_test` is off there too, which takes every `#[cfg(test)]` call site
+    /// out of the module tree along with it.
+    ///
+    /// Measured on a 4000-file workspace (2026-08-28): a `pub fn` with six call
+    /// sites answered three — the cross-crate one and both test ones missing,
+    /// with no indication that the answer was partial. "Fewer references than
+    /// exist" is the one wrong answer this tool must not give, because it is
+    /// read as "this code is dead".
+    ///
+    /// The cost lands once per project: `get_or_load_full` upgrades a cached
+    /// `Fast` context in place rather than holding a second one, and `rename`
+    /// already pays the same price for the same reason.
     pub(crate) fn find_references_by_name_with_exact(
         &mut self,
         project_path: &Path,
         symbol_name: &str,
         exact: bool,
     ) -> Result<Vec<Location>> {
-        self.get_or_load(project_path)?;
+        self.get_or_load_full(project_path)?;
 
         let canonical = project_path.canonicalize()?;
         let ctx = self.projects.get(&canonical)
             .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
 
-        position::find_references_by_name_with_exact(&ctx.host, &ctx.vfs, symbol_name, exact)
+        position::find_references_by_name_with_exact(
+            &ctx.host,
+            &ctx.vfs,
+            &canonical,
+            symbol_name,
+            exact,
+        )
     }
 
     /// Preview rename of a symbol by name. Does not modify any files.
@@ -625,9 +799,39 @@ impl SemanticService {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    /// Keeps the process-global salsa sweep away from tests holding an analysis.
+    ///
+    /// `collect_garbage` frees memory belonging to *every* context in the
+    /// process, not only the one under test — see the `unsafe` sweep it calls.
+    /// A peer test mid-query when that lands does not fail an assertion, it
+    /// takes a SIGSEGV and kills the whole test binary, so the failure surfaces
+    /// as "the suite crashed" with no clue which pair collided.
+    ///
+    /// Loading tests hold the read side, so they still run alongside each
+    /// other; the sweep takes the write side and runs alone. Making the whole
+    /// group serial would cost minutes for a hazard that is only between the
+    /// sweep and everyone else.
+    static SWEEP: RwLock<()> = RwLock::new(());
+
+    /// "I am holding a loaded analysis — do not sweep under me."
+    ///
+    /// Poisoning is stepped over deliberately: a panic in some other test says
+    /// nothing about whether this one may hold an analysis, and turning it into
+    /// a second failure would only bury the first.
+    fn holding_an_analysis() -> RwLockReadGuard<'static, ()> {
+        SWEEP.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// "I am the sweep."
+    fn sweeping_alone() -> RwLockWriteGuard<'static, ()> {
+        SWEEP.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn rename_preview_includes_workspace_reverse_dependencies() {
+        let _analysis = holding_an_analysis();
         let workspace = tempfile::tempdir().expect("create workspace tempdir");
         let workspace_path = workspace.path();
 
@@ -779,6 +983,7 @@ pub fn first() {
     /// same service must see it.
     #[test]
     fn references_see_an_edit_made_after_the_project_was_cached() {
+        let _analysis = holding_an_analysis();
         let workspace = tempfile::tempdir().expect("create workspace tempdir");
         let root = workspace.path();
         let lib = one_crate_workspace(root);
@@ -821,6 +1026,7 @@ pub fn second() {
     /// database file-by-file — the refresh has to notice and reload.
     #[test]
     fn references_see_a_call_site_added_in_a_new_file() {
+        let _analysis = holding_an_analysis();
         let workspace = tempfile::tempdir().expect("create workspace tempdir");
         let root = workspace.path();
         let lib = one_crate_workspace(root);
@@ -860,10 +1066,213 @@ pub fn first() {
         );
     }
 
+    /// Call sites landing in one file, named by the tail of its path.
+    fn refs_in(locations: &[Location], file_suffix: &str) -> usize {
+        locations
+            .iter()
+            .filter(|location| {
+                location.name == "reference" && location.file_path.ends_with(file_suffix)
+            })
+            .count()
+    }
+
+    /// Two crates and a known answer, built so that each way the search used to
+    /// come up short is one countable reference.
+    ///
+    /// `probed()` is called three times: once in ordinary code, once from a
+    /// `#[cfg(test)]` module, once from the other crate. `radius_override` is a
+    /// **struct field** — the symbol index does not carry those at all — read
+    /// four times across the same three places.
+    ///
+    /// Nothing here uses `use`: every cross-crate mention is written out as
+    /// `oracle_lib::…`, so an import edge cannot pad the counts and make a
+    /// missing call site look present.
+    fn two_crate_oracle_workspace(root: &Path) {
+        write_file(
+            &root.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["oracle_lib", "oracle_consumer"]
+resolver = "2"
+"#,
+        );
+        write_file(
+            &root.join("oracle_lib/Cargo.toml"),
+            r#"
+[package]
+name = "oracle_lib"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+        );
+        write_file(
+            &root.join("oracle_lib/src/lib.rs"),
+            r#"
+pub struct Probe {
+    pub radius_override: u32,
+}
+
+impl Probe {
+    pub fn read_here(&self) -> u32 {
+        self.radius_override
+    }
+}
+
+pub fn probed() {}
+
+pub fn calls_here() {
+    probed();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn touches_both() {
+        let probe = super::Probe { radius_override: 1 };
+        assert_eq!(probe.radius_override, 1);
+        super::probed();
+    }
+}
+"#,
+        );
+        write_file(
+            &root.join("oracle_consumer/Cargo.toml"),
+            r#"
+[package]
+name = "oracle_consumer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+oracle_lib = { path = "../oracle_lib" }
+"#,
+        );
+        write_file(
+            &root.join("oracle_consumer/src/lib.rs"),
+            r#"
+pub fn read_across(probe: &oracle_lib::Probe) -> u32 {
+    probe.radius_override
+}
+
+pub fn call_across() {
+    oracle_lib::probed();
+}
+"#,
+        );
+    }
+
+    /// The regression net for the two ways a `fn` search came up short: a
+    /// workspace loaded without dependency edges cannot see the call from the
+    /// other crate, and one loaded without `cfg(test)` cannot see the call from
+    /// the test module. Both used to be invisible *and* silent — the answer was
+    /// a shorter list, not an error.
+    #[test]
+    fn references_to_a_fn_include_the_other_crate_and_the_test_module() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        two_crate_oracle_workspace(root);
+
+        let mut service = SemanticService::new();
+        let found = service
+            .find_references_by_name_with_exact(root, "probed", true)
+            .expect("query references");
+
+        assert_eq!(
+            refs_in(&found, "oracle_consumer/src/lib.rs"),
+            1,
+            "the call from the other crate must be visible, got {found:?}"
+        );
+        assert_eq!(
+            refs_in(&found, "oracle_lib/src/lib.rs"),
+            2,
+            "both the plain call and the #[cfg(test)] one must be visible, got {found:?}"
+        );
+        assert_eq!(
+            call_sites(&found),
+            3,
+            "three call sites exist and three must be reported, got {found:?}"
+        );
+    }
+
+    /// A struct field reaches rust-analyzer's symbol index not at all, so the
+    /// name resolved to nothing and the tool answered "no references" — the
+    /// same words it uses for a field nobody reads. Four reads exist here.
+    #[test]
+    fn references_to_a_struct_field_are_found_at_all() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        two_crate_oracle_workspace(root);
+
+        let mut service = SemanticService::new();
+        let found = service
+            .find_references_by_name_with_exact(root, "radius_override", true)
+            .expect("query references");
+
+        assert_eq!(
+            refs_in(&found, "oracle_consumer/src/lib.rs"),
+            1,
+            "the read from the other crate must be visible, got {found:?}"
+        );
+        assert_eq!(
+            refs_in(&found, "oracle_lib/src/lib.rs"),
+            3,
+            "the impl read plus both test reads must be visible, got {found:?}"
+        );
+        assert!(
+            found.iter().any(|location| location.name != "reference"),
+            "the declaration itself must come back alongside the reads, got {found:?}"
+        );
+    }
+
+    /// The fallback sweeps source text for the identifier, so it must not report
+    /// a same-spelled *local* as a field read. Negative control for the sweep:
+    /// without the "what did this actually resolve to" check, this reads 2.
+    #[test]
+    fn a_local_binding_spelled_like_the_field_is_not_counted() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        two_crate_oracle_workspace(root);
+        write_file(
+            &root.join("oracle_consumer/src/lib.rs"),
+            r#"
+pub fn read_across(probe: &oracle_lib::Probe) -> u32 {
+    probe.radius_override
+}
+
+pub fn a_local_of_the_same_name() -> u32 {
+    // Same spelling, unrelated binding: not a read of the field.
+    let radius_override = 7;
+    radius_override
+}
+"#,
+        );
+
+        let mut service = SemanticService::new();
+        let found = service
+            .find_references_by_name_with_exact(root, "radius_override", true)
+            .expect("query references");
+
+        assert_eq!(
+            refs_in(&found, "oracle_consumer/src/lib.rs"),
+            1,
+            "only the field read counts, not the local spelled like it, got {found:?}"
+        );
+    }
+
     /// Untouched code must not pay for the check: same stamps, no reload, and
     /// crucially the same answer.
     #[test]
     fn an_untouched_project_is_not_reloaded() {
+        let _analysis = holding_an_analysis();
         let workspace = tempfile::tempdir().expect("create workspace tempdir");
         let root = workspace.path();
         one_crate_workspace(root);
@@ -909,6 +1318,7 @@ pub fn first() {
     /// in, which is the one it will ask about next.
     #[test]
     fn a_third_project_evicts_the_least_recently_used_not_the_oldest() {
+        let _analysis = holding_an_analysis();
         let (first, second, third) = (
             tempfile::tempdir().expect("tempdir a"),
             tempfile::tempdir().expect("tempdir b"),
@@ -950,6 +1360,7 @@ pub fn first() {
     /// and the one thing that must survive is the project being asked about.
     #[test]
     fn the_project_being_used_is_never_the_victim() {
+        let _analysis = holding_an_analysis();
         let (first, second) = (
             tempfile::tempdir().expect("tempdir a"),
             tempfile::tempdir().expect("tempdir b"),
@@ -1010,6 +1421,7 @@ pub fn first() {
     /// crash on the next query — hence the same question on both sides of it.
     #[test]
     fn a_collection_bumps_the_revision_and_keeps_the_answers() {
+        let _sweep = sweeping_alone();
         use ra_ap_ide_db::base_db::SourceDatabase;
 
         let workspace = tempfile::tempdir().expect("create workspace tempdir");
@@ -1090,6 +1502,9 @@ pub fn first() {
     #[test]
     #[ignore = "needs a real workspace in RMC_RSS_CYCLE_PROJECT and minutes to run"]
     fn rss_across_load_clear_cycles_separates_a_leak_from_fragmentation() {
+        // Exclusive: this one sweeps too, and it measures RSS — a peer holding
+        // a workspace would be counted as this test's own memory.
+        let _sweep = sweeping_alone();
         let Ok(project) = std::env::var("RMC_RSS_CYCLE_PROJECT") else {
             panic!(
                 "set RMC_RSS_CYCLE_PROJECT to a cargo workspace root; without one this test \
@@ -1166,19 +1581,22 @@ pub fn first() {
     ///
     /// Salsa reports three numbers per ingredient: the number of instances, the
     /// *stack* size of their fields, and its own metadata. Heap behind those
-    /// fields is only counted when the query declares `heap_size = <fn>` — and
-    /// **rust-analyzer declares it nowhere** (zero occurrences across all its
-    /// crates as of the 2026-08-26 upstream). Every heavy memo in rust-analyzer
-    /// is a `Vec`/`Arc`/`Box` behind a small struct, so the heap is exactly
-    /// where the gigabytes are and exactly what stays invisible here.
+    /// fields is counted only where the query declares `heap_size = <fn>`, and
+    /// every heavy memo in rust-analyzer is a `Vec`/`Arc`/`Box` behind a small
+    /// struct — so the heap is exactly where the gigabytes are.
     ///
-    /// So read the output as *counts and shapes*, not as a memory budget: an
-    /// ingredient with millions of instances is the suspect even when its
-    /// stack column is small. Turning a suspect into a number takes one
-    /// `heap_size = <fn>` attribute on that query in the rust-analyzer fork.
-    /// The printed "accounted for" percentage is the honest measure of how much
-    /// of the process this table explains; when someone adds `heap_size`
-    /// upstream (or we do), that percentage is what should climb.
+    /// Upstream declares it nowhere (zero occurrences as of the 2026-08-26
+    /// tree, which is what made this table explain 4.2% of RSS). Our fork
+    /// declares it on the families that were the biggest by count *and* own
+    /// buffers: the parse query, bodies with their source maps, the signature
+    /// queries and macro expansion. That took the same table to 42.7%.
+    ///
+    /// The rest of the rows are still counts and shapes, not bytes, and a
+    /// number that is present is a LOWER bound (see `syntax::heap_size`). Read
+    /// the printed "accounted for" percentage as the honest measure of how much
+    /// of the process this table explains — never as a budget. Turning another
+    /// suspect into a number takes one `heap_size = <fn>` attribute on its
+    /// query in the fork; picking which suspect is what this output is for.
     ///
     /// # Running it
     ///
@@ -1191,6 +1609,11 @@ pub fn first() {
     #[test]
     #[ignore = "needs a real workspace in RMC_SALSA_MEMORY_PROJECT and minutes to run"]
     fn salsa_ingredient_memory_breakdown_names_the_suspects() {
+        // Exclusive for the same two reasons as the RSS cycle test: it sweeps,
+        // and it attributes memory.
+        let _sweep = sweeping_alone();
+        // Still needed below, where the test asks the database itself which
+        // queries have a tunable capacity; the breakdown no longer needs it.
         use ra_ap_ide_db::base_db::salsa;
 
         let Ok(project) = std::env::var("RMC_SALSA_MEMORY_PROJECT") else {
@@ -1202,61 +1625,11 @@ pub fn first() {
         let project = PathBuf::from(project);
         let top = env_usize("RMC_SALSA_MEMORY_TOP", 25);
 
-        /// One row of the breakdown, already flattened across salsa's two
-        /// families (input/interned structs and memoized query results).
-        struct Row {
-            family: &'static str,
-            /// For a query this is the *query* name — `<SelfTy>::<fn>`, the very
-            /// string [`RootDatabase::set_query_lru_capacity`] takes. salsa keeps
-            /// it in the map KEY and puts the result *type* in `debug_name`, so
-            /// reading `values()` alone silently loses the only label that can be
-            /// acted on. For a struct there is no such pair and this is the name.
-            name: &'static str,
-            /// The result type, shown beside a query name: two queries can return
-            /// the same shape, and the shape is what hints at the heap behind it.
-            produces: Option<&'static str>,
-            count: usize,
-            stack: usize,
-            metadata: usize,
-            heap: Option<usize>,
-            page: Option<String>,
-        }
-
-        /// Take a breakdown of one loaded analysis, sorted by what it can see.
-        fn breakdown(host: &AnalysisHost) -> Vec<Row> {
-            // `memory_usage` is implemented on `dyn Database`, not on the trait,
-            // so the unsize coercion here is required rather than stylistic.
-            let db: &dyn salsa::Database = host.raw_database();
-            let info = db.memory_usage();
-
-            let mut rows: Vec<Row> = info
-                .structs
-                .iter()
-                .map(|ingredient| Row {
-                    family: "struct",
-                    name: ingredient.debug_name(),
-                    produces: None,
-                    count: ingredient.count(),
-                    stack: ingredient.size_of_fields(),
-                    metadata: ingredient.size_of_metadata(),
-                    heap: ingredient.heap_size_of_fields(),
-                    page: ingredient.page_info().map(|page| format!("{page:?}")),
-                })
-                .chain(info.queries.iter().map(|(query, ingredient)| Row {
-                    family: "query",
-                    name: query,
-                    produces: Some(ingredient.debug_name()),
-                    count: ingredient.count(),
-                    stack: ingredient.size_of_fields(),
-                    metadata: ingredient.size_of_metadata(),
-                    heap: ingredient.heap_size_of_fields(),
-                    page: None,
-                }))
-                .collect();
-            let bytes_of = |row: &Row| row.stack + row.metadata + row.heap.unwrap_or(0);
-            rows.sort_by(|a, b| bytes_of(b).cmp(&bytes_of(a)).then(b.count.cmp(&a.count)));
-            rows
-        }
+        // The breakdown itself is production code — the `analysis_memory` tool
+        // serves the same rows — so this test exercises what ships rather than
+        // a copy that could drift from it.
+        type Row = IngredientMemory;
+        let breakdown = ingredient_rows;
 
         let mut service = SemanticService::new();
         // A real query, not a bare load: an empty database has nothing memoized
@@ -1279,9 +1652,8 @@ pub fn first() {
                 .host,
         );
 
-        let bytes_of = |row: &Row| row.stack + row.metadata + row.heap.unwrap_or(0);
-        let accounted: usize = rows.iter().map(bytes_of).sum();
-        let with_heap = rows.iter().filter(|row| row.heap.is_some()).count();
+        let accounted: usize = rows.iter().map(Row::bytes).sum();
+        let with_heap = rows.iter().filter(|row| row.heap_bytes.is_some()).count();
         let instances: usize = rows.iter().map(|row| row.count).sum();
 
         println!(
@@ -1308,9 +1680,9 @@ pub fn first() {
                 row.family,
                 row.name,
                 row.count,
-                row.stack / 1024,
-                row.metadata / 1024,
-                row.heap
+                row.stack_bytes / 1024,
+                row.metadata_bytes / 1024,
+                row.heap_bytes
                     .map_or("-".to_string(), |heap| (heap / 1024).to_string()),
                 row.produces.or(row.page.as_deref()).unwrap_or(""),
             );
@@ -1387,7 +1759,7 @@ pub fn first() {
         let row_of = |rows: &[Row], query: &str| {
             rows.iter()
                 .find(|row| row.family == "query" && row.name == query)
-                .map(|row| (row.count, row.heap))
+                .map(|row| (row.count, row.heap_bytes))
         };
         let (before, heap_before) = row_of(&rows, CAPPED_QUERY).unwrap_or_else(|| {
             panic!(
@@ -1426,7 +1798,7 @@ pub fn first() {
         let mut freed: Vec<(&str, usize)> = rows
             .iter()
             .filter_map(|row| {
-                let before = row.heap?;
+                let before = row.heap_bytes?;
                 let after = row_of(&after_rows, row.name).map(|(_, heap)| heap)??;
                 before.checked_sub(after).filter(|freed| *freed > 0).map(|freed| (row.name, freed))
             })
