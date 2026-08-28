@@ -1714,7 +1714,10 @@ pub fn a_local_of_the_same_name() -> u32 {
     /// tree, which is what made this table explain 4.2% of RSS). Our fork
     /// declares it on the families that were the biggest by count *and* own
     /// buffers: the parse query, bodies with their source maps, the signature
-    /// queries and macro expansion. That took the same table to 42.7%.
+    /// queries and macro expansion. That took the same table to 42.7%. Def
+    /// maps, item trees and symbol indices followed, then type inference — the
+    /// one capacity the fork chose for itself, and so the one that most needed
+    /// bytes to argue from.
     ///
     /// The rest of the rows are still counts and shapes, not bytes, and a
     /// number that is present is a LOWER bound (see `syntax::heap_size`). Read
@@ -1731,6 +1734,15 @@ pub fn a_local_of_the_same_name() -> u32 {
     /// ```
     ///
     /// `RMC_SALSA_MEMORY_TOP` (default 25) caps how many rows are printed.
+    ///
+    /// `RMC_SALSA_MEMORY_PROBE` picks what fills the database first:
+    /// `symbols` (default, a symbol search — cheap, and what every earlier run
+    /// in this track used) or `references` (chase the uses of
+    /// `RMC_SALSA_MEMORY_SYMBOL`, which then has to be set). Only the second
+    /// runs type inference, so only under it does the `InferenceResult` row mean
+    /// anything.
+    /// The probe decides every number in the table: two runs are comparable only
+    /// if they probed alike.
     #[test]
     #[ignore = "needs a real workspace in RMC_SALSA_MEMORY_PROJECT and minutes to run"]
     fn salsa_ingredient_memory_breakdown_names_the_suspects() {
@@ -1749,6 +1761,25 @@ pub fn a_local_of_the_same_name() -> u32 {
         };
         let project = PathBuf::from(project);
         let top = env_usize("RMC_SALSA_MEMORY_TOP", 25);
+        // Which query fills the database before it is weighed. `symbols` is the
+        // default because it is what every earlier run in this track used, and
+        // the probe decides every number in the table — two runs are comparable
+        // only if they probed the same way.
+        //
+        // `references` exists because `symbols` never runs type inference:
+        // measured on a 4000-file workspace, it leaves `InferenceResult` at
+        // thirteen memos, and a byte count over thirteen memos is noise. Chasing
+        // a name's use sites infers every body that mentions it, which is also
+        // what the `find_references` endpoint does in production.
+        let probe = std::env::var("RMC_SALSA_MEMORY_PROBE")
+            .unwrap_or_else(|_| "symbols".to_string());
+        // Deliberately without a default. The name decides both what the probe
+        // costs and whether it proves anything, and one guessed here would do
+        // neither: `new` looked like the obvious choice and matches up to fifty
+        // declarations, each of which sweeps the whole tree for its own uses —
+        // measured at 10 GB and still climbing after two minutes on a 4000-file
+        // workspace. What works is a name with ONE declaration and many uses.
+        let symbol = std::env::var("RMC_SALSA_MEMORY_SYMBOL").unwrap_or_default();
 
         // The breakdown itself is production code — the `analysis_memory` tool
         // serves the same rows — so this test exercises what ships rather than
@@ -1759,9 +1790,34 @@ pub fn a_local_of_the_same_name() -> u32 {
         let mut service = SemanticService::new();
         // A real query, not a bare load: an empty database has nothing memoized
         // and every row would read as zero.
-        let found = service
-            .symbol_search(&project, "main", 16)
-            .expect("symbol search on the probe workspace");
+        let probed = match probe.as_str() {
+            "symbols" => {
+                let found = service
+                    .symbol_search(&project, "main", 16)
+                    .expect("symbol search on the probe workspace");
+                format!("probe `symbols`: {} symbol(s) named `main`", found.len())
+            }
+            "references" => {
+                assert!(
+                    !symbol.is_empty(),
+                    "the `references` probe needs RMC_SALSA_MEMORY_SYMBOL: a name with one \
+                     declaration and many use sites in the probe workspace. See the comment on \
+                     `symbol` for why there is no default"
+                );
+                let found = service
+                    .find_references_by_name_with_exact(&project, &symbol, true)
+                    .expect("reference search on the probe workspace");
+                format!(
+                    "probe `references`: {} location(s) for `{symbol}`",
+                    found.len()
+                )
+            }
+            other => panic!(
+                "RMC_SALSA_MEMORY_PROBE={other:?} names no probe; use `symbols` (cheap, runs no \
+                 type inference) or `references` (infers every body mentioning \
+                 RMC_SALSA_MEMORY_SYMBOL, default `new`)"
+            ),
+        };
         let rss_kib = crate::mcp::memory::rss_kib().expect("RSS readable on linux");
 
         let canonical = project
@@ -1782,8 +1838,7 @@ pub fn a_local_of_the_same_name() -> u32 {
         let instances: usize = rows.iter().map(|row| row.count).sum();
 
         println!(
-            "{} symbol(s) found; RSS {} MB; {} ingredients, {} instances total",
-            found.len(),
+            "{probed}; RSS {} MB; {} ingredients, {} instances total",
             rss_kib / 1024,
             rows.len(),
             instances,
@@ -1815,9 +1870,40 @@ pub fn a_local_of_the_same_name() -> u32 {
 
         assert!(
             !rows.is_empty(),
-            "a database that answered a symbol search must have memoized something; an empty \
-             breakdown means the measurement, not the database, is broken"
+            "a database that answered a query must have memoized something; an empty breakdown \
+             means the measurement, not the database, is broken"
         );
+
+        // The salsa `debug_name` of the type inference query. The spelling is
+        // the macro's, lifetime and spaces included, and it cannot be guessed —
+        // it is what `Database::lru_capacity_names` prints below.
+        const INFER_QUERY: &str = "InferenceResult < 'db >::for_body_";
+        let row_of = |rows: &[Row], query: &str| {
+            rows.iter()
+                .find(|row| row.family == "query" && row.name == query)
+                .map(|row| (row.count, row.heap_bytes))
+        };
+        if probe == "references" {
+            // A floor on "did inference run at all", not on "is the sample
+            // large": the `symbols` probe leaves this query at thirteen memos,
+            // so anything in that neighbourhood means the probe missed its
+            // target rather than found a small answer. How big the sample is,
+            // the reader judges from the per-memo average printed beside it.
+            const INFER_FLOOR: usize = 50;
+            let (inferred, infer_heap) = row_of(&rows, INFER_QUERY).unwrap_or((0, None));
+            println!(
+                "type inference: {inferred} memo(s), heap {} KiB ({} bytes each on average)",
+                infer_heap.unwrap_or(0) / 1024,
+                infer_heap.unwrap_or(0).checked_div(inferred).unwrap_or(0),
+            );
+            assert!(
+                inferred > INFER_FLOOR,
+                "the reference probe inferred only {inferred} bodies (floor {INFER_FLOOR}) — \
+                 `{symbol}` is used too little in this workspace to make type inference measurable, \
+                 so any heap number for `{INFER_QUERY}` above is noise. Point \
+                 RMC_SALSA_MEMORY_SYMBOL at a name called from many bodies"
+            );
+        }
         // The gap between this table and RSS is the finding, not a defect: it is
         // the heap that salsa cannot see without `heap_size`. If the table ever
         // covers the process, this assert fires and the conclusion above — "read
@@ -1881,11 +1967,6 @@ pub fn a_local_of_the_same_name() -> u32 {
         // `Body::with_source_map` matches nothing at all.
         const CAPPED_QUERY: &str = "Body::with_source_map_";
         const DECLARED_CAP: usize = 512;
-        let row_of = |rows: &[Row], query: &str| {
-            rows.iter()
-                .find(|row| row.family == "query" && row.name == query)
-                .map(|row| (row.count, row.heap_bytes))
-        };
         let (before, heap_before) = row_of(&rows, CAPPED_QUERY).unwrap_or_else(|| {
             panic!(
                 "no query named `{CAPPED_QUERY}` in the breakdown — upstream renamed it, and \
