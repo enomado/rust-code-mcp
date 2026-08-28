@@ -90,8 +90,22 @@ const MACRO_QUERY: &str = "MacroCallId::parse_macro_expansion_";
 ///
 /// The probe decides every number a sweep prints: two runs are comparable only
 /// if they probed alike.
+/// # Neither probe is cheap any more
+///
+/// Earlier sessions of this track called `symbols` the cheap one and measured it
+/// at 818 MB and 15 s on a 4000-file workspace. That was a `Fast` context, and it
+/// is gone: since 2026-08-28 `symbol_search` loads the same `Full` context
+/// references do, because a `Fast` one has `set_test` off and answered *no
+/// definition found* for anything behind `#[cfg(test)]`. Measured after that
+/// change, a `symbols` sweep on `rust_app` passed **13.2 GB** and was still
+/// climbing — on a machine whose swap was already full it had to be killed.
+///
+/// Two consequences worth carrying: run either probe only on a quiet machine
+/// with room to spare, and do not compare a number taken today against one from
+/// sessions six to nine — the context under them differs.
 pub(super) enum Probe {
-    /// A symbol search. Cheap, and runs no type inference at all.
+    /// A symbol search. Runs no type inference; that is now the *only* thing
+    /// that makes it lighter than the other.
     Symbols { name: String },
     /// Chase every use of a name. The only probe that infers types, and the same
     /// path `find_references` serves in production.
@@ -674,11 +688,12 @@ path = "src/lib.rs"
     /// ```
     ///
     /// `RMC_SALSA_MEMORY_PROBE` / `RMC_SALSA_MEMORY_SYMBOL` choose what fills the
-    /// database, exactly as for the breakdown test: `symbols` is cheap and runs
-    /// no type inference, `references` infers every body mentioning a name and is
-    /// the path production serves. The `references` probe on a 4000-file
-    /// workspace needs about 12.5 GB and a quiet machine — it was twice cut short
-    /// by another agent's test run on the same desktop.
+    /// database, exactly as for the breakdown test. Read the note on [`Probe`]
+    /// before starting one: both probes now load a `Full` context, `references`
+    /// wants about 12.5 GB and `symbols` was measured past 13.2 GB, and this
+    /// sweep then keeps that database alive across every capacity in the list.
+    /// It needs a quiet machine with room to spare — three attempts in this
+    /// track have been killed by a desktop that had none.
     ///
     /// # Reading the table
     ///
