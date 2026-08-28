@@ -1202,6 +1202,62 @@ pub fn first() {
         let project = PathBuf::from(project);
         let top = env_usize("RMC_SALSA_MEMORY_TOP", 25);
 
+        /// One row of the breakdown, already flattened across salsa's two
+        /// families (input/interned structs and memoized query results).
+        struct Row {
+            family: &'static str,
+            /// For a query this is the *query* name — `<SelfTy>::<fn>`, the very
+            /// string [`RootDatabase::set_query_lru_capacity`] takes. salsa keeps
+            /// it in the map KEY and puts the result *type* in `debug_name`, so
+            /// reading `values()` alone silently loses the only label that can be
+            /// acted on. For a struct there is no such pair and this is the name.
+            name: &'static str,
+            /// The result type, shown beside a query name: two queries can return
+            /// the same shape, and the shape is what hints at the heap behind it.
+            produces: Option<&'static str>,
+            count: usize,
+            stack: usize,
+            metadata: usize,
+            heap: Option<usize>,
+            page: Option<String>,
+        }
+
+        /// Take a breakdown of one loaded analysis, sorted by what it can see.
+        fn breakdown(host: &AnalysisHost) -> Vec<Row> {
+            // `memory_usage` is implemented on `dyn Database`, not on the trait,
+            // so the unsize coercion here is required rather than stylistic.
+            let db: &dyn salsa::Database = host.raw_database();
+            let info = db.memory_usage();
+
+            let mut rows: Vec<Row> = info
+                .structs
+                .iter()
+                .map(|ingredient| Row {
+                    family: "struct",
+                    name: ingredient.debug_name(),
+                    produces: None,
+                    count: ingredient.count(),
+                    stack: ingredient.size_of_fields(),
+                    metadata: ingredient.size_of_metadata(),
+                    heap: ingredient.heap_size_of_fields(),
+                    page: ingredient.page_info().map(|page| format!("{page:?}")),
+                })
+                .chain(info.queries.iter().map(|(query, ingredient)| Row {
+                    family: "query",
+                    name: query,
+                    produces: Some(ingredient.debug_name()),
+                    count: ingredient.count(),
+                    stack: ingredient.size_of_fields(),
+                    metadata: ingredient.size_of_metadata(),
+                    heap: ingredient.heap_size_of_fields(),
+                    page: None,
+                }))
+                .collect();
+            let bytes_of = |row: &Row| row.stack + row.metadata + row.heap.unwrap_or(0);
+            rows.sort_by(|a, b| bytes_of(b).cmp(&bytes_of(a)).then(b.count.cmp(&a.count)));
+            rows
+        }
+
         let mut service = SemanticService::new();
         // A real query, not a bare load: an empty database has nothing memoized
         // and every row would read as zero.
@@ -1213,54 +1269,17 @@ pub fn first() {
         let canonical = project
             .canonicalize()
             .expect("canonicalize the probe project");
-        let host = &service
-            .projects
-            .get(&canonical)
-            .expect("the query above must have cached a context for this path")
-            .host;
-        // `memory_usage` is implemented on `dyn Database`, not on the trait, so
-        // the unsize coercion here is required rather than stylistic.
-        let db: &dyn salsa::Database = host.raw_database();
-        let info = db.memory_usage();
-
-        /// One row of the breakdown, already flattened across salsa's two
-        /// families (input/interned structs and memoized query results).
-        struct Row {
-            family: &'static str,
-            name: &'static str,
-            count: usize,
-            stack: usize,
-            metadata: usize,
-            heap: Option<usize>,
-            page: Option<String>,
-        }
-
-        let mut rows: Vec<Row> = info
-            .structs
-            .iter()
-            .map(|ingredient| Row {
-                family: "struct",
-                name: ingredient.debug_name(),
-                count: ingredient.count(),
-                stack: ingredient.size_of_fields(),
-                metadata: ingredient.size_of_metadata(),
-                heap: ingredient.heap_size_of_fields(),
-                page: ingredient.page_info().map(|page| format!("{page:?}")),
-            })
-            .chain(info.queries.values().map(|ingredient| Row {
-                family: "query",
-                name: ingredient.debug_name(),
-                count: ingredient.count(),
-                stack: ingredient.size_of_fields(),
-                metadata: ingredient.size_of_metadata(),
-                heap: ingredient.heap_size_of_fields(),
-                page: None,
-            }))
-            .collect();
+        // Borrowed inline, not held: `collect_garbage` below needs `&mut` on the
+        // service, so no borrow of a host may outlive a single measurement.
+        let rows = breakdown(
+            &service
+                .projects
+                .get(&canonical)
+                .expect("the query above must have cached a context for this path")
+                .host,
+        );
 
         let bytes_of = |row: &Row| row.stack + row.metadata + row.heap.unwrap_or(0);
-        rows.sort_by(|a, b| bytes_of(b).cmp(&bytes_of(a)).then(b.count.cmp(&a.count)));
-
         let accounted: usize = rows.iter().map(bytes_of).sum();
         let with_heap = rows.iter().filter(|row| row.heap.is_some()).count();
         let instances: usize = rows.iter().map(|row| row.count).sum();
@@ -1280,12 +1299,12 @@ pub fn first() {
             rows.len(),
         );
         println!(
-            "{:<8} {:<52} {:>12} {:>12} {:>12} {:>12}",
-            "family", "ingredient", "count", "stack KiB", "meta KiB", "heap KiB"
+            "{:<8} {:<44} {:>10} {:>10} {:>10} {:>10}  {}",
+            "family", "query / struct", "count", "stack KiB", "meta KiB", "heap KiB", "produces"
         );
         for row in rows.iter().take(top) {
             println!(
-                "{:<8} {:<52} {:>12} {:>12} {:>12} {:>12}{}",
+                "{:<8} {:<44} {:>10} {:>10} {:>10} {:>10}  {}",
                 row.family,
                 row.name,
                 row.count,
@@ -1293,9 +1312,7 @@ pub fn first() {
                 row.metadata / 1024,
                 row.heap
                     .map_or("-".to_string(), |heap| (heap / 1024).to_string()),
-                row.page
-                    .as_deref()
-                    .map_or(String::new(), |page| format!("  {page}")),
+                row.produces.or(row.page.as_deref()).unwrap_or(""),
             );
         }
 
@@ -1315,6 +1332,106 @@ pub fn first() {
              before trusting it",
             accounted / (1024 * 1024),
             rss_kib / 1024,
+        );
+
+        // ---- the end-to-end positive control for the whole LRU + GC chain ----
+        //
+        // A capacity is declared on this query (512, restated in
+        // `update_base_query_lru_capacities`) but salsa only evicts inside
+        // `reset_for_new_revision`, so a database nobody writes to keeps every
+        // memo it ever made however small the capacity is. That is the entire
+        // reason `collect_garbage` exists; this asserts it in *counts*, which —
+        // unlike RSS — cannot be hidden by glibc holding freed pages.
+        // Ask the database which queries actually have a tunable capacity rather
+        // than trusting the names the fork hardcodes: salsa suffixes the
+        // generated ingredient of an *associated* tracked fn with `_`, so a
+        // hand-written `Type::method` matches nothing and only logs a warning
+        // nobody reads. This line is what makes that visible.
+        {
+            let db: &dyn salsa::Database = service
+                .projects
+                .get(&canonical)
+                .expect("context still cached")
+                .host
+                .raw_database();
+            let mut tunable = salsa::Database::lru_capacity_names(db);
+            tunable.sort_unstable();
+            println!("queries with a tunable LRU capacity: {tunable:?}");
+        }
+        {
+            // And the other half: that rust-analyzer's own configuration reaches
+            // those queries. It reports a miss only through `tracing::warn!`, and
+            // a warning in a daemon log is not an oracle — this turns the whole
+            // set of names into one red assertion.
+            let missed = service
+                .projects
+                .get_mut(&canonical)
+                .expect("context still cached")
+                .host
+                .raw_database_mut()
+                .update_base_query_lru_capacities(None);
+            assert_eq!(
+                missed, 0,
+                "rust-analyzer asked for {missed} LRU capacities that match no query in this \
+                 database; the knob looks alive and retunes nothing (see the printed list of \
+                 tunable names just above for what it should have said)"
+            );
+        }
+
+        // The salsa `debug_name` of a tracked query, which is what the capacity
+        // is addressed by. Associated tracked fns carry a trailing `_` — the
+        // macro's own name for the generated ingredient — so the readable
+        // `Body::with_source_map` matches nothing at all.
+        const CAPPED_QUERY: &str = "Body::with_source_map_";
+        const DECLARED_CAP: usize = 512;
+        let row_of = |rows: &[Row], query: &str| {
+            rows.iter()
+                .find(|row| row.family == "query" && row.name == query)
+                .map(|row| (row.count, row.heap))
+        };
+        let (before, heap_before) = row_of(&rows, CAPPED_QUERY).unwrap_or_else(|| {
+            panic!(
+                "no query named `{CAPPED_QUERY}` in the breakdown — upstream renamed it, and \
+                 `update_base_query_lru_capacities` is now setting a capacity on nothing"
+            )
+        });
+        assert!(
+            before > DECLARED_CAP,
+            "the probe workspace memoized only {before} bodies, at or under the {DECLARED_CAP} \
+             capacity — eviction has nothing to do here, so a pass below would prove nothing; \
+             point RMC_SALSA_MEMORY_PROJECT at a bigger workspace"
+        );
+
+        service.collect_garbage();
+
+        let after_rows = breakdown(
+            &service
+                .projects
+                .get(&canonical)
+                .expect("collecting garbage must not drop the context")
+                .host,
+        );
+        let (after, heap_after) = row_of(&after_rows, CAPPED_QUERY).unwrap_or((0, None));
+        println!(
+            "after collect_garbage: `{CAPPED_QUERY}` {before} -> {after} memo slot(s), heap \
+             {heap_before:?} -> {heap_after:?} (cap {DECLARED_CAP}); RSS {} MB",
+            crate::mcp::memory::rss_kib().unwrap_or(0) / 1024,
+        );
+        // Why the *slot count* cannot be the oracle: evicting a memo sets its
+        // value to `None` and keeps the slot (`function/memo.rs`, `map_memo`), so
+        // the count is unchanged whether eviction ran or not. What does move is
+        // the reported heap: a memo with no value reports `Some(0)`, a live one
+        // reports `None` while rust-analyzer declares no `heap_size` anywhere. So
+        // `None -> Some(0)` on this ingredient means "at least one value was
+        // actually dropped", and it is the only allocator-independent signal
+        // available — RSS cannot serve, because glibc need not return the pages.
+        assert_eq!(
+            heap_after,
+            Some(0),
+            "`{CAPPED_QUERY}` holds {after} memo slots against a capacity of {DECLARED_CAP}, and \
+             after a garbage collection not one of them has had its value dropped (heap still \
+             {heap_before:?}): the capacity is declared but nothing enforces it, which is exactly \
+             the defect this whole chain exists to fix"
         );
     }
 
