@@ -285,6 +285,17 @@ impl SearchToolRouter {
         crate::tools::endpoints::runtime::runtime_status(&self.runtime, params).await
     }
 
+    /// Report per-query memory of one loaded rust-analyzer analysis
+    #[tool(
+        description = "Report what a LOADED rust-analyzer analysis is holding, per salsa ingredient: memo count, stack, metadata, and — for the queries that declare a heap size — the heap behind them, largest first. Reads a live analysis and refuses to load one, because a database built to answer the question measures a cold start instead of the daemon. `heap` is absent where nothing measures it (counted, not weighed) and a lower bound where present, so compare `accounted_bytes` against `rss_kib` rather than treating it as a budget."
+    )]
+    async fn analysis_memory(
+        &self,
+        Parameters(params): Parameters<crate::tools::endpoints::runtime::AnalysisMemoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::tools::endpoints::runtime::analysis_memory(&self.runtime, params).await
+    }
+
     /// Clear runtime-owned in-memory caches and sync tracking
     #[tool(
         description = "Clear MCP runtime caches and sync tracking. scope values: all, workspace, semantic_only, search_cache_only, sync_tracking_only. Pass workspace to target one workspace. This does not stop the background sync task; process shutdown cancels tasks through ServerRuntime."

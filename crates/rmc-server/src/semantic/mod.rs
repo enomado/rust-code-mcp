@@ -387,7 +387,13 @@ impl SemanticService {
     /// the `unsafe` really demands is that no query be *in flight*, holding a
     /// type it has not recorded anywhere yet. Every path into this service goes
     /// through one `Mutex<SemanticService>`, and this method needs `&mut self`,
-    /// so holding that lock means no analysis is running in any project.
+    /// so holding that lock means no analysis is running *in this service*.
+    ///
+    /// That is not the whole process, though — the graph tools, the audits and
+    /// the skeleton builder each load a rust-analyzer workspace outside this
+    /// service. What covers them is the gate in [`crate::deep_stack`], which
+    /// the caller enters exclusively for this call; see
+    /// `RuntimeState::collect_garbage`.
     ///
     /// # Cost
     ///
@@ -667,6 +673,16 @@ impl SemanticService {
     }
 
     /// Search for symbols by name with optional full-name filtering.
+    ///
+    /// # Why a `Fast` context still answers
+    ///
+    /// Unlike `find_references_by_name_with_exact`, this one does not need the
+    /// dependency edges a `Fast` load throws away: a declaration lives in
+    /// exactly one crate, and every workspace member's own sources are loaded
+    /// either way. What `Fast` does cost here is the same as everywhere else —
+    /// `cfg(test)` is off, so a type declared inside a `#[cfg(test)]` module is
+    /// not in the module tree and cannot be found. That is the pre-existing
+    /// behaviour for every kind of symbol, not something the field path adds.
     pub(crate) fn symbol_search_with_exact(
         &mut self,
         project_path: &Path,
@@ -680,7 +696,14 @@ impl SemanticService {
         let ctx = self.projects.get(&canonical)
             .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
 
-        position::symbol_search_with_exact(&ctx.host, &ctx.vfs, symbol_name, limit, exact)
+        position::symbol_search_with_exact(
+            &ctx.host,
+            &ctx.vfs,
+            &canonical,
+            symbol_name,
+            limit,
+            exact,
+        )
     }
 
     /// Find all references to symbols matching a name
