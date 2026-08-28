@@ -70,6 +70,32 @@ fn enter_exclusive() -> RwLockWriteGuard<'static, ()> {
     ANALYSIS_GATE.write().unwrap_or_else(|error| error.into_inner())
 }
 
+/// The same gate, for tests that drive a `SemanticService` directly instead of
+/// through [`run_analysis`].
+///
+/// Those tests hold a loaded analysis for their whole body and the collection
+/// tests call `collect_garbage` without going through
+/// [`run_exclusive_analysis`] — so neither side takes this gate on its own, and
+/// the sweep is free to land inside someone else's analysis. It does not fail an
+/// assertion when it does; it takes a SIGSEGV and the whole test binary with it,
+/// reported as "the suite crashed" with no clue which pair collided.
+///
+/// There used to be a second `RwLock` inside `semantic::tests` doing this job.
+/// Two locks that must agree and cannot see each other agreed only by luck:
+/// the heaviest analysis in the suite lives in `tools::graph::tests`, on the
+/// other side of the divide, and the crash arrived the day something shifted the
+/// schedule. One gate, the real one, or none.
+#[cfg(test)]
+pub(crate) fn test_holding_an_analysis() -> RwLockReadGuard<'static, ()> {
+    enter_shared()
+}
+
+/// "I am the sweep" — see [`test_holding_an_analysis`].
+#[cfg(test)]
+pub(crate) fn test_sweeping_alone() -> RwLockWriteGuard<'static, ()> {
+    enter_exclusive()
+}
+
 /// Either kind of gate guard, so one spawn path can hold whichever it took.
 enum GateGuard {
     Shared(RwLockReadGuard<'static, ()>),
