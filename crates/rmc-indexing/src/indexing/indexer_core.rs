@@ -41,6 +41,7 @@ use crate::indexing::file_processor::FileProcessor;
 use crate::indexing::IndexingError;
 use crate::metadata_cache::MetadataCache;
 use rmc_engine::parser::RustParser;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -102,10 +103,12 @@ impl IndexerCore {
             .with_env_overrides();
 
         let chunk_split_config = chunk_split_config_from(&config);
+        // Salt namespaces the shared per-directory sled cache by
+        // embedder + chunking; see `identity::metadata_cache_salt`.
         let file_processor = FileProcessor::with_cache_key_salt(
             cache_path,
             config.max_file_size,
-            config.chunking_cache_salt(),
+            crate::indexing::identity::metadata_cache_salt(&backend, &config.chunking_cache_salt()),
         )?;
         let chunker = Chunker::new();
 
@@ -213,6 +216,17 @@ impl IndexerCore {
     /// Clear metadata cache
     pub(crate) fn clear_metadata_cache(&self) -> Result<(), IndexingError> {
         self.file_processor.clear_metadata_cache()
+    }
+
+    /// File paths the metadata cache considers already indexed, for this
+    /// embedder+chunking identity.
+    pub(crate) fn cached_paths(&self) -> Result<HashSet<String>, IndexingError> {
+        self.file_processor.cached_paths()
+    }
+
+    /// Drop one file's cache entry so the next run re-embeds it.
+    pub(crate) fn forget_file(&self, file_path: &Path) -> Result<(), IndexingError> {
+        self.file_processor.forget_file(file_path)
     }
 
     // --- Orchestration (uses FileProcessor + Chunker) ---

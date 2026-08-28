@@ -28,6 +28,41 @@ embeddings-cuda = [
   "fastembed/qwen3",
   "fastembed/cuda",
 ]
+# AMD GPU via the ONNX Runtime MIGraphX EP (measured on RX 7700 XT / gfx1101: ×32 vs
+# CPU on BGE-small fp32, batch 32x512). The ROCm EP is NOT added here on purpose: it
+# is deprecated in ORT, and system builds simply don't have it:
+# libonnxruntime_providers_rocm.so is not shipped, only migraphx is.
+#
+# The feature is additive to `embeddings`: the CPU profile keeps working in the same
+# build, GPU is a separate profile. The downloaded `ort-download-binaries` archive is
+# not used in that case (load-dynamic loads the system library), but it does not
+# get in the way either, so features stay additive, as cargo requires.
+embeddings-migraphx = [
+  "embeddings",
+  "dep:ort",
+  "ort/migraphx",
+  # Compiled-kernel cache directory; see ensure_migraphx_kernel_cache().
+  "dep:directories",
+]
+# AMD (and any other DX12) GPU on WINDOWS, via the DirectML EP.
+#
+# A separate feature rather than 'GPU in general', because MIGraphX does NOT exist on
+# Windows: not all of the ROCm stack has been ported to Windows, MIGraphX is not part of
+# the ported set (ROCm/TheRock#1912 is open), and the only AMD plugin EP for ORT
+# that made it to Windows is DirectML. So this is not 'a second way to do the same', but
+# the ONLY way to compute embeddings inside the tool on Windows.
+#
+# `fastembed/directml` is required, and not for the EP: through it the vendored fastembed
+# recognizes DirectML in the provider list and disables memory pattern + parallel
+# execution (init_session_builder), which the DirectML EP does not survive. Taking
+# `ort/directml` without it means building a session that crashes or silently
+# degrades, and not in this file.
+embeddings-directml = [
+  "embeddings",
+  "dep:ort",
+  "ort/directml",
+  "fastembed/directml",
+]
 vector-store = [
   "embeddings",
   "dep:lancedb",
@@ -60,6 +95,7 @@ uuid  = { workspace = true }
 reqwest     = { workspace = true, optional = true }
 hf-hub      = { workspace = true, optional = true }
 fastembed   = { workspace = true, optional = true }
+ort         = { workspace = true, optional = true }
 candle-core = { workspace = true, optional = true }
 tokenizers  = { workspace = true, optional = true }
 serde_json  = { workspace = true }

@@ -3,27 +3,28 @@
 //! Embedded vector database using Apache Arrow for columnar storage.
 //! No external server required - direct file access.
 
-use async_trait::async_trait;
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
     StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
+use async_trait::async_trait;
 use futures::TryStreamExt;
-use lancedb::connect;
-use lancedb::index::scalar::BTreeIndexBuilder;
-use lancedb::index::Index;
-use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::DistanceType;
+use lancedb::connect;
+use lancedb::index::Index;
+use lancedb::index::scalar::BTreeIndexBuilder;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::chunker::{ChunkId, CodeChunk};
-use crate::embeddings::Embedding;
+use super::VectorSearchResult;
 use super::error::VectorStoreError;
 use super::traits::VectorStoreBackend;
-use super::VectorSearchResult;
+use crate::chunker::{ChunkId, CodeChunk};
+use crate::embeddings::Embedding;
 
 const TABLE_NAME: &str = "vectors";
 const METADATA_FILE: &str = "metadata.json";
@@ -288,7 +289,8 @@ impl LanceDbBackend {
             let batches: Box<dyn RecordBatchReader + Send> =
                 Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema));
 
-            let table = self.db
+            let table = self
+                .db
                 .create_table(&self.table_name, batches)
                 .execute()
                 .await
@@ -357,11 +359,9 @@ impl LanceDbBackend {
         for (id, embedding, chunk) in chunks {
             ids.push(id.to_string());
             flat_vectors.extend_from_slice(embedding);
-            chunk_jsons.push(
-                serde_json::to_string(chunk).map_err(|e| {
-                    VectorStoreError::serialization(format!("Failed to serialize chunk: {}", e))
-                })?,
-            );
+            chunk_jsons.push(serde_json::to_string(chunk).map_err(|e| {
+                VectorStoreError::serialization(format!("Failed to serialize chunk: {}", e))
+            })?);
             file_paths.push(chunk.context.file_path.display().to_string());
             symbol_kinds.push(chunk.context.symbol_kind.clone());
             module_paths.push(chunk.context.module_path.join("::"));
@@ -525,7 +525,10 @@ impl VectorStoreBackend for LanceDbBackend {
         let table = self.get_table().await?;
 
         // Build filter for deletion
-        let ids: Vec<String> = chunk_ids.iter().map(|id| format!("'{}'", id.to_string())).collect();
+        let ids: Vec<String> = chunk_ids
+            .iter()
+            .map(|id| format!("'{}'", id.to_string()))
+            .collect();
         let filter = format!("id IN ({})", ids.join(", "));
 
         table
@@ -562,6 +565,47 @@ impl VectorStoreBackend for LanceDbBackend {
             .map_err(|e| VectorStoreError::query(format!("Failed to count rows: {}", e)))?;
 
         Ok(count)
+    }
+
+    async fn indexed_file_paths(&self) -> Result<HashSet<String>, VectorStoreError> {
+        let table = self.get_table().await?;
+
+        // Column projection matters here: the table also holds the
+        // vectors and the serialized chunk JSON, and pulling those to
+        // count files would read hundreds of megabytes to answer a
+        // question about a single string column.
+        let stream = table
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "file_path".to_string(),
+            ]))
+            .execute()
+            .await
+            .map_err(|e| {
+                VectorStoreError::query(format!("Failed to scan file_path column: {}", e))
+            })?;
+
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
+            VectorStoreError::query(format!("Failed to collect file_path batches: {}", e))
+        })?;
+
+        let mut paths = HashSet::new();
+        for batch in batches {
+            let column = batch
+                .column_by_name("file_path")
+                .ok_or_else(|| VectorStoreError::query("Missing file_path column"))?;
+            let array = column
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| VectorStoreError::query("file_path column is not Utf8"))?;
+            for i in 0..array.len() {
+                if array.is_valid(i) {
+                    paths.insert(array.value(i).to_string());
+                }
+            }
+        }
+
+        Ok(paths)
     }
 
     async fn clear(&self) -> Result<(), VectorStoreError> {

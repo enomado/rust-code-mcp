@@ -18,7 +18,7 @@ pub use backend::{EmbeddingBackend, EmbeddingRuntime};
 
 mod profile;
 pub use profile::{EmbeddingProfile, Qwen3Variant};
-pub use profile::{FastembedCpuModel, LocalLoaderSpec, QueryPolicy};
+pub use profile::{FastembedOnnxModel, LocalLoaderSpec, QueryPolicy};
 
 mod identity;
 
@@ -28,7 +28,28 @@ mod util;
 mod profile_registry;
 pub use profile_registry::resolve_profile;
 
-mod fastembed_cpu;
+mod ep_census;
+pub use ep_census::{ProviderCensus, CPU_EP, DIRECTML_EP, MIGRAPHX_EP};
+
+mod kernel_cache;
+
+mod fastembed_onnx;
+
+/// Census of graph nodes per execution provider, taken from one profiled
+/// run of the selected profile.
+///
+/// Answers the question `error_on_failure()` does not answer: not
+/// whether the EP came up, but whether it got any nodes. Expensive (a separate session;
+/// on a cold kernel cache, a MIGraphX compile), so it is called only through an explicit
+/// switch, not on every startup.
+///
+/// Non-fastembed-ONNX profiles (Qwen3/OpenRouter) refuse: they have no
+/// ORT session, and therefore no profile to compute the census from.
+pub fn probe_provider_census(
+    backend: &EmbeddingBackend,
+) -> Result<ProviderCensus, EmbeddingError> {
+    fastembed_onnx::probe_provider_census(backend)
+}
 mod openrouter;
 pub use openrouter::{
     openrouter_runtime_config, OpenRouterEncodingFormat, OpenRouterProviderPreferences,
@@ -67,7 +88,7 @@ pub struct EmbeddingGenerator {
 enum EmbeddingGeneratorInner {
     #[cfg(feature = "embeddings-cuda")]
     Qwen3(Arc<qwen3::Qwen3Embedder>),
-    FastembedCpu(Arc<fastembed_cpu::FastembedCpuEmbedder>),
+    FastembedOnnx(Arc<fastembed_onnx::FastembedOnnxEmbedder>),
     OpenRouter(Arc<openrouter::OpenRouterEmbedder>),
 }
 
@@ -96,9 +117,11 @@ impl EmbeddingGenerator {
             EmbeddingRuntime::OpenRouter => EmbeddingGeneratorInner::OpenRouter(Arc::new(
                 openrouter::OpenRouterEmbedder::new(&backend)?,
             )),
-            EmbeddingRuntime::LocalFastembedOnnxCpu => {
-                EmbeddingGeneratorInner::FastembedCpu(Arc::new(
-                    fastembed_cpu::FastembedCpuEmbedder::new(&backend)?,
+            EmbeddingRuntime::LocalFastembedOnnxCpu
+            | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+            | EmbeddingRuntime::LocalFastembedOnnxDirectml => {
+                EmbeddingGeneratorInner::FastembedOnnx(Arc::new(
+                    fastembed_onnx::FastembedOnnxEmbedder::new(&backend)?,
                 ))
             }
         };
@@ -110,7 +133,7 @@ impl EmbeddingGenerator {
         match &self.inner {
             #[cfg(feature = "embeddings-cuda")]
             EmbeddingGeneratorInner::Qwen3(inner) => inner.dim(),
-            EmbeddingGeneratorInner::FastembedCpu(inner) => inner.dim(),
+            EmbeddingGeneratorInner::FastembedOnnx(inner) => inner.dim(),
             EmbeddingGeneratorInner::OpenRouter(inner) => inner.dim(),
         }
     }
@@ -137,7 +160,7 @@ impl EmbeddingGenerator {
                 .await
                 .map_err(|e| EmbeddingError::task_join(e.to_string()))?
             }
-            EmbeddingGeneratorInner::FastembedCpu(inner) => {
+            EmbeddingGeneratorInner::FastembedOnnx(inner) => {
                 let inner = inner.clone();
                 tokio::task::spawn_blocking(move || {
                     let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
@@ -169,7 +192,7 @@ impl EmbeddingGenerator {
                 .await
                 .map_err(|e| EmbeddingError::task_join(e.to_string()))?
             }
-            EmbeddingGeneratorInner::FastembedCpu(inner) => {
+            EmbeddingGeneratorInner::FastembedOnnx(inner) => {
                 let inner = inner.clone();
                 tokio::task::spawn_blocking(move || {
                     let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();

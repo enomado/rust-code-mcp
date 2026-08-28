@@ -7,9 +7,16 @@ edition = "2024"
 rmc-server = { path = "../rmc-server" }
 
 rmcp = { workspace = true }
-tokio = { workspace = true }
+# net/time/io-util: shared-daemon transport (unix socket, startup wait, proxy).
+tokio = { workspace = true, features = ["net", "time", "io-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Lock around starting the daemon: without it two concurrent sessions would start two.
+fs2 = "0.4"
+# Socket key (project + env + binary version).
+sha2 = { workspace = true }
+# Global allocator behind the `mimalloc` feature; see its comment below.
+mimalloc = { version = "0.1", optional = true }
 
 [dev-dependencies]
 # Examples and integration tests moved here with the executable package, so they
@@ -71,3 +78,32 @@ embedded = []
 # GPU/CUDA embeddings (qwen3 reranker via candle). Requires nvcc/CUDA toolkit at build time.
 # Default build is CPU-only; opt in with `cargo build --release --features cuda`.
 cuda = ["rmc-server/cuda"]
+# AMD GPU (MIGraphX). Requires a system ONNX Runtime built with the MIGraphX EP.
+migraphx = ["rmc-server/migraphx"]
+# GPU on Windows (DirectML). Requires an ORT built with the DirectML EP: the DLL from NuGet
+# `Microsoft.ML.OnnxRuntime.DirectML`; no ROCm needed, it runs on DX12.
+directml = ["rmc-server/directml"]
+# mimalloc allocator instead of the system one.
+#
+# 🚨 MEASURED AND LOST: enable only with a new measurement under your own workload.
+#
+# The same work (loading RA over a workspace of ~4000 files, 13
+# definitions + 120 references), three builds, RSS in MB:
+#
+#             | start |  peak RA | AFTER unload
+#   glibc+trim|  2311 |     2466 |  1357
+#   mimalloc  |  2334 |     3535 |  2763
+#   +purge0   |  2337 |     3558 |  2666
+#
+# That is, glibc with `malloc_trim` settles TWICE as low. mimalloc reserves
+# more aggressively (peak a gigabyte higher) and holds more even with
+# `MIMALLOC_PURGE_DELAY=0`, which otherwise works: there it returned 860 MB
+# by itself, without our call.
+#
+# The feature is kept because the verdict is tied to THIS workload and this machine:
+# under a different profile (many workspaces, long lifetime, a different allocation stream)
+# the picture may flip. But the default is the system allocator.
+#
+# Why mimalloc and not jemalloc: `tikv-jemalloc-sys` does not build on
+# Windows, and the server is needed there too.
+mimalloc = ["dep:mimalloc", "rmc-server/mimalloc"]

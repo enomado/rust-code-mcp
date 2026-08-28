@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sled::Db;
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -150,6 +151,23 @@ impl MetadataCache {
         self.db.clear()
     }
 
+    /// Cached file paths belonging to one salt, with the salt prefix stripped.
+    ///
+    /// Cache keys are `{salt}::{path}` (see `FileProcessor::cache_key`), where
+    /// the salt is the embedder+chunking identity. One cache therefore holds
+    /// keys for several identities at once, and any caller reasoning about
+    /// "which files are done" must speak about a single salt — otherwise a
+    /// neighbouring profile's keys leak into the answer.
+    pub(crate) fn paths_for_salt(keys: Vec<String>, salt: &str) -> HashSet<String> {
+        if salt.is_empty() {
+            return keys.into_iter().collect();
+        }
+        let prefix = format!("{}::", salt);
+        keys.into_iter()
+            .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
+            .collect()
+    }
+
     /// Get total number of cached files
     pub(crate) fn len(&self) -> usize {
         self.db.len()
@@ -283,5 +301,36 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn paths_for_salt_keeps_only_its_own_salt() {
+        let keys = vec![
+            "saltA::/repo/a.rs".to_string(),
+            "saltB::/repo/b.rs".to_string(),
+            "saltA::/repo/c.rs".to_string(),
+            "/repo/unsalted.rs".to_string(),
+        ];
+
+        let mine = MetadataCache::paths_for_salt(keys, "saltA");
+
+        assert_eq!(mine.len(), 2);
+        assert!(mine.contains("/repo/a.rs"));
+        assert!(mine.contains("/repo/c.rs"));
+        // A neighbouring identity's entry says nothing about this index, and
+        // an unsalted key belongs to no identity at all.
+        assert!(!mine.contains("/repo/b.rs"));
+        assert!(!mine.contains("/repo/unsalted.rs"));
+    }
+
+    #[test]
+    fn paths_for_salt_without_salt_takes_every_key_verbatim() {
+        let keys = vec!["/repo/a.rs".to_string(), "saltA::/repo/b.rs".to_string()];
+
+        let all = MetadataCache::paths_for_salt(keys, "");
+
+        assert_eq!(all.len(), 2);
+        assert!(all.contains("/repo/a.rs"));
+        assert!(all.contains("saltA::/repo/b.rs"));
     }
 }

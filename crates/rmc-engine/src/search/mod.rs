@@ -4,6 +4,7 @@
 
 mod bm25;
 mod error;
+mod relevance;
 #[cfg(feature = "hybrid-search")]
 mod resilient;
 #[cfg(feature = "hybrid-search")]
@@ -11,6 +12,7 @@ mod rrf_tuner;
 
 pub use bm25::Bm25Search;
 pub use error::SearchError;
+pub use relevance::{CaseScore, RelevanceCase, RelevanceSummary, RepoRelPath, score_case};
 #[cfg(feature = "hybrid-search")]
 pub use resilient::ResilientHybridSearch;
 

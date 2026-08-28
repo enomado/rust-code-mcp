@@ -14,6 +14,7 @@ pub use traits::VectorStoreBackend;
 
 use crate::chunker::{ChunkId, CodeChunk};
 use crate::embeddings::{Embedding, EmbeddingBackend};
+use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -150,6 +151,14 @@ impl VectorStore {
     /// Get the total number of vectors in the store
     pub async fn count(&self) -> Result<usize, VectorStoreError> {
         self.backend.count().await
+    }
+
+    /// Distinct source files that have at least one vector in the store.
+    ///
+    /// The "actual" side of the coverage check — see
+    /// [`VectorStoreBackend::indexed_file_paths`].
+    pub async fn indexed_file_paths(&self) -> Result<HashSet<String>, VectorStoreError> {
+        self.backend.indexed_file_paths().await
     }
 
     /// Clear all vectors (keep collection/table structure)

@@ -15,6 +15,7 @@ pub mod project_paths;
 mod retry;
 pub mod search;
 mod tantivy_adapter;
+mod traversal;
 mod unified;
 mod unified_parallel;
 

@@ -7,10 +7,10 @@ use rmcp::{
     schemars, tool,
 };
 
-use rmc_engine::embeddings::EmbeddingBackend;
 use crate::mcp::project_paths::{
     ProjectPaths, data_dir, read_embedder_identity, resolve_embedding_backend_for_mcp,
 };
+use rmc_engine::embeddings::EmbeddingBackend;
 use rmc_engine::vector_store::VectorStore;
 use rmc_indexing::{
     indexing::open_bm25_search,
@@ -20,9 +20,13 @@ use rmc_indexing::{
 /// Health check parameters (optional directory to check specific project)
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct HealthCheckParams {
-    #[schemars(description = "Optional: project directory to check (checks system-wide if not provided)")]
+    #[schemars(
+        description = "Optional: project directory to check (checks system-wide if not provided)"
+    )]
     pub directory: Option<String>,
-    #[schemars(description = "Optional embedding profile (built-in name or one from embedding_profiles.toml). The BM25 index, vector store, and collection name are all keyed by the embedder identity, so this must match the profile the directory was indexed with. Default: local-cpu-small.")]
+    #[schemars(
+        description = "Optional embedding profile (built-in name or one from embedding_profiles.toml). The BM25 index, vector store, and collection name are all keyed by the embedder identity, so this must match the profile the directory was indexed with. Default: local-cpu-small."
+    )]
     #[serde(default)]
     pub embedding_profile: Option<String>,
 }
@@ -51,7 +55,9 @@ async fn open_vector_store_for_health(
 }
 
 /// Check system health status
-#[tool(description = "Check the health status of the code search system (BM25, Vector store, Merkle tree)")]
+#[tool(
+    description = "Check the health status of the code search system (BM25, Vector store, Merkle tree)"
+)]
 pub(crate) async fn health_check(
     Parameters(HealthCheckParams {
         directory,
@@ -68,36 +74,47 @@ pub(crate) async fn health_check(
     // on-disk `metadata.json` so the report reflects the real cached
     // identity.
     let root = directory.as_deref().unwrap_or(".");
-    let backend =
-        resolve_embedding_backend_for_mcp(embedding_profile.as_deref(), std::path::Path::new(root))?;
+    let backend = resolve_embedding_backend_for_mcp(
+        embedding_profile.as_deref(),
+        std::path::Path::new(root),
+    )?;
     let embedder_identity = backend.identity();
 
     // Determine paths using the same shared helper as index_tool.
-    let (bm25_path, merkle_path, collection_name) = if let Some(ref dir) = directory {
-        let dir_path = std::path::Path::new(dir);
-        let paths = ProjectPaths::from_directory(dir_path, &backend);
+    // `coverage_inputs` carries the project's metadata cache and the salt
+    // its keys are prefixed with — without them the coverage check has
+    // nothing to compare the store against and reports "unknown".
+    let (bm25_path, merkle_path, collection_name, coverage_inputs) =
+        if let Some(ref dir) = directory {
+            let dir_path = std::path::Path::new(dir);
+            let paths = ProjectPaths::from_directory(dir_path, &backend);
 
-        (
-            paths.tantivy_path,
-            paths.snapshot_path,
-            paths.collection_name,
-        )
-    } else {
-        // System-wide check: can't determine specific snapshot path
-        // Merkle snapshots are directory-specific, so this will report as missing
-        (
-            data_dir().join("index"),
-            std::path::PathBuf::from("/nonexistent/merkle.snapshot"),  // Sentinel value
-            "code_chunks_default".to_string(),
-        )
-    };
+            (
+                paths.tantivy_path,
+                paths.snapshot_path,
+                paths.collection_name,
+                Some((paths.cache_path, paths.metadata_cache_salt)),
+            )
+        } else {
+            // System-wide check: can't determine specific snapshot path
+            // Merkle snapshots are directory-specific, so this will report as missing
+            (
+                data_dir().join("index"),
+                std::path::PathBuf::from("/nonexistent/merkle.snapshot"), // Sentinel value
+                "code_chunks_default".to_string(),
+                None,
+            )
+        };
 
     // Initialize components (optional)
     let bm25 = open_bm25_search(&bm25_path).ok().map(std::sync::Arc::new);
 
     // Initialize embedded vector store (LanceDB)
     // Path must match unified.rs: cache_path.parent().join("vectors").join(collection_name)
-    let vector_path = data_dir().join("cache").join("vectors").join(&collection_name);
+    let vector_path = data_dir()
+        .join("cache")
+        .join("vectors")
+        .join(&collection_name);
 
     // On-disk identity, if any: the actual model that wrote this
     // index. May differ from `embedder_identity` (the configured
@@ -113,7 +130,10 @@ pub(crate) async fn health_check(
     .await;
 
     // Create health monitor
-    let monitor = HealthMonitor::new(bm25, vector_store, merkle_path);
+    let mut monitor = HealthMonitor::new(bm25, vector_store, merkle_path);
+    if let Some((cache_path, chunking_identity)) = coverage_inputs {
+        monitor = monitor.with_metadata_cache(cache_path, chunking_identity);
+    }
 
     // Run health check
     let health = monitor.check_health().await;
@@ -122,8 +142,8 @@ pub(crate) async fn health_check(
     // operators can confirm which model the cache will be keyed against.
     // Report both the configured default (what a fresh index would use)
     // and the on-disk model (what the existing index was built with).
-    let mut health_value = serde_json::to_value(&health)
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+    let mut health_value =
+        serde_json::to_value(&health).map_err(|e| McpError::internal_error(e.to_string(), None))?;
     if let Some(obj) = health_value.as_object_mut() {
         // `embedder` keeps its existing meaning: the currently configured
         // default. `embedder_on_disk` is new and reflects the actual
@@ -158,7 +178,9 @@ pub(crate) async fn health_check(
             response.push_str("✓ System Status: HEALTHY\n\n");
         }
         Status::Degraded => {
-            response.push_str("⚠ System Status: DEGRADED (some components unavailable but system functional)\n\n");
+            response.push_str(
+                "⚠ System Status: DEGRADED (some components unavailable but system functional)\n\n",
+            );
         }
         Status::Unhealthy => {
             response.push_str("✗ System Status: UNHEALTHY (critical components failing)\n\n");
@@ -170,6 +192,8 @@ pub(crate) async fn health_check(
     response.push_str("- Healthy: All components operational\n");
     response.push_str("- Degraded: One search engine down OR Merkle snapshot missing\n");
     response.push_str("- Unhealthy: Both BM25 and Vector search are down\n");
+    response.push_str("- Coverage: files the indexer will SKIP as unchanged, but for which the store holds no vectors.\n");
+    response.push_str("  Non-zero `stale_skips` = index silently incomplete (a run died halfway); fix with index_codebase force_reindex: true.\n");
     response.push_str("\nNote: Merkle snapshots are directory-specific. Use 'directory' parameter for accurate check.\n");
 
     if let Some(ref dir) = directory {
@@ -193,13 +217,9 @@ mod tests {
         let backend = EmbeddingBackend::default();
         let embedder_identity = backend.identity();
 
-        let vector_store = open_vector_store_for_health(
-            vector_path.clone(),
-            &backend,
-            &embedder_identity,
-            None,
-        )
-        .await;
+        let vector_store =
+            open_vector_store_for_health(vector_path.clone(), &backend, &embedder_identity, None)
+                .await;
 
         assert!(vector_store.is_none());
         assert!(!vector_path.exists());
