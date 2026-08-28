@@ -50,9 +50,22 @@
 //! knowing this measured a knob that had quietly turned itself off — which is
 //! how the first run of these tests failed.
 //!
-//! Hence the protocol: every capacity is applied, then *exercised*, and only
-//! then collected. That is also what production does, where the capacity is set
-//! before the workspace is read rather than in the middle of its life.
+//! That damage outlives the row it happens in: every capacity priced after a
+//! zero can only evict what has been *used since*, which on this workload is
+//! almost nothing (see the cost end below), so those rows read as "the knob
+//! stopped working". A sweep therefore refuses a zero in its list — see
+//! [`sweep_capacities`] — and the zero case is measured on its own instead.
+//!
+//! # Where the cost actually falls
+//!
+//! Not on repeats, which is where this module first looked for it. Measured:
+//! evicting 12.2 MB of parse trees down to one and then repeating the very same
+//! reference search costs *nothing* and brings *nothing* back — both read paths
+//! of this daemon are answered out of memos above the parse query, and
+//! re-validating those against unchanged files never asks for a tree again. What
+//! pays is a **change**: after one edited file, 0.77 MB of the 12.2 came back.
+//! So a smaller parse capacity charges the daemon on the queries that follow an
+//! edit, and only for what the edit invalidated.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -162,9 +175,14 @@ pub(super) struct Priced {
     /// What the whole breakdown can see after the collection. Not a budget — see
     /// `memory_breakdown` for why the gap to RSS is the finding, not a defect.
     pub accounted_after: usize,
-    /// The probe run under this capacity *before* the collection: it records the
-    /// uses eviction needs, and its time is the reference the rebuild is read
-    /// against — the same query on the same database with nothing thrown away.
+    /// The probe run under this capacity *before* the collection — the row's own
+    /// reference point: the same query, on the same database, with nothing
+    /// thrown away yet.
+    ///
+    /// No assertion judges it; it is a measurement, and the module says so
+    /// rather than implying coverage it does not have. It was written believing
+    /// it also re-recorded the uses eviction sorts by, which a mutation
+    /// disproved — a repeat fetches no parse memos, so it records none.
     pub settle: Duration,
     /// First repeat of the probe, paying for whatever was evicted…
     pub rebuild: Duration,
@@ -210,6 +228,36 @@ fn rows_of(service: &SemanticService, canonical: &Path) -> Vec<IngredientMemory>
     )
 }
 
+/// The capacities a sweep will walk, led by `None` — the capacity the daemon
+/// runs at today, which is the row every decision is measured against.
+///
+/// Rejects a zero rather than pricing it. Zero does not evict, and worse, it
+/// clears the recorded use order (module docs), so every row after it can only
+/// evict what has been used since and reads as a knob that stopped working. A
+/// sweep that quietly printed those rows would be worse than one that refuses.
+pub(super) fn sweep_capacities(spec: &str) -> Vec<Option<u16>> {
+    let mut capacities = vec![None];
+    for value in spec.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+        let capacity: u16 = value.parse().unwrap_or_else(|_| {
+            panic!("RMC_LRU_SWEEP holds {value:?}, which is not a capacity; use whole numbers")
+        });
+        assert!(
+            capacity > 0,
+            "RMC_LRU_SWEEP asks for a capacity of 0. Zero DISABLES eviction rather than emptying \
+             the cache, and it also drops salsa's record of which memos were used, so every row \
+             priced after it would understate what a capacity frees. The smallest cache that \
+             still evicts is 1; the zero case has its own test"
+        );
+        capacities.push(Some(capacity));
+    }
+    assert!(
+        capacities.len() > 1,
+        "RMC_LRU_SWEEP named no capacity to price, so the sweep would report only the default \
+         row and prove nothing about the knob"
+    );
+    capacities
+}
+
 /// Set the base capacity on a loaded analysis, exactly as `RootDatabase::new`
 /// does with `RA_LRU_CAP`. `None` means the default the daemon runs at.
 ///
@@ -241,14 +289,13 @@ pub(super) fn parse_bytes(service: &SemanticService, canonical: &Path) -> (usize
     query_bytes(&rows_of(service, canonical), PARSE_QUERY)
 }
 
-/// Apply one capacity to an already-loaded analysis, exercise it, collect, and
-/// time the rebuild.
+/// Apply one capacity to an already-loaded analysis, collect, and time what the
+/// queries around the collection cost.
 ///
-/// The probe runs three times: once under the new capacity before the
-/// collection (which both records the uses eviction sorts by — see the module
-/// docs on what a zero capacity forgets — and times the query with nothing
-/// thrown away), once immediately after the collection, and once more with the
-/// caches full again.
+/// The probe runs three times: once under the new capacity before the collection
+/// (the row's reference time), once immediately after it, and once more with the
+/// caches full again. Three rather than two so that every row can be read on its
+/// own instead of against the row above it.
 pub(super) fn price_capacity(
     service: &mut SemanticService,
     project: &Path,
@@ -374,6 +421,17 @@ path = "src/lib.rs"
         root.to_path_buf()
     }
 
+    /// Change one file of the fixture, leaving `probe_target0` and its use site
+    /// alone: what the tests want from an edit is the invalidation, not a
+    /// different answer.
+    fn edit_a_file(root: &Path) {
+        fs::write(
+            root.join("src/part3.rs"),
+            "pub fn probe_target3() -> u32 {\n    3\n}\n\npub fn added_by_the_edit() {}\n",
+        )
+        .expect("edit a fixture file");
+    }
+
     /// Load the fixture and answer one query, so that the database has something
     /// memoized before any capacity is priced.
     fn probed_service(root: &Path) -> (SemanticService, Probe) {
@@ -396,6 +454,31 @@ path = "src/lib.rs"
             priced.parse_memos
         );
         priced
+    }
+
+    /// The sweep's list, and the one value it must refuse. Cheap — no workspace
+    /// — because what it guards is a reading error, not a rust-analyzer
+    /// behaviour: a zero row poisons every row printed after it.
+    #[test]
+    fn a_sweep_list_leads_with_the_default_and_refuses_a_zero() {
+        assert_eq!(
+            super::sweep_capacities("128, 8,1"),
+            vec![None, Some(128), Some(8), Some(1)],
+            "the default capacity must lead the list: it is the row the others are read against"
+        );
+
+        let zero = std::panic::catch_unwind(|| super::sweep_capacities("32,0,8"));
+        assert!(
+            zero.is_err(),
+            "a sweep accepted a capacity of 0. It evicts nothing and clears the recorded use \
+             order, so the `8` row after it would have measured a knob that had turned itself off"
+        );
+        let empty = std::panic::catch_unwind(|| super::sweep_capacities(" , "));
+        assert!(
+            empty.is_err(),
+            "a sweep with no capacity in its list would print one default row and read as a \
+             finished measurement"
+        );
     }
 
     /// The memory end, and the trap in its units, judged as a pair on one
@@ -424,10 +507,24 @@ path = "src/lib.rs"
 
         // Zero disables eviction rather than emptying the cache. If this ever
         // starts freeing bytes, every sweep printed with a zero row has been
-        // reading backwards. The probe inside `price_capacity` has refilled the
-        // parse cache since the eviction above, so there is again something a
-        // capacity could throw away — which is what makes this half honest.
+        // reading backwards.
+        //
+        // The edit is what makes this half mean anything, and it was added
+        // because a mutation proved the half vacuous without it: repeating a
+        // query does NOT refill the parse cache (see
+        // `a_repeat_after_eviction_pays_nothing_...`), so after the eviction
+        // above there was nothing left for a zero to wrongly throw away, and a
+        // zero behaving exactly like a one would still have passed.
+        edit_a_file(&root);
+        probe.run(&mut service, &root);
         let disabled = priced(&mut service, &root, &probe, Some(0));
+        assert!(
+            disabled.parse_heap_before > evicting.parse_heap_after,
+            "the edit brought no parse trees back ({} bytes, against {} left by the eviction), so \
+             a zero capacity has nothing it could wrongly evict and the check below is empty",
+            disabled.parse_heap_before,
+            evicting.parse_heap_after
+        );
         assert!(
             disabled.parse_heap_after >= disabled.parse_heap_before,
             "a capacity of zero freed {} bytes of parse trees; zero DISABLES eviction — the \
@@ -472,56 +569,96 @@ path = "src/lib.rs"
             heap_before.saturating_sub(heap_after)
         );
 
-        // And the other half: once queries run under the restored capacity, it
-        // evicts again. Without this the test would also pass on a capacity that
-        // stayed broken forever.
+        // And the other half: once something makes the queries fetch parse trees
+        // again, the restored capacity evicts. Without this the test would also
+        // pass on a capacity that stayed broken forever.
+        //
+        // An *edit*, not a repeat: a repeated query is answered out of the memos
+        // above the parse query and never fetches one, so it records no uses (see
+        // `a_repeat_after_eviction_pays_nothing_...` for that measured on its
+        // own). What is evicted below is therefore only what the edit touched —
+        // everything memoized before the zero stays untracked and unreachable
+        // for eviction, which is the shape of the damage a zero does.
+        edit_a_file(&root);
+        probe.run(&mut service, &root);
         let recovered = priced(&mut service, &root, &probe, Some(1));
         assert!(
             recovered.parse_heap_after < recovered.parse_heap_before,
-            "after exercising the restored capacity, a collection still freed nothing — the \
-             capacity did not come back at all, which is a different defect from forgetting"
+            "after fresh uses were recorded under the restored capacity, a collection still \
+             freed nothing — the capacity did not come back at all, which is a different defect \
+             from forgetting"
         );
     }
 
-    /// The cost end. A latency number is only a price if the time went into
-    /// rebuilding what was evicted, so this asserts the rebuild in bytes — the
-    /// clock alone cannot tell a rebuild from a slow machine.
+    /// The cost end, and it is not where it was expected to be.
     ///
-    /// The probe is `references`, not `symbols`, and the difference is the
-    /// finding rather than a preference: a repeated symbol search is answered
-    /// out of the memoized symbol index and never asks for a syntax tree, so
-    /// evicting every parse tree in the workspace costs it nothing at all. What
-    /// pays for the eviction is a query that reads sources — which is what the
-    /// reference sweep does, and what production's `find_references` is.
+    /// The sweep was written assuming that a query repeated after an eviction
+    /// pays to rebuild what was thrown away. Measured on this fixture, it pays
+    /// **nothing**: eviction takes 12.2 MB of parse trees down to one, and the
+    /// same reference search — the `find_references` production serves — answers
+    /// again with the table still at one. Both of this daemon's read paths are
+    /// answered out of memos that sit *above* the parse query (the symbol index,
+    /// item trees, def maps), and re-validating those against an unchanged file
+    /// never asks for the tree back.
     ///
-    /// The answer-stability check rides along deliberately: it is the same
-    /// question ("did the eviction change anything but timing") asked of the
-    /// other observable, and separating it would cost a second workspace load
-    /// for one assertion.
+    /// What does pay is a **change**. The edit below brings 0.77 MB of the 12.2
+    /// back — the file that moved plus what its invalidation forced to recompute
+    /// — and that is where a smaller parse capacity would charge the daemon.
+    ///
+    /// So the pair below is the finding and its positive control: the equality
+    /// is the claim ("a repeat is free"), and the edit is what makes the equality
+    /// mean something rather than being satisfied by a measurement that can see
+    /// nothing at all.
     #[test]
-    fn the_rebuild_that_the_latency_prices_actually_happens() {
+    fn a_repeat_after_eviction_pays_nothing_and_an_edit_is_what_pays() {
         let _sweep = sweeping_alone();
         let workspace = tempfile::tempdir().expect("create workspace tempdir");
         let root = many_file_workspace(workspace.path());
         let (mut service, _) = probed_service(&root);
+        let canonical = root.canonicalize().expect("canonicalize the fixture");
         let probe = Probe::References { name: "probe_target0".to_string() };
 
-        let baseline = priced(&mut service, &root, &probe, None);
+        // The answer to hold every later one against, taken from a plain run
+        // rather than from a priced row: this test is about cost, and a second
+        // priced capacity would cost three more probe runs to learn nothing.
+        let baseline_answers = probe.run(&mut service, &root);
         let evicting = priced(&mut service, &root, &probe, Some(1));
-
         assert!(
-            evicting.parse_heap_rebuilt > evicting.parse_heap_after,
-            "after eviction left {} parse bytes, repeating the probe brought it to {} — nothing \
-             was rebuilt, so the {} µs it took price nothing",
+            evicting.parse_heap_after < evicting.parse_heap_before / 2,
+            "eviction at a capacity of one left {} of {} parse bytes; the rest of this test is \
+             about what a *thorough* eviction costs, and there was not one",
             evicting.parse_heap_after,
-            evicting.parse_heap_rebuilt,
-            evicting.rebuild.as_micros()
+            evicting.parse_heap_before
         );
         assert_eq!(
-            baseline.answers, evicting.answers,
+            evicting.parse_heap_rebuilt, evicting.parse_heap_after,
+            "repeating the probe after the eviction brought parse trees back, so a repeat is no \
+             longer free and the cost model in these docs is out of date: a smaller capacity now \
+             charges every query, not only the ones that follow a change"
+        );
+        assert_eq!(
+            baseline_answers, evicting.answers,
             "the probe found {} answers at the default capacity and {} at a capacity of one; \
              evicting a cache must cost time, never answers",
-            baseline.answers, evicting.answers
+            baseline_answers, evicting.answers
+        );
+
+        // The positive control: a change *is* paid for. Without this, a
+        // measurement that reported the same number forever would satisfy the
+        // equality above and read as "repeats are free".
+        let (_, before_edit) = super::parse_bytes(&service, &canonical);
+        edit_a_file(&root);
+        let after_edit_answers = probe.run(&mut service, &root);
+        let (_, after_edit) = super::parse_bytes(&service, &canonical);
+        assert!(
+            after_edit > before_edit,
+            "an edited file did not bring a single parse byte back ({before_edit} both before and \
+             after), so this test cannot see a rebuild at all and its equality above proves \
+             nothing"
+        );
+        assert_eq!(
+            baseline_answers, after_edit_answers,
+            "the edit was meant to change what the workspace costs, not what it answers"
         );
     }
 
@@ -564,17 +701,10 @@ path = "src/lib.rs"
         let project = PathBuf::from(project);
         let probe = Probe::from_env();
         // The default list brackets today's capacity (128) on the way down to the
-        // smallest cache that still evicts. `None` leads it: the row a decision
-        // is measured against is the one the daemon runs at now.
-        let capacities: Vec<Option<u16>> = std::iter::once(None)
-            .chain(
-                std::env::var("RMC_LRU_SWEEP")
-                    .unwrap_or_else(|_| "128,32,8,1".to_string())
-                    .split(',')
-                    .filter_map(|value| value.trim().parse::<u16>().ok())
-                    .map(Some),
-            )
-            .collect();
+        // smallest cache that still evicts.
+        let capacities = super::sweep_capacities(
+            &std::env::var("RMC_LRU_SWEEP").unwrap_or_else(|_| "128,32,8,1".to_string()),
+        );
 
         let mut service = SemanticService::new();
         let started = std::time::Instant::now();
