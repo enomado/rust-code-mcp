@@ -8,7 +8,7 @@ use serde::Serialize;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::deep_stack::run_analysis;
+use crate::deep_stack::run_exclusive_analysis;
 use crate::semantic::{SemanticService, SemanticServiceStatus};
 
 use super::memory::{MemoryRelease, release_and_measure, rss_kib};
@@ -201,10 +201,20 @@ impl RuntimeState {
     ///
     /// # Two things about *how* it is called
     ///
-    /// It runs on [`run_analysis`]'s thread, not on a runtime worker: the
-    /// interner sweep recurses over the shape of the analyzed types, and a
-    /// 2 MiB tokio stack is what took the whole server down with an `abort`
-    /// the last time rust-analyzer work was run on one.
+    /// It runs on the analysis thread, not on a runtime worker: the interner
+    /// sweep recurses over the shape of the analyzed types, and a 2 MiB tokio
+    /// stack is what took the whole server down with an `abort` the last time
+    /// rust-analyzer work was run on one.
+    ///
+    /// It takes that thread *exclusively*
+    /// ([`crate::deep_stack::run_exclusive_analysis`]). The paragraph below
+    /// argues the sweep is safe because every path into this service is behind
+    /// one mutex, and that much holds — but this service is not the only
+    /// rust-analyzer in the process: the graph tools, the audits and the
+    /// skeleton builder each load a workspace of their own, outside it, and
+    /// this method runs on a timer that knows nothing about them. The gate is
+    /// what makes "no query is in flight" true rather than assumed; without it
+    /// the overlap is a `SIGSEGV`, which is how it was found.
     ///
     /// It does *not* take the workspace locks that [`Self::clear`] takes. Those
     /// guard the search index and the sync manager, neither of which this
@@ -213,7 +223,7 @@ impl RuntimeState {
     /// the collection sound.
     pub async fn collect_garbage(&self) -> usize {
         let semantic = Arc::clone(&self.semantic);
-        match run_analysis("collect_garbage", move || {
+        match run_exclusive_analysis("collect_garbage", move || {
             semantic
                 .lock()
                 .expect("semantic service mutex poisoned")

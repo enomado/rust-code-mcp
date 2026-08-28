@@ -18,11 +18,63 @@
 //! caller can guard against. The work therefore carries its own stack instead
 //! of depending on whoever spawned it.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rmcp::ErrorData as McpError;
 
 use crate::semantic::SemanticService;
+
+/// Who may be inside rust-analyzer at the same time.
+///
+/// Ordinary analysis takes it shared; a garbage collection takes it
+/// exclusively, because its interner sweep is process-global and `unsafe`.
+///
+/// # The defect this closes
+///
+/// `hir::collect_ty_garbage` marks live types by refcount, so anything another
+/// `AnalysisHost` *stores* survives it. What it cannot see is a type held by a
+/// query still in flight — computed, not yet recorded anywhere. The collection
+/// was documented as safe because "every path into the semantic service goes
+/// through one mutex", and that much is true; what it missed is that the
+/// semantic service is not the only rust-analyzer in this process. The graph
+/// tools, the five audits and the skeleton builder each load a workspace of
+/// their own, outside that mutex, and the watchdog fires a collection on a
+/// timer — so a hypergraph build and a sweep could, and did, overlap.
+///
+/// The symptom is not a wrong answer: it is `SIGSEGV`, observed in a parallel
+/// test run of this crate (the same suite is green run single-threaded, and
+/// green again on a rerun, which is what a race looks like).
+///
+/// Making the gate live at this door rather than at the call sites is the point
+/// — [`run_analysis`] is already the one place all such work passes through, so
+/// a new tool gets the guarantee without knowing it exists.
+///
+/// # What it costs
+///
+/// Analyses still run concurrently with each other; what changed is that a
+/// collection waits for the ones already inside, and the ones arriving during
+/// that wait queue behind it. The collection is short and fires on a timer
+/// (`RMC_GC_INTERVAL_SECS`, 300s by default), so the added latency is bounded by
+/// one sweep — against a crash that takes the whole daemon with it.
+static ANALYSIS_GATE: RwLock<()> = RwLock::new(());
+
+/// Enter the gate shared. A poisoned gate is stepped over rather than
+/// propagated: it means some earlier analysis panicked, which says nothing
+/// about whether it is safe to run this one, and refusing every analysis
+/// afterwards would turn one failed tool call into a dead server.
+fn enter_shared() -> RwLockReadGuard<'static, ()> {
+    ANALYSIS_GATE.read().unwrap_or_else(|error| error.into_inner())
+}
+
+fn enter_exclusive() -> RwLockWriteGuard<'static, ()> {
+    ANALYSIS_GATE.write().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Either kind of gate guard, so one spawn path can hold whichever it took.
+enum GateGuard {
+    Shared(RwLockReadGuard<'static, ()>),
+    Exclusive(RwLockWriteGuard<'static, ()>),
+}
 
 /// Stack for the analysis thread.
 ///
@@ -43,11 +95,40 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    spawn_gated(what, work, false).await
+}
+
+/// Run rust-analyzer work that must be the *only* such work in the process.
+///
+/// The one caller is the garbage collection; see [`ANALYSIS_GATE`] for why it
+/// cannot share the process with an analysis in flight.
+pub(crate) async fn run_exclusive_analysis<T, F>(what: &'static str, work: F) -> Result<T, McpError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    spawn_gated(what, work, true).await
+}
+
+async fn spawn_gated<T, F>(what: &'static str, work: F, exclusive: bool) -> Result<T, McpError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("rmc-analysis".to_string())
         .stack_size(ANALYSIS_STACK_BYTES)
         .spawn(move || {
+            // Taken here rather than before the spawn: waiting for the gate is
+            // the analysis thread's business, and doing it in the caller would
+            // block a runtime worker on exactly what this module exists to keep
+            // off one.
+            let _guard = if exclusive {
+                GateGuard::Exclusive(enter_exclusive())
+            } else {
+                GateGuard::Shared(enter_shared())
+            };
             // A send error means the caller went away; nothing to report to.
             let _ = tx.send(work());
         })
@@ -99,6 +180,78 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gate, judged by the only thing that matters about it: exclusive work
+    /// must not *begin* while shared work is still inside.
+    ///
+    /// The shared side reports that it entered and then waits to be released;
+    /// the exclusive side stamps a flag the moment it starts. Between the two,
+    /// the test waits a bounded while for that flag *not* to appear.
+    ///
+    /// That wait is one-sided, which is what makes it an oracle rather than a
+    /// race: with the gate in place the flag can never be set before the
+    /// release however long we wait, because a write lock cannot be taken while
+    /// a read guard is held; without it, the flag appears as soon as the thread
+    /// is scheduled. The bound therefore decides only how quickly a broken
+    /// implementation is caught, never whether a correct one passes.
+    ///
+    /// The first version had no wait at all and passed under mutation — the
+    /// exclusive thread simply had not been scheduled yet by the time the test
+    /// released the shared side.
+    #[tokio::test]
+    async fn a_collection_waits_for_the_analysis_already_inside() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        static EXCLUSIVE_STARTED: AtomicBool = AtomicBool::new(false);
+        EXCLUSIVE_STARTED.store(false, Ordering::SeqCst);
+
+        // Entry is reported over a *tokio* channel and awaited, not received
+        // with a blocking `recv`: `#[tokio::test]` gives a single-threaded
+        // runtime, and a blocking wait on its thread would keep the very task
+        // that reports entry from ever being polled. (Learned the hard way —
+        // that version hung.) The release channel stays a blocking one, because
+        // the side that waits on it is the analysis thread, which is allowed to
+        // block and whose blocking is the point of the test.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let shared = tokio::spawn(run_analysis("shared", move || {
+            entered_tx.send(()).expect("report entry");
+            // Held until the test says otherwise: this is the window during
+            // which a collection must not run.
+            release_rx.recv().expect("wait for release");
+            EXCLUSIVE_STARTED.load(Ordering::SeqCst)
+        }));
+
+        entered_rx.await.expect("shared work entered the gate");
+
+        let exclusive = tokio::spawn(run_exclusive_analysis("exclusive", || {
+            EXCLUSIVE_STARTED.store(true, Ordering::SeqCst);
+        }));
+
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < deadline && !EXCLUSIVE_STARTED.load(Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        release_tx.send(()).expect("release the shared work");
+
+        let started_before_release = shared.await.expect("shared task").expect("shared analysis");
+        exclusive.await.expect("exclusive task").expect("exclusive analysis");
+
+        assert!(
+            !started_before_release,
+            "the collection ran while an analysis was still inside rust-analyzer — that overlap \
+             is the one the interner sweep cannot survive, and it shows up as a SIGSEGV rather \
+             than as a failed call"
+        );
+        assert!(
+            EXCLUSIVE_STARTED.load(Ordering::SeqCst),
+            "positive control: the exclusive work never ran at all, so the assertion above \
+             passed without proving anything"
+        );
+    }
 
     #[tokio::test]
     async fn a_result_travels_back_from_the_analysis_thread() {
