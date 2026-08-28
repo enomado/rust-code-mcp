@@ -7,6 +7,10 @@ edition = "2024"
 # CPU embeddings by default; opt into GPU with `--features cuda` (requires nvcc/CUDA toolkit).
 default = []
 cuda = ["rmc-engine/embeddings-cuda"]
+# AMD GPU через MIGraphX EP — см. rmc-engine/Cargo.toml.
+migraphx = ["rmc-engine/embeddings-migraphx"]
+# DirectML EP (винда) — см. rmc-engine/Cargo.toml.
+directml = ["rmc-engine/embeddings-directml"]
 
 [dependencies]
 # In-workspace dependencies

@@ -446,6 +446,66 @@ impl UnifiedIndexer {
         Ok(())
     }
 
+    /// Drop one file's metadata-cache entry, so a later run treats it as new.
+    ///
+    /// Used when a file leaves the tree: its chunks go from the stores, and
+    /// the cache entry must go with them.
+    pub fn forget_file(&self, file_path: &Path) -> Result<()> {
+        self.core.forget_file(file_path)?;
+        Ok(())
+    }
+
+    /// Forget cache entries whose file has no vectors in the store.
+    ///
+    /// These are the files `monitoring::health` reports as `stale_skips`: the
+    /// metadata cache says "done", the vector store holds nothing for them.
+    /// Two different histories end up here, and both are repaired the same way:
+    ///
+    /// - the file is GONE from the tree (renamed, deleted) and its entry
+    ///   outlived it — on the live rust_app index this was 38 of 39 cases;
+    /// - the file is still there but its vectors were lost after the cache
+    ///   entry was written (a run killed mid-flight, a collection rebuilt
+    ///   underneath) — the remaining 1 of 39.
+    ///
+    /// Either way the pair is self-sustaining: the cache entry makes every
+    /// later run skip the file, so the vectors are never rebuilt. Forgetting
+    /// the entry ends it — a live file gets re-embedded on the next walk, a
+    /// dead one simply stops being compared.
+    ///
+    /// Removing just those entries is what makes repair cheap: the rest of the
+    /// tree keeps its cache and is waved through by the stat check, so only
+    /// these files are re-embedded. Returns the paths that were forgotten.
+    pub async fn forget_files_without_vectors(&mut self) -> Result<Vec<String>> {
+        let cached = self.core.cached_paths()?;
+        let indexed = self
+            .vector_store
+            .indexed_file_paths()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list indexed files: {}", e))?;
+
+        let mut stale: Vec<String> = cached
+            .into_iter()
+            .filter(|path| !indexed.contains(path))
+            .collect();
+        stale.sort();
+
+        for path in &stale {
+            self.core.forget_file(Path::new(path))?;
+            tracing::debug!("Forgot stale cache entry: {}", path);
+        }
+
+        if stale.is_empty() {
+            tracing::info!("Coverage repair: no cached files are missing vectors");
+        } else {
+            tracing::info!(
+                "Coverage repair: forgot {} cache entries with no vectors",
+                stale.len()
+            );
+        }
+
+        Ok(stale)
+    }
+
     /// Get access to the Tantivy index for searching
     pub fn tantivy_index(&self) -> &Index {
         self.tantivy.index()

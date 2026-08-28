@@ -8,6 +8,7 @@ use crate::indexing::IndexingError;
 use crate::metadata_cache::MetadataCache;
 use crate::security::SecretsScanner;
 use crate::security::SensitiveFileFilter;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Handles file filtering, security scanning, and change detection.
@@ -131,6 +132,27 @@ impl FileProcessor {
         &self.metadata_cache
     }
 
+    /// File paths this processor's salt considers already indexed.
+    pub(crate) fn cached_paths(&self) -> Result<HashSet<String>, IndexingError> {
+        let keys = self
+            .metadata_cache
+            .list_files()
+            .map_err(|e| IndexingError::Cache(e.to_string()))?;
+        Ok(MetadataCache::paths_for_salt(keys, &self.cache_key_salt))
+    }
+
+    /// Drop this file's cache entry so the next run treats it as new.
+    ///
+    /// The cache entry is what makes `has_stat_changed` / `has_file_changed`
+    /// answer "unchanged"; removing it is the only way to make a file that is
+    /// byte-identical on disk be embedded again.
+    pub(crate) fn forget_file(&self, file_path: &Path) -> Result<(), IndexingError> {
+        let key = self.cache_key(file_path);
+        self.metadata_cache
+            .remove(&key)
+            .map_err(|e| IndexingError::Cache(e.to_string()))
+    }
+
     /// Clear metadata cache
     pub(crate) fn clear_metadata_cache(&self) -> Result<(), IndexingError> {
         self.metadata_cache
@@ -188,6 +210,55 @@ mod tests {
         let result = fp.should_process_file(&test_file);
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    /// A forgotten file must look brand new again — this is what makes both
+    /// the deletion path and `repair_coverage` work: without it the entry
+    /// keeps answering "unchanged" and the file is never embedded again.
+    #[test]
+    fn forget_file_makes_a_cached_file_look_new_again() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_path = temp_dir.path().join("cache");
+        let fp = FileProcessor::with_cache_key_salt(&cache_path, 10_000_000, "salt".to_string())
+            .unwrap();
+
+        let test_file = temp_dir.path().join("test.rs");
+        let content = "fn test() {}";
+        std::fs::write(&test_file, content).unwrap();
+
+        fp.update_file_metadata(&test_file, content).unwrap();
+        assert!(!fp.has_stat_changed(&test_file).unwrap());
+        assert!(fp.cached_paths().unwrap().contains(
+            test_file.to_string_lossy().as_ref()
+        ));
+
+        fp.forget_file(&test_file).unwrap();
+
+        assert!(fp.has_stat_changed(&test_file).unwrap());
+        assert!(fp.has_file_changed(&test_file, content).unwrap());
+        assert!(fp.cached_paths().unwrap().is_empty());
+    }
+
+    /// Forgetting one file must not touch its neighbours.
+    #[test]
+    fn forget_file_leaves_other_entries_alone() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_path = temp_dir.path().join("cache");
+        let fp = FileProcessor::with_cache_key_salt(&cache_path, 10_000_000, "salt".to_string())
+            .unwrap();
+
+        let kept = temp_dir.path().join("kept.rs");
+        let dropped = temp_dir.path().join("dropped.rs");
+        std::fs::write(&kept, "fn kept() {}").unwrap();
+        std::fs::write(&dropped, "fn dropped() {}").unwrap();
+        fp.update_file_metadata(&kept, "fn kept() {}").unwrap();
+        fp.update_file_metadata(&dropped, "fn dropped() {}").unwrap();
+
+        fp.forget_file(&dropped).unwrap();
+
+        let cached = fp.cached_paths().unwrap();
+        assert_eq!(cached.len(), 1);
+        assert!(cached.contains(kept.to_string_lossy().as_ref()));
     }
 
     #[test]

@@ -7,9 +7,16 @@ edition = "2024"
 rmc-server = { path = "../rmc-server" }
 
 rmcp = { workspace = true }
-tokio = { workspace = true }
+# net/time/io-util — транспорт общего демона (unix-сокет, ожидание старта, прокси).
+tokio = { workspace = true, features = ["net", "time", "io-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Лок вокруг «поднять демона»: без него две одновременные сессии поднимут двух.
+fs2 = "0.4"
+# Ключ сокета (проект + env + версия бинаря).
+sha2 = { workspace = true }
+# Глобальный аллокатор под фичей `mimalloc` — см. её комментарий ниже.
+mimalloc = { version = "0.1", optional = true }
 
 [dev-dependencies]
 # Examples and integration tests moved here with the executable package, so they
@@ -71,3 +78,32 @@ embedded = []
 # GPU/CUDA embeddings (qwen3 reranker via candle). Requires nvcc/CUDA toolkit at build time.
 # Default build is CPU-only; opt in with `cargo build --release --features cuda`.
 cuda = ["rmc-server/cuda"]
+# AMD GPU (MIGraphX). Требует системного ONNX Runtime со сборкой MIGraphX EP.
+migraphx = ["rmc-server/migraphx"]
+# GPU на винде (DirectML). Требует ORT со сборкой DirectML EP — DLL из NuGet
+# `Microsoft.ML.OnnxRuntime.DirectML`; ROCm не нужен, идёт на DX12.
+directml = ["rmc-server/directml"]
+# Аллокатор mimalloc вместо системного.
+#
+# 🚨 ЗАМЕРЕН И ПРОИГРАЛ — включать только с новым замером под свою нагрузку.
+#
+# Одна и та же работа (загрузка RA по воркспейсу в ~4000 файлов, 13
+# определений + 120 ссылок), три сборки, RSS в МБ:
+#
+#             | старт | пик с RA | ПОСЛЕ выгрузки
+#   glibc+trim|  2311 |     2466 |  1357
+#   mimalloc  |  2334 |     3535 |  2763
+#   +purge0   |  2337 |     3558 |  2666
+#
+# То есть glibc с `malloc_trim` оседает ВДВОЕ ниже. mimalloc резервирует
+# агрессивнее (пик на гигабайт выше) и держит больше даже с
+# `MIMALLOC_PURGE_DELAY=0`, который в остальном работает: там он вернул 860 МБ
+# сам, без нашего вызова.
+#
+# Фича оставлена, потому что вердикт привязан к ЭТОЙ нагрузке и этой машине —
+# на другом профиле (много воркспейсов, долгая жизнь, иной поток аллокаций)
+# картина может перевернуться. Но дефолт — системный аллокатор.
+#
+# Почему mimalloc, а не jemalloc: `tikv-jemalloc-sys` не собирается под
+# Windows, а сервер нужен и там.
+mimalloc = ["dep:mimalloc", "rmc-server/mimalloc"]

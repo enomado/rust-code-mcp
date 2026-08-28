@@ -3,11 +3,12 @@
 //! Defines the interface that all vector storage backends must implement.
 
 use async_trait::async_trait;
+use std::collections::HashSet;
 
+use super::VectorSearchResult;
+use super::error::VectorStoreError;
 use crate::chunker::{ChunkId, CodeChunk};
 use crate::embeddings::Embedding;
-use super::error::VectorStoreError;
-use super::VectorSearchResult;
 
 /// Trait for vector storage backends
 ///
@@ -29,19 +30,21 @@ pub trait VectorStoreBackend: Send + Sync {
     ) -> Result<Vec<VectorSearchResult>, VectorStoreError>;
 
     /// Delete chunks by their IDs
-    async fn delete_chunks(
-        &self,
-        chunk_ids: Vec<ChunkId>,
-    ) -> Result<(), VectorStoreError>;
+    async fn delete_chunks(&self, chunk_ids: Vec<ChunkId>) -> Result<(), VectorStoreError>;
 
     /// Delete all chunks from a specific file path
-    async fn delete_by_file_path(
-        &self,
-        file_path: &str,
-    ) -> Result<(), VectorStoreError>;
+    async fn delete_by_file_path(&self, file_path: &str) -> Result<(), VectorStoreError>;
 
     /// Get the total number of vectors in the store
     async fn count(&self) -> Result<usize, VectorStoreError>;
+
+    /// Distinct source files that have at least one vector in the store.
+    ///
+    /// Coverage lives here and nowhere else: `count()` answers "how many
+    /// vectors", which says nothing about whether a file was indexed at
+    /// all. A run that dies halfway leaves both numbers plausible, and
+    /// only the file set can be put next to the Merkle snapshot.
+    async fn indexed_file_paths(&self) -> Result<HashSet<String>, VectorStoreError>;
 
     /// Clear all vectors (keep collection/table structure)
     async fn clear(&self) -> Result<(), VectorStoreError>;

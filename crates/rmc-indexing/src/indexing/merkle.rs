@@ -5,6 +5,7 @@
 //! - Precise identification of changed files
 //! - Directory-level skipping (if directory hash unchanged, skip all children)
 
+use crate::indexing::traversal::collect_project_rust_files;
 use anyhow::Result;
 use rs_merkle::{Hasher, MerkleTree};
 use serde::{Deserialize, Serialize};
@@ -12,7 +13,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use walkdir::WalkDir;
 
 /// SHA-256 hasher for Merkle tree
 #[derive(Clone)]
@@ -92,28 +92,12 @@ impl FileSystemMerkle {
         let mut file_hashes = Vec::new();
         let mut file_to_node = HashMap::new();
 
-        // Collect all Rust files in sorted order with proper error handling (critical for consistency!)
-        let mut files = Vec::new();
-        let mut walk_errors = 0;
-
-        for entry in WalkDir::new(root) {
-            match entry {
-                Ok(e) if e.file_type().is_file()
-                       && e.path().extension() == Some(std::ffi::OsStr::new("rs")) => {
-                    files.push(e.path().to_path_buf());
-                }
-                Ok(_) => {}, // Directory or non-.rs file, skip silently
-                Err(err) => {
-                    let path = err.path().unwrap_or_else(|| Path::new("<unknown>"));
-                    tracing::warn!(
-                        "Failed to access {} during Merkle tree build: {}",
-                        path.display(),
-                        err
-                    );
-                    walk_errors += 1;
-                }
-            }
-        }
+        // Same walker as the indexer (see `traversal`): build output,
+        // vendored copies and generated trees are neither indexed nor
+        // tracked for changes. Walking more here would make the snapshot
+        // incomparable with the index — and the coverage check in
+        // `monitoring::health` is exactly that comparison.
+        let (mut files, walk_errors) = collect_project_rust_files(root);
 
         if walk_errors > 0 {
             tracing::warn!(
@@ -290,6 +274,15 @@ impl FileSystemMerkle {
         self.file_to_node.len()
     }
 
+    /// Paths of every file the tree tracks.
+    ///
+    /// This is the "expected" side of the coverage check: whatever the
+    /// tree holds, the index is supposed to hold too (both sides walk
+    /// with `traversal::collect_project_rust_files`).
+    pub fn file_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.file_to_node.keys()
+    }
+
     /// Get the snapshot version
     pub fn version(&self) -> u64 {
         self.snapshot_version
@@ -424,7 +417,9 @@ mod tests {
         assert!(snapshot_path.exists());
 
         // Load snapshot
-        let merkle2 = FileSystemMerkle::load_snapshot(&snapshot_path).unwrap().unwrap();
+        let merkle2 = FileSystemMerkle::load_snapshot(&snapshot_path)
+            .unwrap()
+            .unwrap();
 
         // Should be identical
         assert_eq!(merkle1.file_count(), merkle2.file_count());

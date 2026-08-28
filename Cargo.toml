@@ -71,7 +71,18 @@ heed = "0.22.1"
 text-splitter = "0.13"  # Semantic text chunking
 
 # Phase 4: Embedding Generation
-fastembed = { version = "5.13.4", default-features = false }
+fastembed = { version = "6.0.0", default-features = false }
+# ort — тот же ONNX Runtime, что тянет fastembed (пин совпадает намеренно: две
+# разные версии в графе дали бы два несовместимых набора биндингов). Нужен
+# НАПРЯМУЮ, чтобы собрать ExecutionProvider и передать его в fastembed через
+# TextInitOptions::with_execution_providers — fastembed принимает EP снаружи и
+# сам про GPU-EP ничего знать не обязан.
+#   load-dynamic — dlopen системной libonnxruntime.so вместо линковки: GPU-EP
+#                  живёт только в системной сборке ORT, скачиваемый cargo'й
+#                  архив собран CPU-only.
+#   api-24       — версия C-API. Без неё ort-sys генерит урезанный OrtApi и
+#                  ep/vitis.rs (компилируется безусловно) не находит своё поле.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "tracing", "api-24", "load-dynamic"] }
 candle-core = "0.10.2"
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "native-tls"] }
 

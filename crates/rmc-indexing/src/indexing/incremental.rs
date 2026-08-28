@@ -267,6 +267,16 @@ impl IncrementalIndexer {
         for deleted_path in &changes.deleted {
             tracing::info!("Deleting chunks for removed file: {}", deleted_path.display());
             indexer.delete_file_chunks(deleted_path).await?;
+
+            // The metadata cache has to forget it too, or the entry outlives
+            // the file forever: `monitoring::health` compares cache entries
+            // against vectors in the store, so a ghost entry for a file that
+            // no longer exists reads as "indexed but missing vectors" and
+            // holds coverage at `degraded` permanently. Measured on the live
+            // rust_app index (2026-08-25): 38 of 39 `stale_skips` were
+            // renamed-away files, not lost vectors.
+            indexer.forget_file(deleted_path)?;
+
             stats.skipped_files += 1;
         }
 
@@ -337,6 +347,15 @@ impl IncrementalIndexer {
     /// by the caller (e.g., in index_tool.rs) before calling index_with_change_detection.
     pub async fn clear_all_data(&mut self) -> Result<()> {
         self.ensure_indexer().await?.clear_all_data().await
+    }
+
+    /// Forget cache entries whose file has no vectors; see
+    /// [`UnifiedIndexer::forget_files_without_vectors`].
+    pub async fn forget_files_without_vectors(&mut self) -> Result<Vec<String>> {
+        self.ensure_indexer()
+            .await?
+            .forget_files_without_vectors()
+            .await
     }
 }
 
