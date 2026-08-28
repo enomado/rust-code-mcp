@@ -154,20 +154,46 @@ struct ResolvedDecl {
     kind: Option<SymbolKind>,
 }
 
-/// Run `find_all_refs` at `position` and append everything it found to `out`.
+/// Everything one `find_all_refs` call turned up, kept apart by role.
 ///
-/// Returns the definition the position resolved to, or `None` when the position
-/// pointed at no symbol at all. That distinction is the whole reason this
-/// returns anything: `find_all_refs` reports "the cursor is not on a name" and
-/// "this name has no references" identically, as an empty result, and a caller
-/// that cannot tell them apart reports a missed position as "nothing uses this".
+/// The halves are separated because the two callers want different ones: "who
+/// uses this" wants both, "where is this declared" wants only the declarations
+/// — and yet still needs the use sites, to know which text occurrences it no
+/// longer has to ask about.
+#[derive(Default)]
+struct Harvest {
+    /// Declaration sites of whatever the position resolved to.
+    decls: Vec<Location>,
+    /// Use sites of the same.
+    refs: Vec<Location>,
+}
+
+impl Harvest {
+    /// Every position this harvest accounts for, in dedup-key shape.
+    fn keys(&self) -> impl Iterator<Item = (PathBuf, u32, u32)> + '_ {
+        self.decls.iter().chain(&self.refs).map(location_key)
+    }
+
+    fn into_all(self) -> Vec<Location> {
+        let mut all = self.decls;
+        all.extend(self.refs);
+        all
+    }
+}
+
+/// Run `find_all_refs` at `position` and report what it found.
+///
+/// `None` means the position pointed at no symbol at all. That distinction is
+/// the whole reason this returns an `Option`: `find_all_refs` reports "the
+/// cursor is not on a name" and "this name has no references" identically, as
+/// an empty result, and a caller that cannot tell them apart reports a missed
+/// position as "nothing uses this".
 fn harvest_refs_at(
     analysis: &Analysis,
     vfs: &Vfs,
     position: FilePosition,
     exact: bool,
-    out: &mut Vec<Location>,
-) -> Result<Option<ResolvedDecl>> {
+) -> Result<Option<(ResolvedDecl, Harvest)>> {
     let Some(search_results) = analysis
         .find_all_refs(position, &all_refs_config())
         .context("find_all_refs query failed")?
@@ -175,18 +201,19 @@ fn harvest_refs_at(
         return Ok(None);
     };
 
-    let mut resolved_name = None;
+    let mut resolved = None;
+    let mut harvest = Harvest::default();
 
     for search_result in search_results {
         // Declaration.nav is NavigationTarget (not Option)
         if let Some(decl) = &search_result.declaration {
-            resolved_name.get_or_insert_with(|| ResolvedDecl {
+            resolved.get_or_insert_with(|| ResolvedDecl {
                 name: decl.nav.name.to_string(),
                 kind: decl.nav.kind,
             });
             let mut decl_location = nav_target_to_location(vfs, analysis, &decl.nav)?;
             decl_location.exact = exact;
-            out.push(decl_location);
+            harvest.decls.push(decl_location);
         }
 
         // references is IntMap<FileId, Vec<(TextRange, ReferenceCategory)>>
@@ -196,7 +223,7 @@ fn harvest_refs_at(
 
             for (range, _category) in refs {
                 let line_col = ref_line_index.line_col(range.start());
-                out.push(Location {
+                harvest.refs.push(Location {
                     file_path: ref_file_path.clone(),
                     line: line_col.line + 1,
                     column: line_col.col + 1,
@@ -207,7 +234,7 @@ fn harvest_refs_at(
         }
     }
 
-    Ok(resolved_name)
+    Ok(resolved.map(|decl| (decl, harvest)))
 }
 
 /// Real filesystem path of a file the analysis knows.
@@ -235,33 +262,48 @@ pub(crate) fn find_references(
     let analysis = host.analysis();
     let position = file_position(&analysis, vfs, file_path, line, column)?;
 
-    let mut locations = Vec::new();
-    if harvest_refs_at(&analysis, vfs, position, false, &mut locations)?.is_none() {
+    let Some((_, harvest)) = harvest_refs_at(&analysis, vfs, position, false)? else {
         anyhow::bail!(
             "No symbol at {}:{}:{} — the position does not point at a name (try a column inside the identifier)",
             file_path.display(),
             line,
             column
         );
-    }
+    };
 
-    Ok(locations)
+    Ok(harvest.into_all())
 }
 
 /// Search for symbols by name
 pub(crate) fn symbol_search(
     host: &AnalysisHost,
     vfs: &Vfs,
+    project_root: &Path,
     symbol_name: &str,
     limit: usize,
 ) -> Result<Vec<Location>> {
-    symbol_search_with_exact(host, vfs, symbol_name, limit, false)
+    symbol_search_with_exact(host, vfs, project_root, symbol_name, limit, false)
 }
 
 /// Search for symbols by name, optionally retaining only full-name matches.
+///
+/// # The blind spot this covers
+///
+/// The symbol index carries module-scope declarations plus impl and trait
+/// members — a **struct field** is not in it. So "where is this field declared"
+/// answered *no definition found*, the same words a misspelled name gets, and
+/// the same words that read as "there is no such thing". When the index
+/// produces no full-name match, the sources are asked directly, exactly as
+/// `find_references_by_name` does — same sweep, same guard against a
+/// same-spelled local.
+///
+/// Enum variants were expected to share the field's fate and do not: an oracle
+/// with the sweep disabled still finds one, so the index does carry them. They
+/// stay in the sweep's accept list as a backstop, not as its reason to exist.
 pub(crate) fn symbol_search_with_exact(
     host: &AnalysisHost,
     vfs: &Vfs,
+    project_root: &Path,
     symbol_name: &str,
     limit: usize,
     exact_only: bool,
@@ -273,7 +315,7 @@ pub(crate) fn symbol_search_with_exact(
         .symbol_search(query, limit)
         .context("symbol_search query failed")?;
 
-    let locations = results
+    let mut locations = results
         .iter()
         .map(|target| {
             let mut location = nav_target_to_location(vfs, &analysis, target)?;
@@ -282,7 +324,37 @@ pub(crate) fn symbol_search_with_exact(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(rank_and_filter_exact(locations, exact_only))
+    if !locations.iter().any(|location| location.exact) {
+        collect_by_token_scan(
+            &analysis,
+            vfs,
+            project_root,
+            symbol_name,
+            Wants::DeclOnly,
+            &mut locations,
+        )?;
+    }
+
+    let mut ranked = rank_and_filter_exact(locations, exact_only);
+    dedup_by_position(&mut ranked);
+    // The index was asked for `limit` and the sweep may have added to that;
+    // the caller's cap is on the answer, not on either source of it.
+    ranked.truncate(limit);
+    Ok(ranked)
+}
+
+/// Collapse repeats of one position, keeping the first — which, after ranking,
+/// is the exact match.
+///
+/// The sweep can arrive at a single declaration several times over. Its skip
+/// list is built from the use sites `find_all_refs` reports, and a `Fast`
+/// context has no dependency edges, so those stop at the crate boundary: an
+/// occurrence in a consuming crate is not on the skip list, gets its own query,
+/// and resolves to the same declaration again. Measured on a 4000-file
+/// workspace — one field, the same file:line three times over.
+fn dedup_by_position(locations: &mut Vec<Location>) {
+    let mut seen = HashSet::new();
+    locations.retain(|location| seen.insert(location_key(location)));
 }
 
 /// Find all references to symbols matching a name
@@ -330,7 +402,9 @@ pub(crate) fn find_references_by_name_with_exact(
         let offset = symbol.focus_range.unwrap_or(symbol.full_range).start();
         let position = FilePosition { file_id, offset };
 
-        harvest_refs_at(&analysis, vfs, position, symbol_exact, &mut all_locations)?;
+        if let Some((_, harvest)) = harvest_refs_at(&analysis, vfs, position, symbol_exact)? {
+            all_locations.extend(harvest.into_all());
+        }
     }
 
     // The symbol index carries module-scope declarations plus impl and trait
@@ -344,6 +418,7 @@ pub(crate) fn find_references_by_name_with_exact(
             vfs,
             project_root,
             symbol_name,
+            Wants::DeclAndRefs,
             &mut all_locations,
         )?;
     }
@@ -357,6 +432,20 @@ pub(crate) fn find_references_by_name_with_exact(
     all_locations.sort_by_key(|location| !location.exact);
 
     Ok(all_locations)
+}
+
+/// What the caller wants out of each definition the sweep resolves.
+///
+/// The sweep itself is identical either way — the same query brings back the
+/// declaration and its uses together — so the choice is only about what reaches
+/// the answer. The uses are kept regardless, because they are what lets the
+/// sweep skip the remaining occurrences of the name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wants {
+    /// Declaration and every use site — `find_references`.
+    DeclAndRefs,
+    /// The declaration alone — `find_definition`.
+    DeclOnly,
 }
 
 /// Resolve `symbol_name` by finding the identifier in the project's own sources
@@ -386,6 +475,7 @@ fn collect_by_token_scan(
     vfs: &Vfs,
     project_root: &Path,
     symbol_name: &str,
+    wants: Wants,
     out: &mut Vec<Location>,
 ) -> Result<()> {
     // Sorted, because the VFS hands files back in load order: two runs that
@@ -433,16 +523,20 @@ fn collect_by_token_scan(
                 offset: TextSize::new(inside as u32),
             };
 
-            let before = out.len();
-            let resolved = harvest_refs_at(analysis, vfs, position, true, out)?;
-            if !resolved.is_some_and(|decl| is_the_wanted_name(&decl, symbol_name)) {
+            let Some((resolved, harvest)) = harvest_refs_at(analysis, vfs, position, true)? else {
+                continue;
+            };
+            if !is_the_wanted_name(&resolved, symbol_name) {
                 // A comment, a string, a local binding spelled the same: the
-                // occurrence looked right in text and is not this name. Drop
-                // whatever it dragged in.
-                out.truncate(before);
+                // occurrence looked right in text and is not this name.
                 continue;
             }
-            covered.extend(out[before..].iter().map(location_key));
+
+            covered.extend(harvest.keys());
+            match wants {
+                Wants::DeclAndRefs => out.extend(harvest.into_all()),
+                Wants::DeclOnly => out.extend(harvest.decls),
+            }
         }
     }
 
@@ -451,12 +545,15 @@ fn collect_by_token_scan(
 
 /// Whether a resolved definition is the thing the token sweep went looking for.
 ///
-/// The name has to match, and so does the *kind*: the sweep exists only for the
-/// two kinds rust-analyzer's symbol index leaves out, so anything else found
-/// under a matching identifier is a different entity that happens to share a
-/// spelling. A local `let radius_override = 7;` declares a name equal to the
-/// field's, and counting it and its uses inflated a four-read field to six —
-/// silently, which is the failure mode this whole path exists to end.
+/// The name has to match, and so does the *kind*: the sweep exists for what
+/// rust-analyzer's symbol index does not surface — struct fields for certain,
+/// enum variants as a backstop — so anything else found under a matching
+/// identifier is a different entity that happens to share a spelling. A local
+/// `let radius_override = 7;` declares a name equal to the field's, and
+/// counting it and its uses inflated a four-read field to six — silently, which
+/// is the failure mode this whole path exists to end. As a *definition* the
+/// same local is worse still: an answer pointing into an unrelated function
+/// body, which reads as fact.
 fn is_the_wanted_name(decl: &ResolvedDecl, symbol_name: &str) -> bool {
     decl.name == symbol_name && matches!(decl.kind, Some(SymbolKind::Field | SymbolKind::Variant))
 }
@@ -527,6 +624,23 @@ mod tests {
         assert!(ranked[0].exact);
         assert_eq!(ranked[1].name, "VectorSearchResult");
         assert!(!ranked[1].exact);
+    }
+
+    /// One declaration reached through several text occurrences is still one
+    /// declaration. Without this the sweep answered a single field with three
+    /// identical lines on a real workspace.
+    #[test]
+    fn dedup_by_position_collapses_one_declaration_reached_twice() {
+        let mut locations = vec![
+            loc("radius_override", true, 280),
+            loc("radius_override", true, 280),
+            loc("radius_override", true, 60),
+        ];
+        dedup_by_position(&mut locations);
+
+        assert_eq!(locations.len(), 2, "got {locations:?}");
+        assert_eq!(locations[0].line, 280);
+        assert_eq!(locations[1].line, 60);
     }
 
     #[test]
