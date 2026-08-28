@@ -183,6 +183,12 @@ on demand.
 Env: RMC_DAEMON=0 forces in-process; RMC_DAEMON_DIR sets the socket directory;
      RMC_DAEMON_IDLE_SECS is the same as --idle-secs.
 
+     RMC_BUILD_SCRIPTS=0 loads a workspace without running its build scripts.
+     They run by default because code included from OUT_DIR (prost messages,
+     generated tables) is otherwise absent from the tree, and references into
+     it come back as an empty list rather than an error. The cost is one cargo
+     invocation per project load, in the workspace's own target directory.
+
 Memory watchdog (daemon only; 0 disables a threshold):
   RMC_RSS_SOFT_MB=8192       unload the analysis contexts above this RSS
   RMC_RSS_HARD_MB=16384      above this, retire: stop taking new clients, let

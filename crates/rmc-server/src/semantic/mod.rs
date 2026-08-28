@@ -1383,6 +1383,84 @@ pub fn a_local_of_the_same_name() -> u32 {
     /// cfg-gating reason instead of the one under study. The one item that *is*
     /// behind `#[cfg(test)]` is there to test exactly that gating, and the
     /// survey does not ask about it.
+    /// A crate whose only declaration of `generated_field` is written by a build
+    /// script into `OUT_DIR` and pulled in with `include!` — the shape prost
+    /// uses, and the shape `ss_project_proto` uses in `rust_app`.
+    ///
+    /// The name also appears inside a string literal in `build.rs`. That is
+    /// deliberate: the sweep walks source text, so a fixture where the only
+    /// other occurrence is a literal proves it is resolving rather than
+    /// grepping.
+    fn generated_code_workspace(root: &Path) {
+        write_file(
+            &root.join("Cargo.toml"),
+            r#"
+[package]
+name = "generated_probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+        );
+        write_file(
+            &root.join("build.rs"),
+            r#"
+fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("generated.rs");
+    std::fs::write(&out, "pub struct Generated { pub generated_field: u32 }\n").unwrap();
+}
+"#,
+        );
+        write_file(
+            &root.join("src/lib.rs"),
+            r#"
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+pub fn read_generated(value: &Generated) -> u32 {
+    value.generated_field
+}
+"#,
+        );
+    }
+
+    /// Generated code was invisible: without build scripts there is no `OUT_DIR`
+    /// to expand, so the included module is not in the tree and every reference
+    /// into it resolves to nothing. Measured on `rust_app` before the fix —
+    /// seven reads of a proto field counted as zero, in the same words used for
+    /// a field nobody reads.
+    ///
+    /// The declaration's path is asserted too, and that is the non-vacuity
+    /// check: it can only sit under `OUT_DIR` if resolution actually went
+    /// through the generated file.
+    #[test]
+    fn references_into_generated_code_are_found() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        generated_code_workspace(root);
+
+        let mut service = SemanticService::new();
+        let found = service
+            .find_references_by_name_with_exact(root, "generated_field", true)
+            .expect("query references");
+
+        assert_eq!(
+            refs_in(&found, "src/lib.rs"),
+            1,
+            "the read of the generated field must be visible, got {found:?}"
+        );
+        assert!(
+            found.iter().any(|location| {
+                location.name != "reference" && location.file_path.ends_with("out/generated.rs")
+            }),
+            "the declaration must resolve into the build script's output, not to \
+             a text match elsewhere, got {found:?}"
+        );
+    }
+
     fn kind_survey_workspace(root: &Path) {
         write_file(
             &root.join("Cargo.toml"),
