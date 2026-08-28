@@ -88,7 +88,8 @@ impl FastembedOnnxEmbedder {
 
         let mut options = TextInitOptions::new(to_fastembed_model(model))
             .with_max_length(backend.max_len)
-            .with_show_download_progress(false);
+            .with_show_download_progress(false)
+            .with_cache_dir(model_cache_dir()?);
         if let (true, Some(shape)) = (on_gpu, shape) {
             options = options.with_execution_providers(gpu_execution_providers(
                 backend.runtime,
@@ -339,6 +340,23 @@ fn directml_execution_providers() -> Result<Vec<EpDispatch>, EmbeddingError> {
 /// Явный `ORT_MIGRAPHX_MODEL_CACHE_PATH` уважается, но трактуется как КОРЕНЬ:
 /// подкаталог формы дописывается и к нему — инвариант «один каталог = одна
 /// форма» не должен зависеть от того, задал ли кто-то переменную.
+/// Where downloaded model weights live.
+///
+/// fastembed's own default is `.fastembed_cache` **relative to the process's
+/// working directory** (`vendor/fastembed/src/common.rs`), which put a copy of
+/// the weights in whatever tree a session happened to start in — four of them,
+/// 128–279 MB each, were on this machine before this was fixed. One daemon now
+/// serves every working directory, so that default would have made the location
+/// of the weights depend on which session woke the daemon first. Same XDG root
+/// as the MIGraphX kernel cache below, so both caches are found in one place.
+fn model_cache_dir() -> Result<std::path::PathBuf, EmbeddingError> {
+    directories::ProjectDirs::from("", "", "rust-code-mcp")
+        .map(|d| d.cache_dir().join("models"))
+        .ok_or_else(|| {
+            EmbeddingError::model_init("cannot resolve a cache directory for model weights")
+        })
+}
+
 #[cfg(feature = "embeddings-migraphx")]
 fn ensure_migraphx_kernel_cache(
     model: FastembedOnnxModel,
