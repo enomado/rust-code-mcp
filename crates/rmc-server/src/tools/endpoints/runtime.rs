@@ -43,7 +43,7 @@ pub(crate) async fn analysis_memory(
     runtime: &RuntimeState,
     params: AnalysisMemoryParams,
 ) -> Result<CallToolResult, McpError> {
-    let directory = std::path::PathBuf::from(params.directory);
+    let directory = crate::tools::paths::require_absolute("directory", &params.directory)?;
     let top = params.top.unwrap_or(25);
 
     // Through the same door as every other rust-analyzer call: the walk that
