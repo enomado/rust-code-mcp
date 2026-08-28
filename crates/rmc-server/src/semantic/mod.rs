@@ -1150,6 +1150,11 @@ pub fn calls_here() {
     probed();
 }
 
+/// The other kind `SymbolCollector` drops on the floor, next to struct fields.
+pub enum Facing {
+    Downhole,
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1288,6 +1293,103 @@ pub fn a_local_of_the_same_name() -> u32 {
             refs_in(&found, "oracle_consumer/src/lib.rs"),
             1,
             "only the field read counts, not the local spelled like it, got {found:?}"
+        );
+    }
+
+    /// `find_definition` resolves through the same symbol index that carries no
+    /// struct fields, so "where is this field declared" answered *no definition
+    /// found* — the words a misspelled name gets, and the words that read as
+    /// "there is no such field". The declaration is on line 2 of the lib
+    /// (`write_file` trims the fixture's leading newline).
+    #[test]
+    fn definition_of_a_struct_field_is_found_at_all() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        two_crate_oracle_workspace(root);
+
+        let mut service = SemanticService::new();
+        let found = service
+            .symbol_search_with_exact(root, "radius_override", 8, true)
+            .expect("query definition");
+
+        assert_eq!(
+            found.len(),
+            1,
+            "the field is declared exactly once, got {found:?}"
+        );
+        assert!(
+            found[0].file_path.ends_with("oracle_lib/src/lib.rs"),
+            "the declaring crate's lib must be the answer, got {found:?}"
+        );
+        assert_eq!(
+            found[0].line, 2,
+            "the declaration line, not one of the reads, got {found:?}"
+        );
+    }
+
+    /// Enum variants were read as sharing the field's fate — absent from the
+    /// symbol index. They do not: disabling the sweep leaves this test green,
+    /// so the index carries them and the index is what answers. Kept as the
+    /// regression that says which half of the guess held, and as the net under
+    /// the ranking and dedup the field fix put in this path.
+    #[test]
+    fn definition_of_an_enum_variant_is_found_at_all() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        two_crate_oracle_workspace(root);
+
+        let mut service = SemanticService::new();
+        let found = service
+            .symbol_search_with_exact(root, "Downhole", 8, true)
+            .expect("query definition");
+
+        assert_eq!(
+            found.len(),
+            1,
+            "the variant is declared exactly once, got {found:?}"
+        );
+        assert!(
+            found[0].file_path.ends_with("oracle_lib/src/lib.rs"),
+            "the declaring crate's lib must be the answer, got {found:?}"
+        );
+    }
+
+    /// Negative control for the definition sweep, the twin of the one guarding
+    /// references: a `let radius_override = 7;` declares that exact name too.
+    /// Accepting it would answer "the field is declared here" pointing into an
+    /// unrelated function body — a wrong location reads worse than none.
+    #[test]
+    fn a_local_binding_spelled_like_the_field_is_not_a_definition_of_it() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        two_crate_oracle_workspace(root);
+        write_file(
+            &root.join("oracle_consumer/src/lib.rs"),
+            r#"
+pub fn a_local_of_the_same_name() -> u32 {
+    // Same spelling, unrelated binding: not a declaration of the field.
+    let radius_override = 7;
+    radius_override
+}
+"#,
+        );
+
+        let mut service = SemanticService::new();
+        let found = service
+            .symbol_search_with_exact(root, "radius_override", 8, true)
+            .expect("query definition");
+
+        assert_eq!(
+            found.len(),
+            1,
+            "only the field is a definition of this name, got {found:?}"
+        );
+        assert!(
+            found[0].file_path.ends_with("oracle_lib/src/lib.rs"),
+            "the local must not be offered as the declaration, got {found:?}"
         );
     }
 
