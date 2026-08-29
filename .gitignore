@@ -21,7 +21,10 @@
 # потому что именно оттуда его берут .mcp.json и ~/.codex/config.toml.
 /rust-code-mcp
 /rust-code-mcp.bak-*
-/rust-code-mcp.prev-*
+# Именно `.prev*`, а не `.prev-*`: голый `rust-code-mcp.prev` (без суффикса)
+# мимо дефисного шаблона проходил и висел untracked — то есть 300 МБ ждали
+# первого `git add -A`.
+/rust-code-mcp.prev*
 # Второй target под замер аллокаторов (фича mimalloc).
 /target-mimalloc/
 # Локальные данные и кэши: векторы, кэш модели эмбеддера, замеры.
