@@ -1,9 +1,10 @@
 //! Operational defaults for MCP server startup and automatic work.
 
 use rmc_engine::embeddings::{
-    CPU_EP, DIRECTML_EP, EmbeddingBackend, EmbeddingRuntime, MIGRAPHX_EP, ProviderCensus,
-    probe_provider_census,
+    CPU_EP, DIRECTML_EP, EmbeddingBackend, EmbeddingProfile, EmbeddingRuntime, MIGRAPHX_EP,
+    ProviderCensus, probe_provider_census, resolve_profile,
 };
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub const BACKGROUND_SYNC_ENV: &str = "RMC_BACKGROUND_SYNC";
@@ -71,7 +72,7 @@ pub fn automatic_embedding_profile_name() -> &'static str {
             // Fail-fast: a typo in the profile name must not silently fall back to the
             // CPU default — otherwise 'GPU enabled' would turn out to be untrue, and one could
             // only notice it by the speed.
-            if let Err(err) = EmbeddingBackend::from_profile_name(&requested) {
+            if let Err(err) = resolve_startup_profile(&requested) {
                 panic!(
                     "{EMBEDDING_PROFILE_ENV}='{requested}' is not a usable embedding profile: {err}"
                 );
@@ -94,9 +95,33 @@ pub(crate) fn resolve_automatic_profile_name(env_value: Option<&str>) -> String 
         .to_string()
 }
 
+/// Directory against which the DEFAULT profile is resolved.
+///
+/// The process working directory, not the directory of a particular request: the default
+/// profile is a property of the server launch, and the server is started from the root of the project
+/// it serves.
+fn startup_project_root() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// The default profile, resolved by THE SAME resolver as a profile explicitly
+/// requested in a tool call.
+///
+/// Specifically by the resolver, not by `from_profile_name`: that one knows only the built-in
+/// list, while a profile may well be PROJECT-level (`embedding_profiles.toml` in the
+/// project root) — that is how `local-qwen3-06b` is declared on Windows, computing
+/// embeddings on a local llama-server. With a strict check against the built-ins
+/// a server with such an `RMC_EMBEDDING_PROFILE` panicked at startup, i.e.
+/// project profiles were unreachable for the default — even though they work for an explicit
+/// tool parameter.
+fn resolve_startup_profile(name: &str) -> Result<EmbeddingProfile, String> {
+    resolve_profile(name, &startup_project_root())
+}
+
 pub(crate) fn automatic_embedding_backend() -> EmbeddingBackend {
-    EmbeddingBackend::from_profile_name(automatic_embedding_profile_name())
-        .expect("automatic embedding profile is validated on first read")
+    let profile = resolve_startup_profile(automatic_embedding_profile_name())
+        .expect("automatic embedding profile is validated on first read");
+    EmbeddingBackend::from_profile(profile)
 }
 
 /// Startup EP probe, if it was requested via [`EP_CENSUS_ENV`].
@@ -121,6 +146,28 @@ pub fn probe_ep_census_on_startup() -> Result<Option<String>, String> {
 
     let backend = automatic_embedding_backend();
     let profile = backend.profile.name();
+
+    // Only the fastembed-ONNX path can do a per-provider node census: it
+    // builds an ORT session and looks at which provider got the graph nodes. The other
+    // runtimes have no graph here at all — computation happens in another process (openrouter,
+    // including a local llama-server) or in Candle (CUDA). Skip, not refuse:
+    // otherwise an armed knob would bring down server startup on a profile it simply
+    // does not apply to, and that would look like a broken configuration.
+    if !matches!(
+        backend.runtime,
+        EmbeddingRuntime::LocalFastembedOnnxCpu
+            | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+            | EmbeddingRuntime::LocalFastembedOnnxDirectml
+    ) {
+        tracing::info!(
+            profile,
+            runtime = ?backend.runtime,
+            "{EP_CENSUS_ENV} is set, but this profile does not run an ONNX graph in-process — \
+             nothing to census"
+        );
+        return Ok(None);
+    }
+
     tracing::info!(
         profile,
         "{EP_CENSUS_ENV} is set: probing which execution provider actually runs the graph \

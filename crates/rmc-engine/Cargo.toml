@@ -18,7 +18,9 @@ embeddings = [
   # Use ORT at build/link time instead of dlopening libonnxruntime.so at runtime.
   # Plain Cargo builds download the CPU ORT archive; Nix builds override this
   # with ORT_LIB_PATH/ORT_PREFER_DYNAMIC_LINK so the pinned Nix ORT is used.
-  "fastembed/ort-download-binaries",
+  # WINDOWS-GNU: ort has no prebuilt for x86_64-pc-windows-gnu (pyke ships only msvc),
+  # so here ORT is loaded dynamically (ORT_DYLIB_PATH) rather than linked at build time.
+  "fastembed/ort-load-dynamic",
 ]
 embeddings-cuda = [
   "embeddings",

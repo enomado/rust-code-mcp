@@ -72,6 +72,12 @@ pub(crate) fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".rust-code-mcp"))
 }
 
+/// Embedding backend for a tool call.
+///
+/// Priority: explicit tool parameter > `RMC_EMBEDDING_PROFILE` > built-in
+/// `local-cpu-small`. The environment switch is read NOT by this resolver but by
+/// [`automatic_embedding_backend`], once per process: the default profile is
+/// a property of how the server was started, not of the request.
 pub(crate) fn resolve_embedding_backend_for_mcp(
     embedding_profile: Option<&str>,
     directory: &Path,
