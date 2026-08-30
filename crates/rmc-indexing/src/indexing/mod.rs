@@ -30,7 +30,6 @@ pub use project_paths::{
     IndexingProjectPaths,
 };
 pub use search::open_bm25_search;
-pub use traversal::collect_project_rust_files;
 pub use tantivy_adapter::TantivyAdapter;
 // Exactly one tree walk is exported: rmc-server stats the same files as the
 // indexer, and both sides must agree EXACTLY on what a project file is, otherwise
