@@ -72,6 +72,12 @@ pub(crate) fn data_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".rust-code-mcp"))
 }
 
+/// Бэкенд эмбеддингов для вызова тула.
+///
+/// Приоритет: явный параметр тула > `RMC_EMBEDDING_PROFILE` > встроенный
+/// `local-cpu-small`. Ручку окружения читает НЕ этот резолвер, а
+/// [`automatic_embedding_backend`] — один раз за процесс: профиль по умолчанию
+/// свойство запуска сервера, а не запроса.
 pub(crate) fn resolve_embedding_backend_for_mcp(
     embedding_profile: Option<&str>,
     directory: &Path,

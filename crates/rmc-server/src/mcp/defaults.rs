@@ -1,9 +1,10 @@
 //! Operational defaults for MCP server startup and automatic work.
 
 use rmc_engine::embeddings::{
-    CPU_EP, DIRECTML_EP, EmbeddingBackend, EmbeddingRuntime, MIGRAPHX_EP, ProviderCensus,
-    probe_provider_census,
+    CPU_EP, DIRECTML_EP, EmbeddingBackend, EmbeddingProfile, EmbeddingRuntime, MIGRAPHX_EP,
+    ProviderCensus, probe_provider_census, resolve_profile,
 };
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 pub const BACKGROUND_SYNC_ENV: &str = "RMC_BACKGROUND_SYNC";
@@ -71,7 +72,7 @@ pub fn automatic_embedding_profile_name() -> &'static str {
             // Fail-fast: опечатка в имени профиля не должна тихо откатывать на
             // CPU-дефолт — иначе «GPU включён» окажется неправдой, а заметить
             // это можно будет только по скорости.
-            if let Err(err) = EmbeddingBackend::from_profile_name(&requested) {
+            if let Err(err) = resolve_startup_profile(&requested) {
                 panic!(
                     "{EMBEDDING_PROFILE_ENV}='{requested}' is not a usable embedding profile: {err}"
                 );
@@ -94,9 +95,33 @@ pub(crate) fn resolve_automatic_profile_name(env_value: Option<&str>) -> String 
         .to_string()
 }
 
+/// Каталог, относительно которого резолвится профиль ПО УМОЛЧАНИЮ.
+///
+/// Рабочая директория процесса, а не директория конкретного запроса: дефолтный
+/// профиль — свойство запуска сервера, и сервер поднимают из корня проекта,
+/// который он обслуживает.
+fn startup_project_root() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Профиль по умолчанию, разрешённый ТЕМ ЖЕ резолвером, что и явно
+/// запрошенный в вызове тула.
+///
+/// Именно резолвером, а не `from_profile_name`: тот знает только встроенный
+/// список, а профиль вполне может быть ПРОЕКТНЫМ (`embedding_profiles.toml` в
+/// корне проекта) — так на винде объявлен `local-qwen3-06b`, считающий
+/// эмбеддинги на локальном llama-server. Со строгой проверкой по built-in
+/// сервер с таким `RMC_EMBEDDING_PROFILE` паниковал на старте, то есть
+/// проектные профили были недостижимы для дефолта — при том что для явного
+/// параметра тула они работают.
+fn resolve_startup_profile(name: &str) -> Result<EmbeddingProfile, String> {
+    resolve_profile(name, &startup_project_root())
+}
+
 pub(crate) fn automatic_embedding_backend() -> EmbeddingBackend {
-    EmbeddingBackend::from_profile_name(automatic_embedding_profile_name())
-        .expect("automatic embedding profile is validated on first read")
+    let profile = resolve_startup_profile(automatic_embedding_profile_name())
+        .expect("automatic embedding profile is validated on first read");
+    EmbeddingBackend::from_profile(profile)
 }
 
 /// Стартовая проба EP, если её попросили через [`EP_CENSUS_ENV`].
@@ -121,6 +146,28 @@ pub fn probe_ep_census_on_startup() -> Result<Option<String>, String> {
 
     let backend = automatic_embedding_backend();
     let profile = backend.profile.name();
+
+    // Перепись узлов по провайдерам умеет ТОЛЬКО fastembed-ONNX-путь: она
+    // строит сессию ORT и смотрит, кому достались узлы графа. У остальных
+    // рантаймов графа тут нет вовсе — счёт идёт в чужом процессе (openrouter,
+    // в т.ч. локальный llama-server) или в Candle (CUDA). Пропуск, а не отказ:
+    // иначе взведённая ручка валит старт сервера на профиле, к которому она
+    // просто не относится, и выглядит это как поломка конфигурации.
+    if !matches!(
+        backend.runtime,
+        EmbeddingRuntime::LocalFastembedOnnxCpu
+            | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+            | EmbeddingRuntime::LocalFastembedOnnxDirectml
+    ) {
+        tracing::info!(
+            profile,
+            runtime = ?backend.runtime,
+            "{EP_CENSUS_ENV} is set, but this profile does not run an ONNX graph in-process — \
+             nothing to census"
+        );
+        return Ok(None);
+    }
+
     tracing::info!(
         profile,
         "{EP_CENSUS_ENV} is set: probing which execution provider actually runs the graph \

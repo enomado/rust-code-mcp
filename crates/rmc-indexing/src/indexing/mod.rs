@@ -32,4 +32,8 @@ pub use project_paths::{
 pub use search::open_bm25_search;
 pub use traversal::collect_project_rust_files;
 pub use tantivy_adapter::TantivyAdapter;
+// Наружу отдан ровно один обход дерева: rmc-server статит те же файлы, что
+// индексатор, и «файл проекта» обе стороны обязаны понимать ОДИНАКОВО — иначе
+// семантический кэш считает свежим то, что индекс уже переиндексировал.
+pub use traversal::collect_project_rust_files;
 pub use unified::{IndexFileResult, IndexStats, UnifiedIndexer};
