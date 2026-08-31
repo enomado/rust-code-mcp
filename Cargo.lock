@@ -7088,6 +7088,7 @@ dependencies = [
  "anyhow",
  "bincode 1.3.3",
  "directories",
+ "fs2",
  "glob",
  "num_cpus",
  "rayon",

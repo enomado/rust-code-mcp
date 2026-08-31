@@ -3,13 +3,11 @@
 //! Provides the `index_codebase` tool which allows manual triggering of
 //! incremental indexing with optional force reindex.
 
-use rmc_engine::embeddings::{EmbeddingBackend, Qwen3Variant};
-use rmc_indexing::indexing::{
-    index_project_incrementally, IncrementalIndexRequest, IndexStats,
-};
-use crate::mcp::defaults::{automatic_embedding_backend, is_background_embedding_backend};
+use crate::mcp::defaults::is_background_embedding_backend;
 use crate::mcp::project_paths::{ProjectPaths, resolve_embedding_backend_for_mcp};
+use rmc_engine::embeddings::{EmbeddingBackend, Qwen3Variant};
 use rmc_engine::vector_store::VectorStoreError;
+use rmc_indexing::indexing::{IncrementalIndexRequest, IndexStats, index_project_incrementally};
 use rmcp::{ErrorData as McpError, model::CallToolResult, model::Content, schemars};
 use tracing;
 
@@ -86,13 +84,24 @@ fn format_index_codebase_result(
             Profile: {}\n\
             Embedder: {}\n\
             Skipped files: {}\n\
+            Retryable failures: {}\n\
             Time: {:?}",
-            directory, profile_name, embedder_identity, stats.skipped_files, elapsed
+            directory,
+            profile_name,
+            embedder_identity,
+            stats.skipped_files,
+            stats.failed_files,
+            elapsed
         );
     }
 
     if stats.indexed_files == 0 {
-        let heading = if stats.skipped_files == 0 {
+        let heading = if stats.failed_files > 0 {
+            format!(
+                "⚠ Indexing incomplete for '{}' — failed files will be retried",
+                directory
+            )
+        } else if stats.skipped_files == 0 {
             format!("✓ Index already up to date for '{}'", directory)
         } else {
             format!("✓ No files needed indexing updates in '{}'", directory)
@@ -106,6 +115,7 @@ fn format_index_codebase_result(
             - Total chunks: {}\n\
             - Unchanged files: {}\n\
             - Skipped or removed files: {}\n\
+            - Retryable failures: {}\n\
             - Time: {:?}\n\n\
             Profile: {}\n\
             Embedder: {}\n\
@@ -116,6 +126,7 @@ fn format_index_codebase_result(
             stats.total_chunks,
             stats.unchanged_files,
             stats.skipped_files,
+            stats.failed_files,
             elapsed,
             profile_name,
             embedder_identity,
@@ -124,20 +135,30 @@ fn format_index_codebase_result(
         );
     }
 
+    let heading = if stats.failed_files == 0 {
+        format!("✓ Successfully indexed '{}'", directory)
+    } else {
+        format!(
+            "⚠ Partially indexed '{}' — failed files will be retried",
+            directory
+        )
+    };
+
     format!(
-        "✓ Successfully indexed '{}'\n\n\
+        "{}\n\n\
         Indexing stats:\n\
         - Total Rust files: {}\n\
         - Indexed files: {} {}\n\
         - Total chunks: {}\n\
         - Unchanged files: {}\n\
         - Skipped or removed files: {}\n\
+        - Retryable failures: {}\n\
         - Time: {:?}\n\n\
         Profile: {}\n\
         Embedder: {}\n\
         Background sync: {}\n\
         Collection: {}",
-        directory,
+        heading,
         stats.total_files,
         stats.indexed_files,
         if force {
@@ -148,6 +169,7 @@ fn format_index_codebase_result(
         stats.total_chunks,
         stats.unchanged_files,
         stats.skipped_files,
+        stats.failed_files,
         elapsed,
         profile_name,
         embedder_identity,
@@ -227,7 +249,10 @@ pub async fn index_codebase(
 
     if !dir.is_dir() {
         return Err(McpError::invalid_params(
-            format!("The specified path '{}' is not a directory", params.directory),
+            format!(
+                "The specified path '{}' is not a directory",
+                params.directory
+            ),
             None,
         ));
     }
@@ -303,7 +328,10 @@ pub async fn index_codebase(
         backend.profile.name(),
         &embedder_identity,
         &paths.collection_name,
-        match (sync_manager.is_some(), is_background_embedding_backend(&backend)) {
+        match (
+            sync_manager.is_some(),
+            is_background_embedding_backend(&backend),
+        ) {
             (false, _) => "disabled",
             (true, true) => "enabled (5-minute interval; CPU/remote profiles only)",
             (true, false) => "enabled, but this local CUDA profile is not synced in background",
@@ -427,6 +455,7 @@ mod tests {
             unchanged_files: 28,
             skipped_files: 0,
             total_chunks: 120,
+            ..Default::default()
         };
 
         let text = format_index_codebase_result(
@@ -454,6 +483,7 @@ mod tests {
             unchanged_files: 0,
             skipped_files: 28,
             total_chunks: 0,
+            ..Default::default()
         };
 
         let text = format_index_codebase_result(
@@ -481,6 +511,7 @@ mod tests {
             unchanged_files: 0,
             skipped_files: 0,
             total_chunks: 0,
+            ..Default::default()
         };
 
         let text = format_index_codebase_result(
@@ -495,6 +526,32 @@ mod tests {
         );
 
         assert!(text.contains("No Rust files suitable"));
+    }
+
+    #[test]
+    fn format_result_does_not_call_a_retryable_partial_run_success() {
+        let stats = IndexStats {
+            total_files: 4,
+            indexed_files: 2,
+            failed_files: 2,
+            ..Default::default()
+        };
+
+        let text = format_index_codebase_result(
+            &stats,
+            "/workspace",
+            "local-gpu-small",
+            "test-embedder:v1",
+            "test_collection",
+            "enabled",
+            false,
+            std::time::Duration::from_millis(33),
+        );
+
+        assert!(text.contains("Partially indexed"));
+        assert!(text.contains("failed files will be retried"));
+        assert!(text.contains("- Retryable failures: 2"));
+        assert!(!text.contains("Successfully indexed"));
     }
 
     #[test]
@@ -583,8 +640,7 @@ mod tests {
 
     #[test]
     fn resolve_backend_explicit_model_keeps_default_limits() {
-        let backend =
-            resolve_backend(None, Some("qwen3-0.6b"), std::path::Path::new(".")).unwrap();
+        let backend = resolve_backend(None, Some("qwen3-0.6b"), std::path::Path::new(".")).unwrap();
         let default = EmbeddingBackend::default();
 
         assert_eq!(backend.qwen3_variant(), Some(Qwen3Variant::Embedding0_6B));

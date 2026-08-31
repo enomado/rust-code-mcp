@@ -99,8 +99,7 @@ pub(super) fn parallel_parse_batch(
     (processed, error_collector)
 }
 
-/// Drain `error_collector` into `stats.skipped_files`, logging each entry
-/// at the appropriate level for its category.
+/// Drain parse errors into permanent skips and retryable failures.
 pub(super) fn process_batch_errors(error_collector: &ErrorCollector, stats: &mut IndexStats) {
     for error in error_collector.get_errors() {
         match error.category {
@@ -109,8 +108,13 @@ pub(super) fn process_batch_errors(error_collector: &ErrorCollector, stats: &mut
                 stats.skipped_files += 1;
             }
             crate::indexing::error_collection::ErrorCategory::Transient => {
-                tracing::warn!("Failed {}: {}", error.file_path.display(), error.message);
-                stats.skipped_files += 1;
+                tracing::warn!(
+                    "Failed {} (will retry): {}",
+                    error.file_path.display(),
+                    error.message
+                );
+                stats.failed_files += 1;
+                stats.retry_files.push(error.file_path);
             }
         }
     }
