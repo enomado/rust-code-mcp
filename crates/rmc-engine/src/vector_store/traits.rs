@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use std::collections::HashSet;
 
 use super::VectorSearchResult;
+use super::VectorStoreMaintenance;
 use super::error::VectorStoreError;
 use crate::chunker::{ChunkId, CodeChunk};
 use crate::embeddings::Embedding;
@@ -48,6 +49,24 @@ pub trait VectorStoreBackend: Send + Sync {
 
     /// Clear all vectors (keep collection/table structure)
     async fn clear(&self) -> Result<(), VectorStoreError>;
+
+    /// Reclaim disk space left behind by writes.
+    ///
+    /// The store is append-only: every upsert lands in a NEW fragment and
+    /// every change publishes a NEW version, and neither the superseded
+    /// rows nor the old manifests go away on their own. Nothing in the
+    /// write path can do this incrementally — a fragment only becomes
+    /// unreferenced once its rows have been rewritten elsewhere — so it is
+    /// a separate pass, and without it on-disk size grows without bound
+    /// against a row count that does not.
+    ///
+    /// `prune_keep` is the age below which versions are left alone: it is
+    /// the margin for a reader that opened the table before this pass
+    /// started and is still walking it.
+    async fn maintain(
+        &self,
+        prune_keep: std::time::Duration,
+    ) -> Result<VectorStoreMaintenance, VectorStoreError>;
 
     /// Check if the backend is healthy/connected
     async fn health_check(&self) -> Result<(), VectorStoreError>;

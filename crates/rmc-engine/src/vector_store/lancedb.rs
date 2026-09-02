@@ -15,12 +15,15 @@ use lancedb::connect;
 use lancedb::index::Index;
 use lancedb::index::scalar::BTreeIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
+use lancedb::table::optimize::Duration as ChronoDuration;
+use lancedb::table::{CompactionOptions, OptimizeAction};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::VectorSearchResult;
+use super::VectorStoreMaintenance;
 use super::error::VectorStoreError;
 use super::traits::VectorStoreBackend;
 use crate::chunker::{ChunkId, CodeChunk};
@@ -621,6 +624,63 @@ impl VectorStoreBackend for LanceDbBackend {
         Ok(())
     }
 
+    async fn maintain(
+        &self,
+        prune_keep: std::time::Duration,
+    ) -> Result<VectorStoreMaintenance, VectorStoreError> {
+        let table = self.get_table().await?;
+
+        // Compaction FIRST, and the order is not cosmetic: pruning is what
+        // deletes files, but a fragment stays referenced by the current
+        // version until compaction has rewritten its rows elsewhere.
+        // Pruned-then-compacted would drop the manifests and leave the
+        // data, which is the larger half.
+        let compacted = table
+            .optimize(OptimizeAction::Compact {
+                options: CompactionOptions::default(),
+                remap_options: None,
+            })
+            .await
+            .map_err(|e| {
+                VectorStoreError::backend(format!("Failed to compact vector table: {}", e))
+            })?;
+
+        // `older_than` is the load-bearing argument, and it must be passed:
+        // lance defaults it to SEVEN DAYS, and on a store written every few
+        // minutes that keeps essentially every version there is.
+        //
+        // `delete_unverified` is deliberately left at lance's default.
+        // Reading its implementation rather than its name: it governs only
+        // files that NO manifest references — the debris of a write that
+        // may still be in flight. Files held by a manifest we are dropping
+        // are deleted whatever their age, so the flag buys us almost
+        // nothing here while carrying the documented risk of deleting a
+        // concurrent writer's in-progress files. Measured, not assumed:
+        // flipping it changed neither the reclaimed bytes nor the version
+        // count in `maintain_reclaims_versions_without_losing_rows`.
+        let keep = ChronoDuration::from_std(prune_keep)
+            .map_err(|e| VectorStoreError::backend(format!("prune window out of range: {}", e)))?;
+        let pruned = table
+            .optimize(OptimizeAction::Prune {
+                older_than: Some(keep),
+                delete_unverified: None,
+                error_if_tagged_old_versions: None,
+            })
+            .await
+            .map_err(|e| {
+                VectorStoreError::backend(format!("Failed to prune vector table: {}", e))
+            })?;
+
+        let compaction = compacted.compaction.unwrap_or_default();
+        let removal = pruned.prune;
+        Ok(VectorStoreMaintenance {
+            fragments_removed: compaction.fragments_removed,
+            fragments_added: compaction.fragments_added,
+            old_versions_removed: removal.as_ref().map(|s| s.old_versions).unwrap_or(0),
+            bytes_removed: removal.as_ref().map(|s| s.bytes_removed).unwrap_or(0),
+        })
+    }
+
     async fn health_check(&self) -> Result<(), VectorStoreError> {
         // Try to list tables as a health check
         self.db
@@ -833,6 +893,87 @@ mod tests {
         backend.clear().await.unwrap();
 
         assert_eq!(backend.count().await.unwrap(), 0);
+    }
+
+    /// Write enough separate batches that the append-only store has real
+    /// fragments and versions to reclaim, then check that maintenance
+    /// reclaims them WITHOUT losing a row.
+    ///
+    /// Both halves matter: a pass that drops versions and also drops data
+    /// would satisfy the first assert alone, and a pass that silently does
+    /// nothing would satisfy the second alone.
+    #[tokio::test]
+    async fn maintain_reclaims_versions_without_losing_rows() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LanceDbBackend::new(temp_dir.path().to_path_buf(), 4, "test-embedder:v1")
+            .await
+            .unwrap();
+
+        // One upsert per call — batching them would produce a single
+        // fragment and the scene would have nothing to compact.
+        for i in 0..12 {
+            let id = ChunkId::new();
+            let chunk = create_test_chunk(id, "fn test() {}", &format!("f{}.rs", i));
+            backend
+                .upsert_chunks(vec![(id, vec![0.1, 0.2, 0.3, i as f32], chunk)])
+                .await
+                .unwrap();
+        }
+        let rows_before = backend.count().await.unwrap();
+        assert_eq!(rows_before, 12);
+
+        // FIRST pass, with a keep window wider than the scene's whole
+        // lifetime. Two things are judged here, and the second is the
+        // positive control for the pass that follows.
+        let first = backend
+            .maintain(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        // Compaction is judged on THIS pass and only here: it is the pass
+        // that finds the twelve one-row fragments. Asserting it on the
+        // second pass would assert nothing — by then they are already
+        // merged, and a build with compaction removed would look
+        // identical.
+        assert!(
+            first.fragments_removed > first.fragments_added,
+            "compaction must merge the per-write fragments, got {:?}",
+            first
+        );
+        // The control: `older_than` is honoured, so a wide window protects
+        // versions written seconds ago. Without this the prune assert
+        // below would also pass on a build that ignores the window and
+        // prunes unconditionally.
+        assert_eq!(
+            first.old_versions_removed, 0,
+            "keep window of an hour must protect versions written seconds ago"
+        );
+
+        // SECOND pass, window closed: now the superseded versions — the
+        // originals plus the ones compaction just replaced — must go.
+        let stats = backend.maintain(std::time::Duration::ZERO).await.unwrap();
+        assert!(
+            stats.old_versions_removed > 0,
+            "12 separate writes must leave prunable versions, got {:?}",
+            stats
+        );
+        // Bytes, not just manifest entries: `old_versions_removed` counts
+        // bookkeeping, and only this number answers the question the pass
+        // exists for.
+        assert!(
+            stats.bytes_removed > 0,
+            "pruning must free bytes on disk, not just manifest entries, got {:?}",
+            stats
+        );
+        assert_eq!(
+            backend.count().await.unwrap(),
+            rows_before,
+            "maintenance must not change what the store holds"
+        );
+
+        // And the store still answers: reclaiming must not orphan the
+        // data files the current version points at.
+        let hits = backend.search(vec![0.1, 0.2, 0.3, 0.0], 5).await.unwrap();
+        assert!(!hits.is_empty(), "search must still work after maintenance");
     }
 
     #[tokio::test]

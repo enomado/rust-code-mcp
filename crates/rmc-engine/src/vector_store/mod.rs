@@ -19,6 +19,25 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// What one [`VectorStore::maintain`] pass actually reclaimed.
+///
+/// Every field is an OUTCOME, not an intent: a pass that ran and found
+/// nothing to do reports zeros, which is how a caller tells "maintenance
+/// is wired up and the store is already tidy" from "maintenance never
+/// ran". Reporting only "ok" would collapse those two.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VectorStoreMaintenance {
+    /// Fragments compaction merged away.
+    pub fragments_removed: usize,
+    /// Fragments compaction wrote in their place (always fewer, or the
+    /// compaction was not worth running).
+    pub fragments_added: usize,
+    /// Superseded dataset versions the prune pass dropped.
+    pub old_versions_removed: u64,
+    /// Bytes the prune pass freed on disk.
+    pub bytes_removed: u64,
+}
+
 /// A search result from vector search
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchResult {
@@ -164,6 +183,15 @@ impl VectorStore {
     /// Clear all vectors (keep collection/table structure)
     pub async fn clear_collection(&self) -> Result<(), VectorStoreError> {
         self.backend.clear().await
+    }
+
+    /// Reclaim disk space left behind by writes — see
+    /// [`VectorStoreBackend::maintain`].
+    pub async fn maintain(
+        &self,
+        prune_keep: std::time::Duration,
+    ) -> Result<VectorStoreMaintenance, VectorStoreError> {
+        self.backend.maintain(prune_keep).await
     }
 
     /// Delete the collection (alias for clear_collection for backward compatibility)
