@@ -78,14 +78,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         daemon::Mode::Client { socket } => {
-            // A failing daemon never leaves the session without a server: fall
-            // through to the previous in-process behaviour.
+            // An unreachable daemon never leaves the session without a server:
+            // fall through to the previous in-process behaviour.
             match daemon::run_client(socket).await {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
                     tracing::info!("shared daemon unavailable; serving this session in-process")
                 }
-                Err(e) => tracing::warn!("shared daemon client failed: {e}; serving in-process"),
+                Err(e) => {
+                    // NOT in-process: bytes were already exchanged, so this
+                    // session's stdin is partly consumed and a local server
+                    // would answer a truncated stream.
+                    //
+                    // Exit rather than return: `tokio::io::stdin` reads on the
+                    // blocking pool, and that read ends only when the host
+                    // closes stdin. Returning hands the error to the runtime
+                    // drop, which waits for that read — so the failure would
+                    // show up as a hang instead of a non-zero exit.
+                    eprintln!("shared daemon session failed: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         daemon::Mode::Daemon { .. } | daemon::Mode::InProcess => {}
