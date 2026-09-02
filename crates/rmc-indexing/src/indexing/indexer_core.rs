@@ -39,6 +39,7 @@ use rmc_engine::embeddings::{
 use crate::indexing::embedding_batcher::EmbeddingBatcher;
 use crate::indexing::file_processor::FileProcessor;
 use crate::indexing::IndexingError;
+use crate::indexing::error::{OUTCOME_FILE_UNCHANGED, OUTCOME_NO_CHUNKS, OUTCOME_SECURITY_FILTERED};
 use crate::metadata_cache::MetadataCache;
 use rmc_engine::parser::RustParser;
 use std::collections::HashSet;
@@ -239,12 +240,12 @@ impl IndexerCore {
 
         // Security checks (delegated to file_processor)
         if !self.file_processor.should_process_file(file_path)? {
-            return Err(IndexingError::Parser("File filtered: security check failed".into()));
+            return Err(IndexingError::Parser(OUTCOME_SECURITY_FILTERED.into()));
         }
 
         // Fast stat-based change detection (avoids reading file content)
         if !self.file_processor.has_stat_changed(file_path)? {
-            return Err(IndexingError::Parser("File unchanged".into()));
+            return Err(IndexingError::Parser(OUTCOME_FILE_UNCHANGED.into()));
         }
 
         // Read file (only if stat suggests change)
@@ -255,7 +256,7 @@ impl IndexerCore {
 
         // Content hash check (confirms stat-based detection)
         if !self.file_processor.has_file_changed(file_path, &content)? {
-            return Err(IndexingError::Parser("File unchanged".into()));
+            return Err(IndexingError::Parser(OUTCOME_FILE_UNCHANGED.into()));
         }
 
         // Parse with tree-sitter (CPU-intensive)
@@ -276,7 +277,7 @@ impl IndexerCore {
 
         if chunks.is_empty() {
             tracing::warn!("No chunks generated for {}", file_path.display());
-            return Err(IndexingError::Parser("No chunks generated".into()));
+            return Err(IndexingError::Parser(OUTCOME_NO_CHUNKS.into()));
         }
 
         let parse_duration = parse_start.elapsed();
