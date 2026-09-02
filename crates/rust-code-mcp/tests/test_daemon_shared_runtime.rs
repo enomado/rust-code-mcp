@@ -405,6 +405,39 @@ fn a_piped_session_keeps_its_replies() -> Result<()> {
     Ok(())
 }
 
+/// A file that is not a socket must survive a client that finds it in the way.
+///
+/// `--socket` names any path, so a typo used to be enough: the client found
+/// something at that address, could not connect to it, and deleted it as a
+/// stale socket. The file it deletes belongs to whoever mistyped the path.
+#[test]
+fn a_file_that_is_not_a_socket_is_left_alone() -> Result<()> {
+    let socket_dir = TempDir::new()?;
+    let not_a_socket = socket_dir.path().join("precious.sock");
+    std::fs::write(&not_a_socket, b"someone else's data")?;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rust-code-mcp"));
+    command
+        .arg("--socket")
+        .arg(&not_a_socket)
+        .env("RUST_LOG", "error")
+        .env("RMC_DAEMON_DIR", socket_dir.path())
+        .env("RMC_DAEMON_IDLE_SECS", "5")
+        .env_remove("RMC_DAEMON")
+        // Empty stdin: the client falls back in-process and the server ends at
+        // once, which is all this test needs — the decision about the file is
+        // taken before any session starts.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hermetic_env(&mut command);
+    command.status()?;
+
+    let survived = std::fs::read(&not_a_socket).context("the client deleted a file it did not own")?;
+    assert_eq!(survived, b"someone else's data");
+    Ok(())
+}
+
 /// Positive control: the opt-out must restore the previous behaviour.
 #[test]
 fn opt_out_serves_in_process() -> Result<()> {
