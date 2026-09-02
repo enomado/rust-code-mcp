@@ -77,10 +77,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", socket.display());
             return Ok(());
         }
-        daemon::Mode::Client { socket } => {
+        daemon::Mode::Client { socket, idle } => {
             // An unreachable daemon never leaves the session without a server:
             // fall through to the previous in-process behaviour.
-            match daemon::run_client(socket).await {
+            match daemon::run_client(socket, *idle).await {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
                     tracing::info!("shared daemon unavailable; serving this session in-process")
