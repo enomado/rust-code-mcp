@@ -587,10 +587,51 @@ fn resolve_socket_dir(
     temp_dir.join(format!("rust-code-mcp-{user}"))
 }
 
+/// `geteuid`, rather than the owner of `/proc/self`, which is Linux only.
+fn process_uid() -> u32 {
+    // SAFETY: no arguments, reads process state the kernel always has, cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// A refusal that names the path, so the warning logged before the in-process
+/// fallback says what to fix.
+fn refuse_dir(dir: &Path, reason: &str) -> io::Error {
+    io::Error::other(format!("directory {}: {reason}", dir.display()))
+}
+
+/// The socket directory: created `0o700` — the socket is an entry point into
+/// analysing someone's code — and otherwise CHECKED, never chmodded.
+///
+/// It may be a directory the user named through `--socket` or `RMC_DAEMON_DIR`,
+/// and turning someone's own directory into `0o700` behind their back is a
+/// change nobody asked for: `--daemon --socket <dir>/mcp.sock` used to take a
+/// perfectly ordinary `0o755` directory down to owner-only as a side effect.
+///
+/// `symlink_metadata`, because a symlink here decides where the socket really
+/// lands: it has to be seen rather than followed.
 fn ensure_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    // The socket is an entry point into analysing someone's code: owner only.
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    let meta = match fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(dir)?;
+            return fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+        Err(e) => return Err(refuse_dir(dir, &format!("cannot be inspected: {e}"))),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(refuse_dir(dir, "is a symlink"));
+    }
+    if !meta.is_dir() {
+        return Err(refuse_dir(dir, "is not a directory"));
+    }
+    let uid = process_uid();
+    if meta.uid() != uid {
+        return Err(refuse_dir(
+            dir,
+            &format!("is owned by uid {}, not by uid {uid}", meta.uid()),
+        ));
+    }
+    Ok(())
 }
 
 /// The daemon key: everything that changes what an answer means.
@@ -1668,6 +1709,55 @@ mod tests {
     #[test]
     fn key_depends_on_keyed_env() {
         assert_ne!(key("/bin/mcp", 10, 20, "1"), key("/bin/mcp", 10, 20, "0"));
+    }
+
+    /// A directory the daemon did not create keeps the mode its owner gave it.
+    ///
+    /// The socket directory can be named by the caller (`--socket <dir>/x.sock`,
+    /// `RMC_DAEMON_DIR`), and tightening someone's own directory to `0o700` as a
+    /// side effect of starting a server is a change nobody asked for.
+    #[test]
+    fn an_existing_directory_keeps_its_mode() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let dir = temp.path().join("sockets");
+        fs::create_dir(&dir).expect("create");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        ensure_dir(&dir).expect("an owned directory is accepted");
+
+        let mode = fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the daemon rewrote a directory it did not create");
+    }
+
+    /// A new directory is still created owner-only: the socket is an entry point
+    /// into analysing someone's code. This is the positive control for the test
+    /// above — without it, "never chmod anything" would pass that one.
+    #[test]
+    fn a_created_directory_is_owner_only() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let dir = temp.path().join("fresh");
+
+        ensure_dir(&dir).expect("a fresh directory is created");
+
+        let mode = fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    /// A symlink decides where the socket really lands, so it must be seen
+    /// rather than followed — `create_dir_all` on it succeeds silently.
+    #[test]
+    fn a_symlinked_directory_is_refused() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let real = temp.path().join("real");
+        let link = temp.path().join("link");
+        fs::create_dir(&real).expect("create");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let refusal = ensure_dir(&link).expect_err("a symlinked socket directory must be refused");
+        assert!(
+            refusal.to_string().contains("is a symlink"),
+            "the refusal must say what is wrong: {refusal}"
+        );
     }
 
     /// The index root must split daemons too. It is not an env var here on
