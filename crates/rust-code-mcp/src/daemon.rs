@@ -61,11 +61,12 @@ use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncWriteExt, copy};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -113,6 +114,14 @@ const IDLE_TICK: Duration = Duration::from_secs(15);
 /// process dies earlier, its exit status ends the wait instead of the timeout.
 const SPAWN_WAIT: Duration = Duration::from_secs(90);
 const SPAWN_POLL: Duration = Duration::from_millis(50);
+/// How long the client keeps draining the socket after stdin reached EOF.
+///
+/// A healthy session ends the drain by itself: the daemon sees the half-close,
+/// finishes the answers it still owes, and closes. This bound only stops a
+/// client from waiting forever behind a daemon that never closes — and reaching
+/// it is a failure, not a shutdown, because replies the host is waiting for
+/// never arrived.
+const DRAIN_AFTER_EOF: Duration = Duration::from_secs(60);
 
 /// How this process was started. Resolved *before* the expensive startup: a
 /// client needs neither a `ServerRuntime` nor a background sync task — it is a pipe.
@@ -718,10 +727,7 @@ pub async fn run_client(socket: &Path) -> Result<bool, BoxError> {
     drop(lock);
 
     match stream {
-        Some(stream) => {
-            proxy(stream).await?;
-            Ok(true)
-        }
+        Some(stream) => proxy(stream).await,
         None => Ok(false),
     }
 }
@@ -815,27 +821,83 @@ async fn wait_for_daemon(socket: &Path, mut child: Child) -> Option<UnixStream> 
     }
 }
 
-/// Pump stdin/stdout ↔ socket.
+/// Pump stdin/stdout ↔ socket for one session, returning [`run_client`]'s
+/// verdict: `true` when the daemon served it, `false` when nothing was
+/// exchanged and the caller may still serve it in-process.
 ///
-/// `select`, not `join`: the daemon is the side that closes the connection, and
-/// waiting for EOF on stdin after that would hang — it may never arrive.
-async fn proxy(stream: UnixStream) -> io::Result<()> {
+/// Half-close, not cancel. At stdin EOF the write half is shut down, the daemon
+/// sees that EOF, finishes the answers it still owes and closes — and those
+/// answers arrive BETWEEN the half-close and the close. Ending the session at
+/// stdin EOF (a plain `select!` over both directions) dropped every reply still
+/// in flight, so a piped one-shot returned nothing at all while the same input
+/// through `RMC_DAEMON=0` answered normally. Hence the drain below.
+///
+/// The socket reaching EOF while stdin is still open is the opposite case: that
+/// daemon died mid-session. It is a failure, not a shutdown, and reporting it as
+/// success would hand the host a silence it cannot tell from an answer.
+async fn proxy(stream: UnixStream) -> Result<bool, BoxError> {
     let (mut from_daemon, mut to_daemon) = stream.into_split();
-    let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
+    // Whether stdin gave up a single byte decides which failure this is, and it
+    // must be readable while the copy still runs. A flag, not a count: nothing
+    // here needs the total.
+    let consumed = AtomicBool::new(false);
 
-    let upstream = async {
-        copy(&mut stdin, &mut to_daemon).await?;
+    let mut upstream = pin!(async {
+        let mut stdin = tokio::io::stdin();
+        let mut head = [0u8; 8 * 1024];
+        let n = stdin.read(&mut head).await?;
+        if n > 0 {
+            consumed.store(true, Ordering::Relaxed);
+            to_daemon.write_all(&head[..n]).await?;
+            copy(&mut stdin, &mut to_daemon).await?;
+        }
         to_daemon.shutdown().await
-    };
-    let downstream = async {
+    });
+    let mut downstream = pin!(async {
         copy(&mut from_daemon, &mut stdout).await?;
         stdout.flush().await
+    });
+
+    // Bytes already taken from stdin are gone from the pipe, so an in-process
+    // server started afterwards would answer a truncated stream. A session that
+    // never started can still be served locally.
+    let ended = |reason: BoxError| -> Result<bool, BoxError> {
+        if consumed.load(Ordering::Relaxed) {
+            return Err(reason);
+        }
+        tracing::warn!("daemon session ended with nothing exchanged: {reason}; serving in-process");
+        Ok(false)
     };
 
     tokio::select! {
-        result = upstream => result,
-        result = downstream => result,
+        result = &mut upstream => {
+            if let Err(e) = result {
+                return ended(e.into());
+            }
+        }
+        // Nobody is left to answer requests that were already sent, and the host
+        // is waiting for them: exiting cleanly here would report a crash as a
+        // shutdown.
+        result = &mut downstream => {
+            return ended(match result {
+                Ok(()) => "daemon closed the connection while stdin was still open".into(),
+                Err(e) => format!("daemon connection failed mid-session: {e}").into(),
+            });
+        }
+    }
+
+    match tokio::time::timeout(DRAIN_AFTER_EOF, &mut downstream).await {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(e)) => ended(e.into()),
+        // Not `ended`: stdin has run to EOF and everything it held went to the
+        // daemon, so no in-process server can serve this session even if not a
+        // single byte moved.
+        Err(_elapsed) => Err(format!(
+            "daemon held the connection open for longer than DRAIN_AFTER_EOF \
+             ({DRAIN_AFTER_EOF:?}) after stdin closed; replies may have been lost"
+        )
+        .into()),
     }
 }
 
