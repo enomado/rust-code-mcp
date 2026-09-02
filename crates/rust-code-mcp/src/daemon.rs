@@ -56,8 +56,10 @@ use rmc_server::mcp::{
 use rmc_server::tools::SearchTool;
 use rmcp::ServiceExt;
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -98,10 +100,22 @@ pub const RETIRE_GRACE_ENV: &str = "RMC_RETIRE_GRACE_SECS";
 /// `0` disables it — see [`should_collect_garbage`].
 pub const GC_INTERVAL_ENV: &str = "RMC_GC_INTERVAL_SECS";
 
-/// Env vars that change what the server computes, and therefore which daemon a
-/// client belongs to. Extend this list whenever a new behaviour-changing knob is
-/// added, or clients configured differently will end up sharing one server.
-const KEYED_ENV: [&str; 3] = [EMBEDDING_PROFILE_ENV, BACKGROUND_SYNC_ENV, EP_CENSUS_ENV];
+/// A prefix policy rather than a list, because a list falls behind the code.
+///
+/// Every knob this server reads is namespaced, and the hand-kept list this
+/// replaced named three variables while the code read far more: the five
+/// `RUST_CODE_MCP_OPENROUTER_*` settings decide WHICH endpoint answers, and none
+/// of them was keyed — two sessions pointing at different endpoints shared one
+/// daemon, whose answers came from whichever endpoint the first client had.
+const KEYED_ENV_PREFIXES: [&str; 2] = ["RMC_", "RUST_CODE_MCP_"];
+
+/// Keyed without a shared prefix: whose account pays for a request, and which
+/// ONNX/CUDA libraries the daemon links when it starts.
+const KEYED_ENV_EXTRA: [&str; 2] = ["OPENROUTER_API_KEY", "LD_LIBRARY_PATH"];
+
+/// Keyed prefix, excluded anyway: these select WHICH daemon a client talks to
+/// rather than what it answers, so keying them would split one daemon in two.
+const UNKEYED_ENV: [&str; 3] = [DAEMON_ENV, DAEMON_DIR_ENV, IDLE_ENV];
 
 /// Half an hour: long enough to survive a pause between questions in a session,
 /// short enough that a closed editor does not hold gigabytes until end of day.
@@ -600,26 +614,67 @@ fn daemon_key() -> Result<String, BoxError> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
 
-    let env: Vec<(&str, String)> = KEYED_ENV
-        .iter()
-        .map(|key| {
-            (
-                *key,
-                std::env::var(key).unwrap_or_else(|_| "<unset>".to_string()),
-            )
-        })
-        .collect();
+    // `vars_os`, not `vars`: the latter panics on a non-UTF-8 name or value
+    // ANYWHERE in this process. This runs before the in-process fallback exists,
+    // so that panic would kill the session instead of degrading it.
+    let env = keyed_env_pairs(std::env::vars_os());
+    let data_dir = rmc_server::mcp::project_paths::data_dir();
+    let key = key_from_parts(&data_dir, &exe, exe_len, exe_mtime, &env);
 
-    Ok(key_from_parts(&exe, exe_len, exe_mtime, &env))
+    // Names, never values: the keyed set now includes OPENROUTER_API_KEY, and a
+    // secret written to a log stays in that log.
+    let names: Vec<_> = env.iter().map(|(name, _)| name.to_string_lossy()).collect();
+    tracing::debug!(
+        "daemon key {key} for index root {}, keyed env: {}",
+        data_dir.display(),
+        names.join(", ")
+    );
+    Ok(key)
+}
+
+/// The keyed variables of `env`, sorted by the raw bytes of the name so that the
+/// key does not depend on the order in which the operating system hands the
+/// environment over.
+///
+/// Bytes, never text: nothing is decoded and nothing is skipped. A variable
+/// dropped for not decoding still changed what the daemon does, so two shells
+/// with different non-UTF-8 `LD_LIBRARY_PATH` values would get one key and
+/// therefore one daemon — the very collision this key exists to prevent.
+fn keyed_env_pairs(env: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
+    let keyed = |name: &OsString| {
+        let name = name.as_bytes();
+        !UNKEYED_ENV.iter().any(|unkeyed| name == unkeyed.as_bytes())
+            && (KEYED_ENV_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_bytes()))
+                || KEYED_ENV_EXTRA.iter().any(|extra| name == extra.as_bytes()))
+    };
+    let mut pairs: Vec<(OsString, OsString)> = env.filter(|(name, _)| keyed(name)).collect();
+    pairs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    pairs
 }
 
 /// The pure part of the key: everything that matters arrives as an argument.
 ///
-/// Split out of [`workspace_key`] for testability rather than tidiness: checking
+/// Split out of [`daemon_key`] for testability rather than tidiness: checking
 /// "the key changes with configuration" through `set_var` means mutating global
 /// env in parallel with other tests, which fails for reasons unrelated to keys.
-fn key_from_parts(exe: &Path, exe_len: u64, exe_mtime: u128, env: &[(&str, String)]) -> String {
+///
+/// `data_dir` is the index root, hashed as the path it resolves to rather than
+/// as the variables that resolve it: that chain (`XDG_DATA_HOME`, then `HOME`)
+/// carries no keyed prefix, so two clients pointing at different index roots
+/// used to meet in one daemon and then read and write the root of whichever
+/// client happened to spawn it. Hashing the outcome also survives a later change
+/// to that chain.
+fn key_from_parts(
+    data_dir: &Path,
+    exe: &Path,
+    exe_len: u64,
+    exe_mtime: u128,
+    env: &[(OsString, OsString)],
+) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(data_dir.as_os_str().as_encoded_bytes());
     hasher.update(exe.as_os_str().as_encoded_bytes());
     hasher.update(exe_len.to_le_bytes());
     hasher.update(exe_mtime.to_le_bytes());
@@ -1587,12 +1642,19 @@ mod tests {
         assert!(resolve_mode(&owned).is_err());
     }
 
+    fn pairs(env: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        env.iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect()
+    }
+
     fn key(exe: &str, len: u64, mtime: u128, sync: &str) -> String {
         key_from_parts(
+            Path::new("/index-root"),
             Path::new(exe),
             len,
             mtime,
-            &[(BACKGROUND_SYNC_ENV, sync.to_string())],
+            &pairs(&[(BACKGROUND_SYNC_ENV, sync)]),
         )
     }
 
@@ -1606,6 +1668,82 @@ mod tests {
     #[test]
     fn key_depends_on_keyed_env() {
         assert_ne!(key("/bin/mcp", 10, 20, "1"), key("/bin/mcp", 10, 20, "0"));
+    }
+
+    /// The index root must split daemons too. It is not an env var here on
+    /// purpose: `data_dir()` is resolved through `XDG_DATA_HOME` and then `HOME`,
+    /// neither of which carries a keyed prefix, so keying the variables would
+    /// have left two clients with different index roots sharing one server —
+    /// and that server reads and writes the root of whoever spawned it.
+    #[test]
+    fn key_depends_on_the_index_root() {
+        let one = key_from_parts(Path::new("/roots/a"), Path::new("/bin/mcp"), 10, 20, &[]);
+        let other = key_from_parts(Path::new("/roots/b"), Path::new("/bin/mcp"), 10, 20, &[]);
+        assert_ne!(one, other, "two index roots must not meet in one daemon");
+    }
+
+    /// The policy, stated as three separate claims about which names are keyed.
+    ///
+    /// Mutation that must fail it: go back to a fixed list of names, and the
+    /// openrouter variable stops being seen — which is the state this replaced.
+    #[test]
+    fn keyed_env_pairs_follows_the_prefix_policy() {
+        let collected = keyed_env_pairs(
+            pairs(&[
+                ("RUST_CODE_MCP_OPENROUTER_CONCURRENCY", "16"),
+                ("RMC_EMBEDDING_PROFILE", "local-cpu-small"),
+                ("OPENROUTER_API_KEY", "secret"),
+                ("LD_LIBRARY_PATH", "/opt/onnx"),
+                // Transport knobs: keyed prefix, deliberately excluded.
+                ("RMC_DAEMON", "0"),
+                ("RMC_DAEMON_DIR", "/run/user/1000"),
+                ("RMC_DAEMON_IDLE_SECS", "5"),
+                // Nothing to do with this server.
+                ("PATH", "/usr/bin"),
+                ("HOME", "/home/nobody"),
+            ])
+            .into_iter(),
+        );
+        let names: Vec<String> = collected
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "LD_LIBRARY_PATH",
+                "OPENROUTER_API_KEY",
+                "RMC_EMBEDDING_PROFILE",
+                "RUST_CODE_MCP_OPENROUTER_CONCURRENCY",
+            ],
+            "keyed set, sorted by name"
+        );
+    }
+
+    /// A transport knob must NOT split the fleet: two clients that differ only
+    /// in how long a daemon idles are asking the same questions of the same
+    /// code, and keying it would double the memory this module exists to save.
+    #[test]
+    fn transport_knobs_do_not_change_the_key() {
+        let with_idle = keyed_env_pairs(pairs(&[("RMC_DAEMON_IDLE_SECS", "5")]).into_iter());
+        assert!(
+            with_idle.is_empty(),
+            "a transport knob leaked into the key: {with_idle:?}"
+        );
+    }
+
+    /// The environment arrives in whatever order the OS chose, and two shells
+    /// with the same settings must still meet in one daemon.
+    #[test]
+    fn key_ignores_the_order_the_environment_arrives_in() {
+        let forward = keyed_env_pairs(
+            pairs(&[("RMC_A", "1"), ("RMC_B", "2")]).into_iter(),
+        );
+        let backward = keyed_env_pairs(
+            pairs(&[("RMC_B", "2"), ("RMC_A", "1")]).into_iter(),
+        );
+        assert_eq!(forward, backward);
     }
 
     /// The inverse of the old `key_depends_on_project`, and the whole point of
