@@ -12,8 +12,10 @@ tokio = { workspace = true, features = ["net", "time", "io-util"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Лок вокруг «поднять демона»: без него две одновременные сессии поднимут двух.
-fs2 = "0.4"
-# Ключ сокета (проект + env + версия бинаря).
+fs2 = { workspace = true }
+# `geteuid` — проверка, что каталог сокета наш, а не чужой.
+libc = { workspace = true }
+# Ключ сокета (корень индекса + env + версия бинаря).
 sha2 = { workspace = true }
 # Глобальный аллокатор под фичей `mimalloc` — см. её комментарий ниже.
 mimalloc = { version = "0.1", optional = true }
