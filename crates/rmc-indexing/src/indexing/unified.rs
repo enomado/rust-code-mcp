@@ -106,6 +106,36 @@ fn has_disk_headroom(available_bytes: u64, minimum_mb: u64) -> bool {
     minimum_mb == 0 || available_bytes >= minimum_mb.saturating_mul(1024 * 1024)
 }
 
+/// Set to `0` to skip the post-run vector-store maintenance pass entirely.
+const VECTOR_MAINTENANCE_ENV: &str = "RMC_VECTOR_MAINTENANCE";
+
+/// Age below which dataset versions are left alone by the prune pass.
+///
+/// Not a tuning number: it is the margin for a reader that opened the
+/// table before maintenance started and is still walking it. Ten minutes
+/// is far longer than any single query and far shorter than the interval
+/// at which versions pile up.
+const VECTOR_PRUNE_KEEP_ENV: &str = "RMC_VECTOR_PRUNE_KEEP_SECS";
+const DEFAULT_VECTOR_PRUNE_KEEP_SECS: u64 = 600;
+
+fn vector_maintenance_enabled() -> bool {
+    !matches!(
+        std::env::var(VECTOR_MAINTENANCE_ENV)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
+}
+
+fn vector_prune_keep() -> std::time::Duration {
+    let secs = std::env::var(VECTOR_PRUNE_KEEP_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_VECTOR_PRUNE_KEEP_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 fn nearest_existing_path(path: &Path) -> &Path {
     let mut candidate = path;
     while !candidate.exists() {
@@ -399,6 +429,10 @@ impl UnifiedIndexer {
             stats.failed_files
         );
 
+        if stats.indexed_files > 0 {
+            self.maintain_vector_store().await;
+        }
+
         Ok(stats)
     }
 
@@ -514,6 +548,10 @@ impl UnifiedIndexer {
             stats.failed_files
         );
 
+        if stats.indexed_files > 0 {
+            self.maintain_vector_store().await;
+        }
+
         Ok(stats)
     }
 
@@ -532,6 +570,44 @@ impl UnifiedIndexer {
     /// Commit Tantivy changes
     pub fn commit(&mut self) -> Result<()> {
         self.tantivy.commit()
+    }
+
+    /// Reclaim the disk space this run's writes left behind.
+    ///
+    /// Call this from EVERY path that writes to the vector store, and only
+    /// after one that actually wrote. There are three such paths — whole
+    /// directory, parallel whole directory, and the per-file incremental
+    /// update — and they do not nest, so a hook on any one of them would
+    /// leave the other two growing. The 5-minute background sync uses the
+    /// per-file path, which makes it the one that matters most.
+    ///
+    /// Deliberately infallible: the index is correct either way, and a
+    /// maintenance failure is a disk-space problem rather than an indexing
+    /// one. Failing the run over it would mean a full disk also destroys
+    /// the record of the work that did complete.
+    pub async fn maintain_vector_store(&self) {
+        if !vector_maintenance_enabled() {
+            tracing::debug!(
+                "Vector store maintenance disabled by {}",
+                VECTOR_MAINTENANCE_ENV
+            );
+            return;
+        }
+        let started = std::time::Instant::now();
+        match self.vector_store.maintain(vector_prune_keep()).await {
+            Ok(stats) => tracing::info!(
+                "Vector store maintenance: {} fragment(s) merged into {}, {} old version(s) pruned, {:.1} MiB reclaimed in {:.2}s",
+                stats.fragments_removed,
+                stats.fragments_added,
+                stats.old_versions_removed,
+                stats.bytes_removed as f64 / (1024.0 * 1024.0),
+                started.elapsed().as_secs_f64(),
+            ),
+            Err(e) => tracing::warn!(
+                "Vector store maintenance failed (index is still correct, disk use will keep growing): {}",
+                e
+            ),
+        }
     }
 
     /// Clear all indexed data (metadata cache, Tantivy, and vector store)
