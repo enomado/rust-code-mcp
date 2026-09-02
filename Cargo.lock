@@ -7226,6 +7226,7 @@ dependencies = [
  "ide",
  "ide-db",
  "lancedb",
+ "libc",
  "load-cargo",
  "mimalloc",
  "notify 6.1.1",
