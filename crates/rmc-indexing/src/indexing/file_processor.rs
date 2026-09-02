@@ -5,6 +5,7 @@
 //! change detection via the metadata cache.
 
 use crate::indexing::IndexingError;
+use crate::indexing::error::OUTCOME_CONTAINS_SECRETS;
 use crate::metadata_cache::MetadataCache;
 use crate::security::SecretsScanner;
 use crate::security::SensitiveFileFilter;
@@ -122,7 +123,7 @@ impl FileProcessor {
                 file_path.display(),
                 summary
             );
-            return Err(IndexingError::Parser("Contains secrets".into()));
+            return Err(IndexingError::Parser(OUTCOME_CONTAINS_SECRETS.into()));
         }
         Ok(())
     }
