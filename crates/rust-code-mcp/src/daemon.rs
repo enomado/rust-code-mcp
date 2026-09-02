@@ -60,7 +60,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::pin::pin;
@@ -146,7 +146,16 @@ pub enum Mode {
     /// Daemon: listens on a socket, serves many clients from one `RuntimeState`.
     Daemon { socket: PathBuf, idle: Duration },
     /// Client: stdin/stdout ↔ socket, spawning the daemon when needed.
-    Client { socket: PathBuf },
+    ///
+    /// `idle` carries `--idle-secs` only when the command line actually passed
+    /// it, so a daemon this client starts honours the flag. The environment
+    /// default stays a daemon-side concern: the spawned process inherits the
+    /// variable itself, and forwarding it here would turn "unset" into an
+    /// explicit argument.
+    Client {
+        socket: PathBuf,
+        idle: Option<Duration>,
+    },
     /// `--print-socket`: print the resolved socket path and exit (diagnostics).
     PrintSocket { socket: PathBuf },
     /// `--help`.
@@ -194,15 +203,16 @@ pub fn resolve_mode(args: &[String]) -> Result<Mode, BoxError> {
         Some(path) => path,
         None => default_socket_path()?,
     };
-    let idle = idle.unwrap_or_else(idle_from_env);
-
     Ok(match explicit {
-        Some("--daemon") => Mode::Daemon { socket, idle },
-        Some("--client") => Mode::Client { socket },
+        Some("--daemon") => Mode::Daemon {
+            socket,
+            idle: idle.unwrap_or_else(idle_from_env),
+        },
+        Some("--client") => Mode::Client { socket, idle },
         Some("--in-process") => Mode::InProcess,
         Some("--print-socket") => Mode::PrintSocket { socket },
         _ if daemon_disabled() => Mode::InProcess,
-        _ => Mode::Client { socket },
+        _ => Mode::Client { socket, idle },
     })
 }
 
@@ -218,7 +228,8 @@ on demand.
   --print-socket      print this configuration's socket path and exit
   --socket <PATH>     use this socket instead of the one derived from the
                       binary and the environment
-  --idle-secs <N>     daemon exits after N seconds with no clients (0 = never)
+  --idle-secs <N>     daemon exits after N seconds with no clients (0 = never);
+                      a client passes it on to a daemon it starts
 
 Env: RMC_DAEMON=0 forces in-process; RMC_DAEMON_DIR sets the socket directory;
      RMC_DAEMON_IDLE_SECS is the same as --idle-secs.
@@ -779,11 +790,14 @@ async fn try_connect(socket: &Path) -> Option<UnixStream> {
 /// `Ok(true)` — the session ran through the daemon and finished. `Ok(false)` —
 /// no daemon could be reached or started, and the caller must serve the session
 /// itself, in-process.
-pub async fn run_client(socket: &Path) -> Result<bool, BoxError> {
+/// `idle` is this client's `--idle-secs`, passed on to a daemon it starts.
+pub async fn run_client(socket: &Path, idle: Option<Duration>) -> Result<bool, BoxError> {
     if let Some(stream) = try_connect(socket).await {
         tracing::info!("connected to shared daemon at {}", socket.display());
-        proxy(stream).await?;
-        return Ok(true);
+        // The verdict is the proxy's, not ours: a session where nothing was
+        // exchanged can still be served in-process, and discarding that here
+        // would report an empty session as a completed one.
+        return proxy(stream).await;
     }
 
     if let Some(parent) = socket.parent() {
@@ -805,13 +819,36 @@ pub async fn run_client(socket: &Path) -> Result<bool, BoxError> {
     let stream = match try_connect(socket).await {
         Some(stream) => Some(stream),
         None => {
-            // The socket file exists but refuses connections, so the daemon died
-            // without cleaning up. Remove it ourselves: binding over a live file
-            // fails with EADDRINUSE.
-            if socket.exists() {
-                let _ = fs::remove_file(socket);
+            // Nobody answers, so this is the corpse of a daemon that died
+            // without cleaning up: remove it, because binding over an existing
+            // file fails with EADDRINUSE.
+            //
+            // A socket only. `--socket` can name anything, and a mistyped path
+            // must never make this delete someone else's file — the check is
+            // what separates "clear a stale address" from "rm whatever is
+            // there". `symlink_metadata`, so a symlink is judged as a symlink
+            // rather than as whatever it points at.
+            match fs::symlink_metadata(socket) {
+                Ok(meta) if meta.file_type().is_socket() => {
+                    if let Err(e) = fs::remove_file(socket) {
+                        tracing::warn!(
+                            "cannot remove stale {}: {e}; serving in-process",
+                            socket.display()
+                        );
+                        return Ok(false);
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "{} exists and is not a socket; serving in-process",
+                        socket.display()
+                    );
+                    return Ok(false);
+                }
+                // Nothing there: the ordinary first-start case.
+                Err(_) => {}
             }
-            match spawn_daemon(socket) {
+            match spawn_daemon(socket, idle) {
                 Ok(child) => wait_for_daemon(socket, child).await,
                 Err(e) => {
                     tracing::warn!("failed to spawn daemon: {e}; serving in-process");
@@ -861,15 +898,20 @@ fn open_daemon_log(socket: &Path) -> io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
-fn spawn_daemon(socket: &Path) -> io::Result<Child> {
+/// Start the daemon for `socket`, forwarding `--idle-secs` when the client was
+/// given one. Without that forwarding the flag was parsed and dropped: only the
+/// environment variable reached the daemon, by inheritance, so `--idle-secs 5`
+/// through the ordinary client path did nothing at all.
+fn spawn_daemon(socket: &Path, idle: Option<Duration>) -> io::Result<Child> {
     let exe = std::env::current_exe()?;
     let log = open_daemon_log(socket)?;
 
     let mut cmd = Command::new(exe);
-    cmd.arg("--daemon")
-        .arg("--socket")
-        .arg(socket)
-        .stdin(Stdio::null())
+    cmd.arg("--daemon").arg("--socket").arg(socket);
+    if let Some(idle) = idle {
+        cmd.arg("--idle-secs").arg(idle.as_secs().to_string());
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         // The daemon's stderr goes to a file next to the socket: otherwise the
         // diagnostics of a shared process die with the session that spawned it.
@@ -1136,10 +1178,16 @@ pub async fn run_daemon(
                     if let Err(e) = serve_connection(stream, state).await {
                         tracing::warn!("connection ended with error: {e}");
                     }
-                    // The idle countdown starts when the *last* client leaves.
-                    if live.fetch_sub(1, Ordering::SeqCst) == 1 {
-                        idle_since.store(now_secs(), Ordering::SeqCst);
-                    }
+                    // The mark BEFORE the count, never after. The idle loop reads
+                    // the counter and the mark separately, so publishing zero
+                    // first leaves a window where it sees "no clients, idle since
+                    // the first connect" — a long session then ends in an
+                    // immediate exit, and the next client pays to start the
+                    // daemon again. Storing on every departure rather than only
+                    // the last is harmless: the mark is read only at zero, and
+                    // "since the last client left" is what it means.
+                    idle_since.store(now_secs(), Ordering::SeqCst);
+                    live.fetch_sub(1, Ordering::SeqCst);
                 });
             }
             Some(Err(e)) => {
@@ -1656,6 +1704,36 @@ mod tests {
             Mode::Daemon {
                 socket: PathBuf::from("/tmp/x.sock"),
                 idle: Duration::from_secs(5),
+            }
+        );
+    }
+
+    /// A client must CARRY `--idle-secs`, because it is the side that starts the
+    /// daemon. The flag used to be parsed and then dropped on this path: only
+    /// the environment variable reached the daemon, by inheritance, so
+    /// `--idle-secs 5` on an ordinary invocation did nothing.
+    #[test]
+    fn a_client_carries_the_idle_flag_it_was_given() {
+        assert_eq!(
+            mode_of(&["--client", "--socket", "/tmp/x.sock", "--idle-secs", "7"]),
+            Mode::Client {
+                socket: PathBuf::from("/tmp/x.sock"),
+                idle: Some(Duration::from_secs(7)),
+            }
+        );
+    }
+
+    /// And must NOT invent one when the command line was silent: the spawned
+    /// daemon inherits `RMC_DAEMON_IDLE_SECS` itself, so passing a resolved
+    /// default here would turn "unset" into an explicit argument and hide the
+    /// environment from the process that reads it.
+    #[test]
+    fn a_client_without_the_flag_passes_nothing_on() {
+        assert_eq!(
+            mode_of(&["--client", "--socket", "/tmp/x.sock"]),
+            Mode::Client {
+                socket: PathBuf::from("/tmp/x.sock"),
+                idle: None,
             }
         );
     }
