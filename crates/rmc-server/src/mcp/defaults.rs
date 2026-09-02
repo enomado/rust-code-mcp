@@ -72,6 +72,12 @@ pub fn automatic_embedding_profile_name() -> &'static str {
             // Fail-fast: опечатка в имени профиля не должна тихо откатывать на
             // CPU-дефолт — иначе «GPU включён» окажется неправдой, а заметить
             // это можно будет только по скорости.
+            //
+            // Последний рубеж, а не первый: бинарь зовёт
+            // [`validate_automatic_profile`] ДО диспетчера режимов и отказывает
+            // кодом 2 с одной строкой. Паника остаётся для встраивания, где
+            // такого входа нет, — и её текст читается хуже, поэтому доходить
+            // сюда штатным путём не должно.
             if let Err(err) = resolve_startup_profile(&requested) {
                 panic!(
                     "{EMBEDDING_PROFILE_ENV}='{requested}' is not a usable embedding profile: {err}"
@@ -82,12 +88,12 @@ pub fn automatic_embedding_profile_name() -> &'static str {
         .as_str()
 }
 
-/// Разбор значения [`EMBEDDING_PROFILE_ENV`] в имя профиля.
+/// The profile name a value of [`EMBEDDING_PROFILE_ENV`] asks for.
 ///
-/// Пустая строка и пробелы трактуются как «переменная не задана»: пустое
-/// значение в обёртке запуска — обычная опечатка, и молча взять её за имя
-/// профиля значило бы отказать в старте вместо разумного дефолта.
-pub(crate) fn resolve_automatic_profile_name(env_value: Option<&str>) -> String {
+/// A blank value counts as unset: an empty value from a launch wrapper is a
+/// slip, and taking it for a profile name would refuse to start instead of
+/// falling back to a sensible default.
+pub fn resolve_automatic_profile_name(env_value: Option<&str>) -> String {
     env_value
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -116,6 +122,21 @@ fn startup_project_root() -> PathBuf {
 /// параметра тула они работают.
 fn resolve_startup_profile(name: &str) -> Result<EmbeddingProfile, String> {
     resolve_profile(name, &startup_project_root())
+}
+
+/// Check that `name` resolves to a usable profile, installing nothing.
+///
+/// Public because the refusal has to happen BEFORE a binary picks its mode. A
+/// client of the shared daemon returns from `main` long before anything reads
+/// the profile, so a typo used to travel through the daemon and exit 0 — while
+/// the same typo with `RMC_DAEMON=0` refused to start. One input, two outcomes,
+/// decided by a transport the caller never chose.
+///
+/// Resolved through [`resolve_startup_profile`], so a PROJECT profile from
+/// `embedding_profiles.toml` counts as usable here exactly as it does for an
+/// explicit tool parameter.
+pub fn validate_automatic_profile(name: &str) -> Result<(), String> {
+    resolve_startup_profile(name).map(|_| ())
 }
 
 pub(crate) fn automatic_embedding_backend() -> EmbeddingBackend {

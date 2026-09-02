@@ -19,10 +19,10 @@ mod daemon;
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use rmc_server::mcp::{
-    BACKGROUND_SYNC_ENABLED_VALUES, BACKGROUND_SYNC_ENV, EP_CENSUS_ENV, ServerRuntime,
-    automatic_embedding_profile_name, cpu_profile_on_gpu_build_warning, gpu_backends_compiled,
-    parse_background_sync_env,
-    probe_ep_census_on_startup,
+    BACKGROUND_SYNC_ENABLED_VALUES, BACKGROUND_SYNC_ENV, EMBEDDING_PROFILE_ENV, EP_CENSUS_ENV,
+    ServerRuntime, automatic_embedding_profile_name, cpu_profile_on_gpu_build_warning,
+    gpu_backends_compiled, parse_background_sync_env, probe_ep_census_on_startup,
+    resolve_automatic_profile_name, validate_automatic_profile,
 };
 use rmc_server::tools::SearchTool;
 use rmcp::{ServiceExt, transport::stdio};
@@ -67,6 +67,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // The two modes that serve nothing come first: they answer from the
+    // arguments alone, and they are how a host reads back a configuration it
+    // got wrong. A rejected profile must not silence them.
     #[cfg(unix)]
     match &mode {
         daemon::Mode::Help => {
@@ -77,6 +80,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", socket.display());
             return Ok(());
         }
+        daemon::Mode::Client { .. } | daemon::Mode::Daemon { .. } | daemon::Mode::InProcess => {}
+    }
+
+    // A statement, not an argument to a log line. `tracing` evaluates arguments
+    // only when the callsite level is enabled, so the check that used to live
+    // inside `tracing::info!` was skipped under `RUST_LOG=error` — a quiet log
+    // level started the server with an unusable profile.
+    //
+    // Here rather than further down: every mode below this line serves a
+    // session, including the client of the shared daemon, which returns from
+    // `main` before any of the startup code runs. That is how a typo used to
+    // exit 0 through the daemon and exit non-zero with `RMC_DAEMON=0` — one
+    // input, two outcomes, chosen by a transport nobody asked about.
+    let requested_profile =
+        resolve_automatic_profile_name(std::env::var(EMBEDDING_PROFILE_ENV).ok().as_deref());
+    if let Err(err) = validate_automatic_profile(&requested_profile) {
+        eprintln!("{EMBEDDING_PROFILE_ENV}='{requested_profile}' is not usable: {err}");
+        std::process::exit(2);
+    }
+
+    #[cfg(unix)]
+    match &mode {
         daemon::Mode::Client { socket, idle } => {
             // An unreachable daemon never leaves the session without a server:
             // fall through to the previous in-process behaviour.
@@ -100,7 +125,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        daemon::Mode::Daemon { .. } | daemon::Mode::InProcess => {}
+        daemon::Mode::Daemon { .. }
+        | daemon::Mode::InProcess
+        | daemon::Mode::Help
+        | daemon::Mode::PrintSocket { .. } => {}
     }
 
     tracing::info!("Starting MCP Server...");
