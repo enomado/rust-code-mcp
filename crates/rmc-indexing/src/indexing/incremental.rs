@@ -217,6 +217,14 @@ impl IncrementalIndexer {
             stats.failed_files,
         );
 
+        // Vector-store maintenance is NOT hooked here, even though this
+        // looks like the natural place. The two branches above reach the
+        // store by different routes — a first-time index goes through
+        // `index_directory_parallel`, an update writes file by file — and
+        // only the second is peculiar to this function. Both are hooked at
+        // their own ends instead, which also covers the lazy
+        // `index_directory` path that never passes through here at all.
+
         Ok(stats)
     }
 
@@ -270,6 +278,9 @@ impl IncrementalIndexer {
     ) -> Result<IndexStats> {
         let mut stats = IndexStats::default();
         let storage_path = self.config.cache_path.clone();
+        // Captured before `changes` is consumed below: deletions are writes
+        // too, and the maintenance gate at the end needs to know about them.
+        let deleted_count = changes.deleted.len();
         let indexer = self.ensure_indexer().await?;
 
         // Handle deletions
@@ -363,6 +374,15 @@ impl IncrementalIndexer {
             stats.total_chunks,
             stats.failed_files,
         );
+
+        // Reclaim what those writes left behind. Deletions count as writes
+        // here: they publish a version each without adding a fragment, and
+        // a tick that only removed files would otherwise pile up versions
+        // no pass ever collects. A tick that found nothing is skipped —
+        // there is nothing to compact and a pass would be pure I/O.
+        if stats.indexed_files > 0 || deleted_count > 0 {
+            indexer.maintain_vector_store().await;
+        }
 
         Ok(stats)
     }
