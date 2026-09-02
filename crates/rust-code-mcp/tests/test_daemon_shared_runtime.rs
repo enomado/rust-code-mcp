@@ -24,6 +24,25 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+/// Cut the developer's own MCP configuration out of a spawned server.
+///
+/// These tests assert about the transport, and every child inherits the
+/// environment of whoever runs them — which on a working machine is the live
+/// server's configuration. `RMC_EMBEDDING_PROFILE=local-gpu-bge` with
+/// `RMC_EP_CENSUS=1` is the usual pair, and it makes the test binary (built
+/// without `--features migraphx`) REFUSE to start, exactly as designed: the
+/// census exists to fail rather than quietly compute on the CPU. The result was
+/// every daemon test failing with `server closed stdout` on a machine where the
+/// daemon itself works fine, and passing in CI — a verdict that says more about
+/// the shell than about the code.
+///
+/// Removed rather than pinned to a value: naming a profile here would make the
+/// tests depend on which backends this build happens to carry.
+fn hermetic_env(command: &mut Command) {
+    command.env_remove("RMC_EMBEDDING_PROFILE");
+    command.env_remove("RMC_EP_CENSUS");
+}
+
 /// An MCP client: the binary plus a pipe to it.
 struct Session {
     child: Child,
@@ -56,6 +75,7 @@ impl Session {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        hermetic_env(&mut command);
         if shared {
             command.env_remove("RMC_DAEMON");
         } else {
@@ -267,15 +287,17 @@ fn killed_daemon_removes_its_socket() -> Result<()> {
     let dir = TempDir::new()?;
     let socket = dir.path().join("probe.sock");
 
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_rust-code-mcp"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rust-code-mcp"));
+    command
         .arg("--daemon")
         .arg("--socket")
         .arg(&socket)
         .env("RUST_LOG", "error")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    hermetic_env(&mut command);
+    let mut daemon = command.spawn()?;
 
     wait_until(Duration::from_secs(60), || socket.exists())
         .ok_or_else(|| anyhow!("the daemon never bound its socket"))?;
@@ -284,6 +306,102 @@ fn killed_daemon_removes_its_socket() -> Result<()> {
     let gone = wait_until(Duration::from_secs(30), || !socket.exists());
     let _ = daemon.wait();
     gone.ok_or_else(|| anyhow!("SIGTERM left a stale {}", socket.display()))?;
+    Ok(())
+}
+
+/// One session's worth of JSON-RPC in a file: handshake, then one call.
+///
+/// A file rather than a pipe the test closes itself, because the case under
+/// test is exactly "stdin reaches EOF while the server still owes an answer" —
+/// the shape of every one-shot invocation a host makes.
+fn piped_script(dir: &Path) -> Result<std::path::PathBuf> {
+    let path = dir.join("session.jsonl");
+    let mut file = std::fs::File::create(&path)?;
+    for message in [
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "piped-session-test", "version": "0.0.0" }
+            }
+        }),
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized", "params": {} }),
+        json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "runtime_status", "arguments": {} }
+        }),
+    ] {
+        writeln!(file, "{message}")?;
+    }
+    file.flush()?;
+    Ok(path)
+}
+
+/// Ids of the responses a piped session got back, in order.
+fn piped_response_ids(socket_dir: &Path, shared: bool) -> Result<Vec<u64>> {
+    let script = piped_script(socket_dir)?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rust-code-mcp"));
+    command
+        .env("RUST_LOG", "error")
+        .env("RMC_DAEMON_DIR", socket_dir)
+        .env("RMC_DAEMON_IDLE_SECS", "5")
+        .stdin(std::fs::File::open(&script)?)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    hermetic_env(&mut command);
+    if shared {
+        command.env_remove("RMC_DAEMON");
+    } else {
+        command.env("RMC_DAEMON", "0");
+    }
+
+    let output = command.output()?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        // A response, not a notification: it carries an id and an outcome.
+        .filter(|value| value.get("result").is_some() || value.get("error").is_some())
+        .filter_map(|value| value.get("id").and_then(Value::as_u64))
+        .collect())
+}
+
+/// A one-shot session must not lose the replies it was owed.
+///
+/// The proxy used to end the moment stdin reached EOF, which is the moment the
+/// last request has just been sent — so the answers still travelling from the
+/// daemon were dropped, and a piped invocation returned NOTHING while the same
+/// input with `RMC_DAEMON=0` answered normally. The daemon looked broken to
+/// every non-interactive caller and fine to every editor.
+///
+/// The oracle is the in-process path rather than a fixed list: whatever that
+/// one answers for this input, the shared daemon has to answer too.
+///
+/// Mutation that must fail it: drop the drain after the half-close (a plain
+/// `select!` over both directions), and the shared side comes back empty.
+#[test]
+fn a_piped_session_keeps_its_replies() -> Result<()> {
+    let shared_dir = TempDir::new()?;
+    let direct_dir = TempDir::new()?;
+
+    let through_daemon = piped_response_ids(shared_dir.path(), true)?;
+    let in_process = piped_response_ids(direct_dir.path(), false)?;
+
+    // The piped session leaves its daemon behind and its replies carry no pid,
+    // so ask an ordinary session which process is listening, and stop it.
+    let mut probe = Session::start(shared_dir.path(), true)?;
+    let daemon_pid = probe.serving_pid()?;
+    drop(probe);
+    kill_pid(daemon_pid);
+
+    assert!(
+        !in_process.is_empty(),
+        "the in-process oracle itself answered nothing, so it proves nothing about the daemon"
+    );
+    assert_eq!(
+        through_daemon, in_process,
+        "the daemon dropped replies that the in-process server delivered for the same input"
+    );
     Ok(())
 }
 
