@@ -200,6 +200,8 @@ Preview a project-wide rename of a Rust symbol using rust-analyzer. **Read-only*
 
 The symbol is resolved by exact leaf name. If multiple symbols share the name, the call fails with an "Ambiguous symbol" error and lists actionable candidates. Rerun with `file_path`, `line`, and `column` from the candidate list to disambiguate. rust-analyzer may also refuse the rename (e.g. for keywords, fields of trait impls in foreign crates, or names that would conflict).
 
+> **Caveat:** rust-analyzer's rename can silently miss occurrences inside macro bodies (e.g. `vec![Foo { .. }]`). The preview reflects exactly what rust-analyzer reports — this tool does not add a textual fallback. **Cross-check with `grep -rn '\bsymbol\b'` before applying any edits**, especially when the symbol appears inside `macro_name![ ... ]` invocations.
+
 **Also useful as a dry-run probe** (beyond actually renaming):
 
 - **Exact reference inventory.** Pass `new_name = symbol_name` to get every byte-precise reference RA can resolve — including method calls, trait-impl headers, `use` paths, and macro-expanded refs RA can trace. Stricter than `who_uses`, narrower than `find_references` (which also catches comments / docs).
