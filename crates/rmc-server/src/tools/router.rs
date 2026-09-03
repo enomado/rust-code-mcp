@@ -150,7 +150,7 @@ impl SearchToolRouter {
 
     /// Preview a rename of a symbol across the project (read-only, no files modified)
     #[tool(
-        description = "Preview renaming a Rust symbol project-wide using rust-analyzer. Returns the set of edits and file moves WITHOUT modifying any files. If symbol_name is ambiguous, rerun with file_path, line, and column from the candidate list."
+        description = "Preview renaming a Rust symbol project-wide using rust-analyzer. Returns the set of edits and file moves WITHOUT modifying any files. If symbol_name is ambiguous, rerun with file_path, line, and column from the candidate list. Caveat: rust-analyzer's rename can miss occurrences inside macro bodies (e.g. vec![]) — cross-check with grep before applying."
     )]
     async fn rename_symbol(
         &self,

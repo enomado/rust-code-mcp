@@ -306,6 +306,13 @@ pub(crate) async fn rename_symbol_with_semantic(
         }
     }
 
+    // A rename that silently misses call sites is worse than a refusal: the preview
+    // reads as complete, and what it left behind surfaces only at the next build.
+    out.push_str(
+        "\nNote: rust-analyzer's rename can miss occurrences inside macro bodies \
+         (e.g. vec![Foo { .. }]). Cross-check with `grep -rn '\\bsymbol\\b'` before applying.\n",
+    );
+
     Ok(CallToolResult::success(vec![Content::text(out)]))
 }
 
