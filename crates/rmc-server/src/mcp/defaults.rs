@@ -145,21 +145,27 @@ pub(crate) fn automatic_embedding_backend() -> EmbeddingBackend {
     EmbeddingBackend::from_profile(profile)
 }
 
-/// Стартовая проба EP, если её попросили через [`EP_CENSUS_ENV`].
+/// The startup EP probe, if it was asked for through [`EP_CENSUS_ENV`].
 ///
-/// Возвращает `Ok(None)`, когда ручка не взведена, и `Ok(Some(census))` —
-/// перепись узлов по провайдерам, уже записанную в лог.
+/// Returns `Ok(None)` when the knob is not set, and `Ok(Some(census))` — the
+/// per-provider node census, already written to the log.
 ///
-/// # Почему отказ, а не предупреждение
-/// Ручку взводят с одним вопросом: «GPU правда работает?». Класс, ради
-/// которого весь этот слой существует — EP поднялся, но граф посчитан на CPU —
-/// проявляется ТОЛЬКО скоростью, то есть предупреждение в логе стартующего
-/// сервера его не ловит: сервер поедет, и «GPU включён» останется ложным
-/// выводом. Поэтому на GPU-профиле нулевая перепись MIGraphX — ошибка старта:
-/// вердикт машинно-читаем (код возврата), а не «видно на экране».
+/// # Why a failure rather than a warning
+/// The knob is set with one question in mind: does the GPU really work? The
+/// class this whole layer exists for — the EP came up, but the graph was
+/// computed on the CPU — shows ONLY as speed, so a warning in a starting
+/// server's log does not catch it: the server drives on, and "GPU is on"
+/// stays a false conclusion. Hence a zero MIGraphX census on a GPU profile is
+/// an `Err` rather than a log line: the caller is left with a value to decide
+/// on.
 ///
-/// На CPU-профиле проба ничего не утверждает — только печатает перепись:
-/// «сколько узлов на CPU» это не отказ, а факт.
+/// ⚠ The startup caller no longer turns that value into a dead process — see
+/// [`spawn_ep_census_on_startup`] for why. This function is left exactly as it
+/// was so that the verdict can still be asked for on its own, away from a
+/// startup path where it has someone to hold up.
+///
+/// On a CPU profile the probe asserts nothing and only prints the census: how
+/// many nodes ran on the CPU is a fact, not a failure.
 pub fn probe_ep_census_on_startup() -> Result<Option<String>, String> {
     if !parse_enabled_env(std::env::var(EP_CENSUS_ENV).ok().as_deref()) {
         return Ok(None);
@@ -201,6 +207,60 @@ pub fn probe_ep_census_on_startup() -> Result<Option<String>, String> {
 
     ep_census_verdict(backend.runtime, profile, &census)?;
     Ok(Some(census.to_string()))
+}
+
+/// Start the EP census probe without waiting for it.
+///
+/// # Why it no longer blocks (2026-09-04)
+/// The probe used to run between process start and the transport coming up,
+/// and the argument for that — nobody is being served yet, so occupying this
+/// thread costs nothing — held exactly as long as the server was a stdio one,
+/// launched by the very client that was waiting for it anyway. A shared daemon
+/// voids it: the client is ALREADY waiting on the socket under a handshake
+/// deadline of its own (`MCP_TIMEOUT`, 30s by default in Claude Code).
+///
+/// Measured from the daemon log: 4.95s with a warm MIGraphX kernel cache and
+/// 38.7s with a cold one — the probe itself warns about 45-70s. So the session
+/// that had to start a cold daemon, and the daemon leaves on its idle timeout
+/// every half hour, lost every tool this server offers — deterministically,
+/// not now and then. A diagnostic does not get to decide whether the service
+/// happens at all.
+///
+/// # What that costs
+/// A failing probe no longer refuses the start. Refusing it AFTER the
+/// transport is up would cut clients already being served, and since it is a
+/// client that starts the daemon, a probe failing on every start would loop:
+/// client starts daemon, daemon dies, client starts daemon. The
+/// machine-readable verdict — the exit code — was a fiction in daemon mode
+/// regardless: nobody reads the exit status of a process a client spawned into
+/// the background. What remains is an `ERROR` in the log, and that is the
+/// honest price of the server being reachable in the first place.
+pub fn spawn_ep_census_on_startup() -> std::thread::JoinHandle<()> {
+    spawn_startup_probe(probe_ep_census_on_startup)
+}
+
+/// The part of [`spawn_ep_census_on_startup`] that is worth an oracle: what has
+/// to hold is that the call RETURNS rather than waiting for the probe, and a
+/// stand-in probe lets that be judged without a GPU, a model, or a network.
+fn spawn_startup_probe<F>(probe: F) -> std::thread::JoinHandle<()>
+where
+    F: FnOnce() -> Result<Option<String>, String> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("ep-census".to_string())
+        // The stack the probe used to run on, main's. ORT graph initialisation
+        // is not where one wants to find out empirically whether the default
+        // of a fresh thread is enough.
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || match probe() {
+            Ok(Some(census)) => tracing::info!("EP census on startup: {census}"),
+            Ok(None) => tracing::info!(
+                "EP census probe skipped; set {}=1 to check which provider runs the graph",
+                EP_CENSUS_ENV
+            ),
+            Err(e) => tracing::error!("{e}"),
+        })
+        .expect("spawning a thread for the EP census probe")
 }
 
 /// Вердикт по переписи: приемлема ли она для профиля, который просили.
@@ -321,6 +381,39 @@ pub(crate) fn is_background_embedding_backend(backend: &EmbeddingBackend) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the 2026-09-04 fix is about: the EP census does not get to hold up
+    /// whoever started it. It used to block ahead of the transport coming up,
+    /// and on a cold MIGraphX kernel cache (38.7s measured) it outlasted the
+    /// client's handshake deadline of 30s — that session got no tools at all.
+    ///
+    /// The stand-in probe is deliberate: what is asserted is the return of
+    /// control itself, and that has to be judged without a GPU, a model or a
+    /// network. The mutant — calling the probe directly — fails the first
+    /// assert; the second one is the positive control, that the probe is
+    /// actually run rather than dropped on the floor.
+    #[test]
+    fn a_startup_probe_does_not_gate_the_caller() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        let handle = spawn_startup_probe(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            tx.send(()).expect("the oracle listens until it joins");
+            Ok(None)
+        });
+        let returned_after = started.elapsed();
+
+        assert!(
+            returned_after < Duration::from_millis(200),
+            "the spawn waited for the probe: returned after {returned_after:?}"
+        );
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the stand-in probe never ran — the spawn lost it");
+        handle.join().expect("the probe thread panicked");
+    }
 
     #[test]
     fn background_sync_env_is_disabled_by_default() {

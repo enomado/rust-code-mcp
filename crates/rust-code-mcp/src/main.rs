@@ -19,10 +19,10 @@ mod daemon;
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use rmc_server::mcp::{
-    BACKGROUND_SYNC_ENABLED_VALUES, BACKGROUND_SYNC_ENV, EMBEDDING_PROFILE_ENV, EP_CENSUS_ENV,
-    ServerRuntime, automatic_embedding_profile_name, cpu_profile_on_gpu_build_warning,
-    gpu_backends_compiled, parse_background_sync_env, probe_ep_census_on_startup,
-    resolve_automatic_profile_name, validate_automatic_profile,
+    BACKGROUND_SYNC_ENABLED_VALUES, BACKGROUND_SYNC_ENV, EMBEDDING_PROFILE_ENV, ServerRuntime,
+    automatic_embedding_profile_name, cpu_profile_on_gpu_build_warning, gpu_backends_compiled,
+    parse_background_sync_env, resolve_automatic_profile_name, spawn_ep_census_on_startup,
+    validate_automatic_profile,
 };
 use rmc_server::tools::SearchTool;
 use rmcp::{ServiceExt, transport::stdio};
@@ -160,28 +160,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("{warning}");
     }
 
-    // Проба «на чём реально считается граф» — по ручке RMC_EP_CENSUS.
+    // Which execution provider actually runs the graph — behind RMC_EP_CENSUS.
     //
-    // Блокирующая и делается ДО того, как поднят сервис: пока никто не
-    // обслуживается, занять поток тут ничем не мешает, а вот получить ответ
-    // после первого запроса было бы поздно.
-    //
-    // Отказ пробы валит старт намеренно: ручку взводят, чтобы узнать, работает
-    // ли GPU, и «сервер поехал, но на CPU» — ровно тот исход, который она
-    // обязана не пропустить (подробности у probe_ep_census_on_startup).
-    match probe_ep_census_on_startup() {
-        Ok(Some(census)) => tracing::info!("EP census on startup: {census}"),
-        Ok(None) => tracing::info!(
-            "EP census probe skipped; set {}=1 to check which provider runs the graph",
-            EP_CENSUS_ENV
-        ),
-        Err(e) => {
-            tracing::error!("{e}");
-            let shutdown = runtime.shutdown_gracefully(Duration::from_secs(10)).await;
-            tracing::info!("Runtime shutdown after EP census failure: {:?}", shutdown);
-            return Err(e.into());
-        }
-    }
+    // Started in the background and NOT awaited. It used to sit right here and
+    // block, spending the client's handshake budget: a cold MIGraphX kernel
+    // cache costs more (38.7s measured) than a client's connect timeout (30s),
+    // so the session that happened to start a cold daemon was left without any
+    // of this server's tools. The reasoning, and what this decision costs, are
+    // at spawn_ep_census_on_startup.
+    let _ep_census = spawn_ep_census_on_startup();
 
     if background_sync_enabled {
         runtime.start_background_sync();
