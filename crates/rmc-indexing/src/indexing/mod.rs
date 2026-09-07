@@ -20,19 +20,20 @@ mod unified;
 mod unified_parallel;
 
 pub(crate) use error::IndexingError;
-pub use incremental::{get_snapshot_path, IncrementalIndexer};
+pub use incremental::{IncrementalIndexer, get_snapshot_path};
 pub use incremental_service::{
-    index_project_incrementally, IncrementalIndexOutcome, IncrementalIndexRequest,
+    IncrementalIndexOutcome, IncrementalIndexRequest, index_project_incrementally,
 };
 pub use merkle::{ChangeSet, FileSystemMerkle};
 pub use project_paths::{
-    collection_prefix, dir_hash, read_embedder_identity, IndexedProfilePaths,
-    IndexingProjectPaths,
+    IndexedProfilePaths, IndexingProjectPaths, collection_prefix, dir_hash, read_embedder_identity,
 };
 pub use search::open_bm25_search;
 pub use tantivy_adapter::TantivyAdapter;
 // Наружу отдан ровно один обход дерева: rmc-server статит те же файлы, что
 // индексатор, и «файл проекта» обе стороны обязаны понимать ОДИНАКОВО — иначе
 // семантический кэш считает свежим то, что индекс уже переиндексировал.
-pub use traversal::collect_project_rust_files;
+// По той же причине наружу отдана и граница вложенного проекта: где кончается
+// «этот проект», должны одинаково понимать все, кто спрашивает про его файлы.
+pub use traversal::{NESTED_ROOT_MARKER, collect_project_rust_files, is_nested_project_root};
 pub use unified::{IndexFileResult, IndexStats, UnifiedIndexer};
