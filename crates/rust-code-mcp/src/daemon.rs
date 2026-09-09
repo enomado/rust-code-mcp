@@ -113,9 +113,31 @@ const KEYED_ENV_PREFIXES: [&str; 2] = ["RMC_", "RUST_CODE_MCP_"];
 /// ONNX/CUDA libraries the daemon links when it starts.
 const KEYED_ENV_EXTRA: [&str; 2] = ["OPENROUTER_API_KEY", "LD_LIBRARY_PATH"];
 
-/// Keyed prefix, excluded anyway: these select WHICH daemon a client talks to
-/// rather than what it answers, so keying them would split one daemon in two.
-const UNKEYED_ENV: [&str; 3] = [DAEMON_ENV, DAEMON_DIR_ENV, IDLE_ENV];
+/// Keyed prefix, excluded anyway: none of these changes what the server
+/// *computes*, so keying them splits the fleet and buys nothing back.
+///
+/// Two kinds live here. The first three are transport — they select WHICH daemon
+/// a client talks to, and keying them would split one daemon in two.
+///
+/// [`EP_CENSUS_ENV`] is the second kind: a startup diagnostic. It probes which
+/// execution provider actually runs the graph and prints the finding
+/// (`probe_ep_census_on_startup`), and decides nothing else — the answer is a
+/// property of the machine and the build, not of the session that asked.
+///
+/// It was keyed until a measurement said what that costs. This machine sets it
+/// to `0` for one repository and leaves eighteen others defaulting to `1`, and
+/// the split does not even need two Claude Code sessions to bite: an editor
+/// extension that does not read Claude Code's settings expanded the default and
+/// ran a SECOND daemon of its own — 1.6 GB of fixed startup (ONNX runtime,
+/// embedding model, GPU probe) beside a live one, and two memory watchdogs that
+/// cannot see each other's RSS. Measured 2026-09-09, while the keyed daemon was
+/// on its way to 30 GB; the second one was unloading on the machine-wide
+/// availability floor because of a pile it had no part in.
+///
+/// The price of unkeying it, stated plainly: a client that asks for a census
+/// while a daemon is already up gets none, because the probe runs once at
+/// startup. Restarting the daemon is what re-runs it.
+const UNKEYED_ENV: [&str; 4] = [DAEMON_ENV, DAEMON_DIR_ENV, IDLE_ENV, EP_CENSUS_ENV];
 
 /// Half an hour: long enough to survive a pause between questions in a session,
 /// short enough that a closed editor does not hold gigabytes until end of day.
@@ -1866,6 +1888,9 @@ mod tests {
                 ("RMC_DAEMON", "0"),
                 ("RMC_DAEMON_DIR", "/run/user/1000"),
                 ("RMC_DAEMON_IDLE_SECS", "5"),
+                // A startup diagnostic, excluded for the same reason: it changes
+                // what the daemon PRINTS, never what it answers.
+                ("RMC_EP_CENSUS", "1"),
                 // Nothing to do with this server.
                 ("PATH", "/usr/bin"),
                 ("HOME", "/home/nobody"),
@@ -1898,6 +1923,45 @@ mod tests {
         assert!(
             with_idle.is_empty(),
             "a transport knob leaked into the key: {with_idle:?}"
+        );
+    }
+
+    /// A startup diagnostic must NOT split the fleet either, and this one is the
+    /// case that proved the rule: `RMC_EP_CENSUS` only decides whether the daemon
+    /// probes and prints which execution provider runs the graph, yet keying it
+    /// gave a client that expanded a different default a whole second daemon —
+    /// 1.6 GB of fixed startup for a line of diagnostics.
+    ///
+    /// Judged through the pair a real fleet splits on, not through one variable
+    /// alone: two clients that agree on the profile and differ only in the census
+    /// must produce the same keyed set, which is the same thing as one daemon.
+    #[test]
+    fn a_startup_diagnostic_does_not_change_the_key() {
+        let asking = keyed_env_pairs(
+            pairs(&[
+                ("RMC_EMBEDDING_PROFILE", "local-gpu-bge"),
+                ("RMC_EP_CENSUS", "1"),
+            ])
+            .into_iter(),
+        );
+        let not_asking = keyed_env_pairs(
+            pairs(&[
+                ("RMC_EMBEDDING_PROFILE", "local-gpu-bge"),
+                ("RMC_EP_CENSUS", "0"),
+            ])
+            .into_iter(),
+        );
+
+        assert_eq!(
+            asking, not_asking,
+            "the census leaked into the key, so two clients that ask the same questions of the \
+             same code land on two daemons"
+        );
+        assert_eq!(
+            asking.len(),
+            1,
+            "the profile must still be keyed — a test where NOTHING is keyed would pass the \
+             equality above while saying nothing: {asking:?}"
         );
     }
 
