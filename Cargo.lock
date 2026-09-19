@@ -7448,7 +7448,7 @@ dependencies = [
 
 [[package]]
 name = "salsa"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "boxcar",
  "crossbeam-queue",
@@ -7473,11 +7473,11 @@ dependencies = [
 
 [[package]]
 name = "salsa-macro-rules"
-version = "0.28.2"
+version = "0.28.4"
 
 [[package]]
 name = "salsa-macros"
-version = "0.28.2"
+version = "0.28.4"
 dependencies = [
  "proc-macro2",
  "quote",
