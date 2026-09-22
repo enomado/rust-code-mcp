@@ -274,8 +274,14 @@ fn apply_edits(ctx: &mut ProjectContext, paths: &[PathBuf]) -> Result<()> {
 /// Derived rather than guessed. A freshly started daemon costs ~2.3 GB before
 /// it loads anything (ONNX runtime, embedding model, GPU probe); one
 /// `Fast`-loaded workspace of ~4000 files adds ~3 GB. Three of them come to
-/// ~11.3 GB, which is what the watchdog's soft limit is set to accommodate
-/// (12288 MB); a fourth is memory that guard has already decided against.
+/// ~11.3 GB, which is what the watchdog's soft limit was once set to
+/// accommodate.
+///
+/// ⚠ That arithmetic is out of date and is kept only as the record of where
+/// the 3 came from: nothing loads `Fast` any more, and one `Full` context of a
+/// large workspace alone works at 18–26 GB (2026-09-22), so the soft limit is
+/// now sized for ONE such project, not three. The cap still holds for small
+/// projects, where three `Full` contexts do fit.
 ///
 /// It was 2 while the daemon key included the working directory, and 2 was the
 /// right number then: each daemon served one directory, so a second project was

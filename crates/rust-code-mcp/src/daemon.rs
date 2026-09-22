@@ -269,7 +269,7 @@ with the session asking, and will refuse a relative path rather than resolve it
 against a directory nobody chose.
 
 Memory watchdog (daemon only; 0 disables a threshold):
-  RMC_RSS_SOFT_MB=12288      unload the analysis contexts above this RSS
+  RMC_RSS_SOFT_MB=24576      unload the analysis contexts above this RSS
   RMC_RSS_HARD_MB=28672      above this, retire: stop taking new clients,
                              unload contexts, let the current clients finish;
                              a successor is started on demand
@@ -406,13 +406,33 @@ pub struct WatchdogLimits {
 /// rust-analyzer every cooldown on a perfectly healthy daemon: a memory guard
 /// that does nothing but make every query reload the workspace.
 ///
-/// It was 8192 while each daemon served one working directory. One daemon now
-/// serves all of them, so the same arithmetic is run for the three projects
-/// `RMC_MAX_PROJECTS` allows: 2.3 GB fixed + 3 × ~3 GB ≈ 11.3 GB. Note what the
-/// change is *not*: one daemon at 12 GB is less than the 12.5 GB that eleven of
-/// them held between them on the machine that prompted this, and unlike that
-/// fleet it is a number something actually enforces.
-const DEFAULT_RSS_SOFT_MB: u64 = 12288;
+/// It was 8192 while each daemon served one working directory, then 12288 for
+/// three projects: 2.3 GB fixed + 3 × ~3 GB ≈ 11.3 GB.
+///
+/// # Why 24 GB now — the same mistake as the 4096, one layer up
+///
+/// Both earlier numbers priced a project at its `Fast` load (~3 GB). Nothing
+/// loads `Fast` any more: every semantic call goes through `get_or_load_full`,
+/// because which context answered decided whether `#[cfg(test)]` code was
+/// visible. A `Full` context of `bur/rust_app` works at **18–26 GB** (measured
+/// 2026-09-22 over twenty load/unload cycles), so one project costs more than
+/// the whole three-project budget, and 12288 sat below the working point
+/// exactly as the first 4096 had: the daemon unloaded on every cooldown and the
+/// next question from any attached session loaded `Full` again — thirty-eight
+/// loads in the log since rotation, each 20 s, five minutes under swap, and not
+/// a gigabyte of the peak saved.
+///
+/// 24 GB lets that working point stand and still unloads the upper end of it
+/// (26 GB was measured too) and anything that grows past it; the hard limit
+/// stays 4 GB above. Pressure from *outside* the daemon was never this
+/// threshold's job — that is `DEFAULT_MIN_AVAILABLE_MB`, which fires whatever
+/// the daemon's own size.
+///
+/// ⚠ Changed as a default rather than set in the environment on purpose: every
+/// `RMC_*` variable is part of the daemon key, so setting it in one client's
+/// environment starts a second daemon beside the first — the doubling this
+/// whole watchdog exists to prevent.
+const DEFAULT_RSS_SOFT_MB: u64 = 24576;
 /// Twenty-eight gigabytes: past this, unloading has already been tried and the
 /// memory is stuck in the allocator, so only a fresh process gets it back.
 ///
@@ -420,7 +440,7 @@ const DEFAULT_RSS_SOFT_MB: u64 = 12288;
 /// of one `Full` rust-analyzer context and retired a healthy daemon three times
 /// in two hours. `Full` is required for complete cross-crate and `#[cfg(test)]`
 /// reference answers, so the hard limit must leave that normal peak alone. The
-/// 12 GiB soft limit still unloads first; 28 GiB keeps a sizeable escalation
+/// 24 GiB soft limit still unloads first; 28 GiB keeps an escalation
 /// gap while the machine-wide availability floor remains the final guard when
 /// other processes consume the RAM.
 const DEFAULT_RSS_HARD_MB: u64 = 28672;
@@ -1243,6 +1263,13 @@ pub async fn run_daemon(
                         rss_mb,
                         limits.hard_mb
                     );
+                    // First, before the unload below: a retired daemon must not
+                    // load an analysis again. The draining sessions otherwise
+                    // reload `Full` on their next question, and the unload buys
+                    // five minutes instead of the memory (2026-09-22: five
+                    // reloads to 15–19 GB over one grace period, next to a
+                    // successor growing its own copy).
+                    runtime.state().refuse_new_analyses();
                     // Unlinking is what makes this graceful: the address stops
                     // resolving to us, so the next client spawns a successor,
                     // while the connections already open keep working.
@@ -1535,16 +1562,24 @@ mod watchdog_tests {
         );
     }
 
-    /// A healthy daemon serving one large workspace, measured live: 2.3 GB of
-    /// fixed startup cost (ONNX runtime, embedding model, GPU probe) plus ~3 GB
-    /// for a `Fast` load of ~4000 files.
-    const MEASURED_HEALTHY_MB: u64 = 5300;
+    /// A healthy daemon serving one large workspace, measured live 2026-09-22:
+    /// the typical RSS of a `Full` context of `bur/rust_app` (range 18–26 GB
+    /// over twenty load/unload cycles), fixed startup cost included. `Full` is
+    /// the only kind anything loads now.
+    ///
+    /// It was 5300 — a `Fast` load of the same workspace — and the soft default
+    /// was derived from that, so this test passed for months while the live
+    /// daemon unloaded its working point on every cooldown. A working point in a
+    /// test is only as good as the load kind it was measured on.
+    const MEASURED_HEALTHY_MB: u64 = 23 * 1024;
 
-    /// The defect this closes: the first `DEFAULT_RSS_SOFT_MB` was 4096, chosen
-    /// from the workspace cost alone and forgetting the fixed startup floor —
-    /// below the normal working point, so a healthy daemon would have unloaded
-    /// rust-analyzer on every cooldown forever. A default that fires during
-    /// ordinary work is worse than no watchdog at all.
+    /// The defect this closes, twice: the first `DEFAULT_RSS_SOFT_MB` was 4096,
+    /// chosen from the workspace cost alone and forgetting the fixed startup
+    /// floor; the second was 12288, priced at `Fast` loads when everything
+    /// loads `Full`. Both sat below the normal working point, so a healthy
+    /// daemon unloaded rust-analyzer on every cooldown and reloaded it on the
+    /// next question. A default that fires during ordinary work is worse than
+    /// no watchdog at all.
     #[test]
     fn defaults_do_not_fire_on_a_healthy_daemon() {
         let defaults = WatchdogLimits {

@@ -239,6 +239,20 @@ impl RuntimeState {
         }
     }
 
+    /// Stop loading rust-analyzer in this process, for good: the daemon retired.
+    ///
+    /// Every later semantic, graph-building, audit or skeleton call is refused
+    /// with a message telling the session how to reach the successor; garbage
+    /// collection and everything that loads no analysis keep working. Call it
+    /// BEFORE unloading, so no load can slip in between the unload and the flag.
+    ///
+    /// ⚠ Process-wide rather than scoped to this `RuntimeState`, and the method
+    /// takes `&self` only so a caller that holds the runtime finds it here —
+    /// see `deep_stack::RETIRED` for why the flag cannot live in the state.
+    pub fn refuse_new_analyses(&self) {
+        crate::deep_stack::refuse_new_analyses();
+    }
+
     pub async fn clear(&self, request: RuntimeClearRequest) -> RuntimeClearReport {
         let workspace = request.workspace.as_deref().map(normalize_workspace);
         if let Some(workspace) = &workspace {

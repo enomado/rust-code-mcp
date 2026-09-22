@@ -18,6 +18,7 @@
 //! caller can guard against. The work therefore carries its own stack instead
 //! of depending on whoever spawned it.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rmcp::ErrorData as McpError;
@@ -96,6 +97,45 @@ pub(crate) fn test_sweeping_alone() -> RwLockWriteGuard<'static, ()> {
     enter_exclusive()
 }
 
+/// Set once, when the daemon retires; never cleared, because a retired process
+/// does not come back — it drains and exits.
+///
+/// # The defect this closes
+///
+/// Retiring hands the socket to a successor and unloads this process's analyses,
+/// but the sessions still attached keep asking — and every question used to load
+/// a `Full` workspace again. Measured 2026-09-22: a daemon retired at 28.8 GB
+/// reloaded `bur/rust_app` five times over its grace period (each time back to
+/// 15–19 GB, each time unloaded on the next cooldown) while the successor beside
+/// it grew its own copy. Retirement meant to free memory ended up holding two
+/// analyses on one machine for half an hour, and the grace period then dropped
+/// the three sessions anyway.
+///
+/// So a retired daemon admits no new rust-analyzer work at all. The sessions
+/// draining on it still get everything that does not load an analysis (search,
+/// the persisted graph queries, status); what they lose is only what they would
+/// have lost at the deadline, and they are told how to get it back.
+///
+/// # Why process-global
+///
+/// For the same reason [`ANALYSIS_GATE`] is: [`run_analysis`] is the one door
+/// every loading path passes through — the semantic service, the graph builder,
+/// the audits, the skeleton — and most of them are handed no runtime state to
+/// carry a flag in. Retirement is a property of the process, not of any one
+/// service inside it. Tests do not touch this static; they drive
+/// [`run_admitted`] with a flag of their own, so one test retiring cannot refuse
+/// another test's analysis running beside it.
+static RETIRED: AtomicBool = AtomicBool::new(false);
+
+/// Stop admitting rust-analyzer work in this process. See [`RETIRED`].
+///
+/// Garbage collection is not affected: it goes through
+/// [`run_exclusive_analysis`], never loads anything, and only gives memory
+/// back — which is the one thing a retired daemon should still do.
+pub(crate) fn refuse_new_analyses() {
+    RETIRED.store(true, Ordering::SeqCst);
+}
+
 /// Either kind of gate guard, so one spawn path can hold whichever it took.
 enum GateGuard {
     Shared(RwLockReadGuard<'static, ()>),
@@ -116,12 +156,51 @@ const ANALYSIS_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// Replaces `tokio::task::spawn_blocking` for this kind of work. The blocking
 /// pool is otherwise the right tool — the point of the swap is solely the stack
 /// size, which the pool does not let us set per task.
+///
+/// Refused once the process has retired — see [`RETIRED`].
 pub(crate) async fn run_analysis<T, F>(what: &'static str, work: F) -> Result<T, McpError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    run_admitted(&RETIRED, what, work).await
+}
+
+/// [`run_analysis`] with the retirement flag passed in, so tests can retire a
+/// flag of their own instead of the process's.
+///
+/// The check sits before the spawn, not inside the thread: a refused call must
+/// cost nothing, and least of all a 64 MiB stack reservation and a wait at the
+/// gate behind a garbage collection.
+async fn run_admitted<T, F>(
+    retired: &AtomicBool,
+    what: &'static str,
+    work: F,
+) -> Result<T, McpError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    if retired.load(Ordering::SeqCst) {
+        return Err(McpError::internal_error(retired_refusal(what), None));
+    }
     spawn_gated(what, work, false).await
+}
+
+/// What a draining session is told instead of an answer.
+///
+/// It has to say two things the caller cannot find out otherwise: that this is
+/// not a failure of the question (retrying it here will never work), and what
+/// does work. The proxy between session and daemon is byte-level and does not
+/// reconnect on its own, so the cure is on the session's side.
+fn retired_refusal(what: &str) -> String {
+    format!(
+        "{what}: this rust-code-mcp daemon has retired (its RSS went over RMC_RSS_HARD_MB) and \
+         no longer loads rust-analyzer; a fresh daemon is already serving new sessions. \
+         Reconnect this session's MCP server (in Claude Code: /mcp, then reconnect \
+         rust-code-mcp) to reach it. Tools that do not load an analysis — search, the \
+         persisted graph queries, status — still work here until then."
+    )
 }
 
 /// Run rust-analyzer work that must be the *only* such work in the process.
@@ -277,6 +356,52 @@ mod tests {
             "positive control: the exclusive work never ran at all, so the assertion above \
              passed without proving anything"
         );
+    }
+
+    /// A retired process must not start the work at all — refusing only the
+    /// answer after a `Full` load had already run would keep exactly the memory
+    /// retirement exists to release. So the oracle is whether the closure ran,
+    /// not what came back.
+    #[tokio::test]
+    async fn a_retired_process_does_not_start_the_work() {
+        let retired = AtomicBool::new(true);
+        let started = Arc::new(AtomicBool::new(false));
+        let stamp = Arc::clone(&started);
+
+        let outcome = run_admitted(&retired, "find_references", move || {
+            stamp.store(true, Ordering::SeqCst);
+        })
+        .await;
+
+        let error = outcome.expect_err("a retired process must refuse the analysis");
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "the work ran before being refused — the load happened anyway"
+        );
+        assert!(
+            error.message.starts_with("find_references: ") && error.message.contains("retired"),
+            "the refusal must name the tool and say why, so it does not read as a failure of \
+             the question: {}",
+            error.message
+        );
+    }
+
+    /// Positive control for the test above, through the same door: with the
+    /// flag down the identical closure runs. Without it, "the work never ran"
+    /// could just as well mean the door never runs anything.
+    #[tokio::test]
+    async fn a_serving_process_runs_the_same_work() {
+        let retired = AtomicBool::new(false);
+        let started = Arc::new(AtomicBool::new(false));
+        let stamp = Arc::clone(&started);
+
+        run_admitted(&retired, "find_references", move || {
+            stamp.store(true, Ordering::SeqCst);
+        })
+        .await
+        .expect("a process that has not retired admits the analysis");
+
+        assert!(started.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

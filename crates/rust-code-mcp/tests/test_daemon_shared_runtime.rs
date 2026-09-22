@@ -62,7 +62,23 @@ impl Session {
     /// caller — the axis `two_clients_from_different_directories_share_one_process`
     /// is about.
     fn start_in(socket_dir: &Path, shared: bool, cwd: Option<&Path>) -> Result<Self> {
+        Self::start_with(socket_dir, shared, cwd, &[])
+    }
+
+    /// As [`Session::start_in`], plus environment for the daemon this client
+    /// spawns — a daemon inherits its first client's environment, which is how
+    /// a test sets a watchdog threshold. Every `RMC_*` variable is part of the
+    /// daemon key, so a per-test `socket_dir` is not optional here either.
+    fn start_with(
+        socket_dir: &Path,
+        shared: bool,
+        cwd: Option<&Path>,
+        env: &[(&str, &str)],
+    ) -> Result<Self> {
         let mut command = Command::new(env!("CARGO_BIN_EXE_rust-code-mcp"));
+        for (key, value) in env {
+            command.env(key, value);
+        }
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
         }
@@ -161,6 +177,18 @@ impl Session {
                 return Ok(value);
             }
         }
+    }
+
+    /// Call a tool and return the whole JSON-RPC response, error or not.
+    ///
+    /// The timeout covers a cold `Full` load of a one-file crate, sysroot
+    /// included, which is the positive control's cost.
+    fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        let id = self.request(
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        )?;
+        self.read_response(id, Duration::from_secs(300))
     }
 
     /// The pid of the process that ACTUALLY serves this session's calls.
@@ -435,6 +463,111 @@ fn a_file_that_is_not_a_socket_is_left_alone() -> Result<()> {
 
     let survived = std::fs::read(&not_a_socket).context("the client deleted a file it did not own")?;
     assert_eq!(survived, b"someone else's data");
+    Ok(())
+}
+
+/// A one-file crate for a real rust-analyzer load: small enough that the
+/// positive control costs seconds, real enough that a load actually happens.
+fn probe_crate() -> Result<TempDir> {
+    let dir = TempDir::new()?;
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"retire_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )?;
+    std::fs::create_dir(dir.path().join("src"))?;
+    std::fs::write(dir.path().join("src/lib.rs"), "pub fn probe_target() {}\n")?;
+    Ok(dir)
+}
+
+fn find_probe_target(session: &mut Session, project: &Path) -> Result<Value> {
+    session.call_tool(
+        "find_definition",
+        json!({
+            "symbol_name": "probe_target",
+            "directory": project.to_str().ok_or_else(|| anyhow!("non-UTF-8 temp path"))?,
+            "exact": true
+        }),
+    )
+}
+
+/// Whether any socket file is left in `dir` — the daemon unlinks its own on
+/// retiring, which is the one externally visible sign that it has.
+fn has_socket(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "sock"))
+        })
+        .unwrap_or(false)
+}
+
+/// A retired daemon must refuse analysis instead of loading it again.
+///
+/// Measured 2026-09-22 on a live machine: a daemon retired at 28.8 GB still had
+/// three sessions attached, and each of their questions loaded a `Full` context
+/// back — five reloads to 15–19 GB over the grace period, next to a successor
+/// growing its own copy. Retirement meant to release memory held two analyses.
+///
+/// The case is driven for real rather than through `decide_watchdog_action`:
+/// `RMC_RSS_HARD_MB=1` makes the very first watchdog tick retire the daemon,
+/// with this client still attached — the draining session of the incident.
+///
+/// Mutation that must fail it: drop the `refuse_new_analyses()` call on the
+/// retire branch, and the call below loads the crate and finds the symbol.
+#[test]
+fn a_retired_daemon_refuses_analysis_instead_of_loading_it() -> Result<()> {
+    let socket_dir = TempDir::new()?;
+    let project = probe_crate()?;
+
+    let mut session =
+        Session::start_with(socket_dir.path(), true, None, &[("RMC_RSS_HARD_MB", "1")])?;
+    let daemon_pid = session.serving_pid()?;
+
+    // The watchdog ticks every 15 s; the unlinked socket is the retirement.
+    wait_until(Duration::from_secs(60), || !has_socket(socket_dir.path()))
+        .ok_or_else(|| anyhow!("the daemon never retired, so there is nothing to judge"))?;
+
+    let response = find_probe_target(&mut session, project.path())?;
+    drop(session);
+    kill_pid(daemon_pid);
+
+    let message = response
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!("a retired daemon answered the analysis instead of refusing it: {response}")
+        })?;
+    assert!(
+        message.contains("has retired") && message.contains("reconnect"),
+        "the refusal must say why and what to do, or the session reads it as a broken tool: \
+         {message}"
+    );
+    Ok(())
+}
+
+/// Positive control for the test above: the same call, on the same crate,
+/// against a daemon that has NOT retired, finds the symbol. Without it "the
+/// call was refused" could be any failure to load a crate in a temp directory.
+#[test]
+fn a_serving_daemon_answers_the_same_analysis() -> Result<()> {
+    let socket_dir = TempDir::new()?;
+    let project = probe_crate()?;
+
+    let mut session = Session::start(socket_dir.path(), true)?;
+    let daemon_pid = session.serving_pid()?;
+    let response = find_probe_target(&mut session, project.path())?;
+    drop(session);
+    kill_pid(daemon_pid);
+
+    let text = response
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("the analysis failed on a daemon that never retired: {response}"))?;
+    assert!(
+        text.contains("probe_target") && text.starts_with("Found"),
+        "the control must actually load the crate and find the symbol: {text}"
+    );
     Ok(())
 }
 
