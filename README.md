@@ -221,7 +221,7 @@ to. Six knobs do that instead, all in seconds or MB, all with `0` meaning *off*:
 |---|---:|---|
 | `RMC_MAX_PROJECTS` | 3 | How many rust-analyzer contexts stay loaded. Past the cap, the least recently used one is dropped; the project being queried is never the victim. |
 | `RMC_GC_INTERVAL_SECS` | 300 | How often loaded analyses are garbage-collected. This is also what makes salsa's LRU capacities do anything: they only evict while the revision bumps, and a project nobody edits never bumps on its own. |
-| `RMC_RSS_SOFT_MB` | 12288 | RSS above which the daemon unloads *all* contexts (at most one unload per `RMC_RSS_COOLDOWN_SECS`, default 300). Sized for the three workspaces above: ~2.3 GB of fixed startup cost plus ~3 GB each. |
+| `RMC_RSS_SOFT_MB` | 24576 | RSS above which the daemon unloads *all* contexts (at most one unload per `RMC_RSS_COOLDOWN_SECS`, default 300). Sized above the working point of one `Full` context of a large workspace (18–26 GB measured) — every analysis is loaded `Full`, so the old 12288, priced at `Fast` loads, unloaded a healthy daemon on every cooldown and reloaded it on the next question. |
 | `RMC_MIN_AVAILABLE_MB` | 6144 | Machine-wide floor on `MemAvailable`: below it the daemon unloads even though its own RSS is fine. The only reading here that sees pressure the daemon did not cause — a build, a second analyser, the application under development — and the caches belong to whoever needs the memory more. It never retires the daemon; that pressure usually passes with the build that caused it. |
 | `RMC_RSS_HARD_MB` | 28672 | RSS above which unloading is judged hopeless: the daemon unlinks its socket so new clients start a fresh one, unloads its contexts on that same tick, and finishes serving the clients it has. Sized above the measured 15–21 GB working range of one `Full` context — at 20480 it retired a *healthy* daemon three times in two hours. |
 | `RMC_RETIRE_GRACE_SECS` | 1800 | How long a retired daemon waits for those clients before exiting anyway. It has to end: a client session runs for hours, and a retired daemon holding 24 GB next to its successor is the failure this bounds. Exiting on the deadline **drops those connections** — the affected session loses its MCP tools until restarted. |
@@ -235,6 +235,17 @@ The cooldown does not apply to a retired daemon's *first* unload. Retirement cha
 economics of unloading rather than its nature: that daemon takes no new clients and its
 successor is already loading its own context, so it must not sit on 20+ GB waiting out a
 countdown that was armed for a different situation.
+
+Nor does a retired daemon load anything again. The sessions still attached get every tool
+that does not load rust-analyzer (search, the persisted graph queries, status); the ones
+that do — definitions, references, rename, building the graph, the audits — answer with a
+refusal that says how to reach the successor (reconnect the MCP server). Before this, each
+of their questions loaded a `Full` context back into the retired process, so for the whole
+grace period the machine held two analyses instead of one.
+
+⚠ Every `RMC_*` variable is part of the daemon key. Setting one of these knobs in one
+client's environment does not retune the running daemon — it starts a second one beside
+it. Change them for every client at once, or not at all.
 
 ### Keeping the index honest when the disk fills
 
