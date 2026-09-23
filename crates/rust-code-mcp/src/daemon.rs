@@ -51,7 +51,8 @@
 use fs2::FileExt;
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENV, EMBEDDING_PROFILE_ENV, EP_CENSUS_ENV, RuntimeClearRequest,
-    RuntimeClearScope, RuntimeState, ServerRuntime, mem_available_kib, rss_kib,
+    RuntimeClearScope, RuntimeState, ServerRuntime, mem_available_kib, release_free_memory,
+    rss_kib,
 };
 use rmc_server::tools::SearchTool;
 use rmcp::ServiceExt;
@@ -436,6 +437,11 @@ const DEFAULT_RSS_SOFT_MB: u64 = 24576;
 /// Twenty-eight gigabytes: past this, unloading has already been tried and the
 /// memory is stuck in the allocator, so only a fresh process gets it back.
 ///
+/// "Stuck in the allocator" is checked, not assumed: [`watchdog_tick`] trims
+/// before this limit is consulted, so retiring needs RSS that a trim could not
+/// return. Until 2026-09-23 the raw reading decided, and freed-but-untrimmed
+/// heap alone retired the daemon about once an hour.
+///
 /// The previous 20 GiB default sat inside the measured 15--22 GiB working range
 /// of one `Full` rust-analyzer context and retired a healthy daemon three times
 /// in two hours. `Full` is required for complete cross-crate and `#[cfg(test)]`
@@ -586,6 +592,99 @@ pub fn decide_watchdog_action(
     match since_unload {
         Some(elapsed) if elapsed < limits.cooldown => WatchdogAction::None,
         _ => WatchdogAction::Unload,
+    }
+}
+
+/// One reading of the two numbers the watchdog decides on, in MB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryReading {
+    pub rss_mb: u64,
+    pub available_mb: Option<u64>,
+}
+
+impl MemoryReading {
+    /// `None` where RSS cannot be read — the watchdog then does nothing, as it
+    /// always has on such platforms.
+    fn now() -> Option<Self> {
+        rss_kib().map(|kib| Self {
+            rss_mb: kib / 1024,
+            available_mb: mem_available_kib().map(|kib| kib / 1024),
+        })
+    }
+}
+
+/// One minute between allocator trims made to settle a decision.
+///
+/// A trim over a fragmented 25 GB heap took 11.6 s on the live daemon
+/// (2026-09-23, `unloaded 0 project(s)` at 01:20:59 → 01:21:11) and stalls
+/// allocating threads while it walks their arenas. RSS that stays over a limit
+/// after one trim would otherwise buy another on every 15 s tick. Within the
+/// minute the watchdog decides on the raw reading, exactly as before trims
+/// existed: memory that came back that fast is not free heap.
+const TRIM_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// What one watchdog tick decided, and the trim that settled it, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchdogTick {
+    pub action: WatchdogAction,
+    /// `(before, after)` when the tick trimmed the allocator before deciding.
+    pub trimmed: Option<(MemoryReading, MemoryReading)>,
+}
+
+/// [`decide_watchdog_action`], but with the allocator trimmed before any
+/// threshold is allowed to act.
+///
+/// # Why RSS alone is the wrong input
+///
+/// RSS counts heap that the program has already freed and glibc has not yet
+/// handed back. On this daemon that is not a rounding error. Measured
+/// 2026-09-22/23 in `6244fe736b7a5d99.log`: five unloads found **no project
+/// loaded at all** (`unloaded 0 project(s)`; four in retired daemons, one in a
+/// serving one) at 17476, 19824, 20838, 24767, 24772 MB, and `malloc_trim`
+/// alone took them to 4941, 4621, 5004, 8555, 8206 MB. Background indexing and
+/// the transient allocations of a `Full` load leave that much behind.
+///
+/// Deciding on the raw number made both thresholds fire on memory nobody
+/// holds: the soft one unloaded a live `Full` context that the next question
+/// reloaded, and the hard one retired the daemon — every hour or so, each time
+/// dropping the sessions still attached when the grace deadline came. A trim
+/// costs seconds; a retirement costs every attached session its tools.
+///
+/// So when the raw reading asks for action, trim first and decide again on
+/// what is left. The trim is not attempted on a healthy tick (nothing to
+/// settle) nor within [`TRIM_COOLDOWN`] of the previous one.
+pub fn watchdog_tick(
+    reading: MemoryReading,
+    limits: WatchdogLimits,
+    since_unload: Option<Duration>,
+    since_trim: Option<Duration>,
+    retiring: bool,
+    trim: impl FnOnce() -> MemoryReading,
+) -> WatchdogTick {
+    let raw = decide_watchdog_action(
+        reading.rss_mb,
+        reading.available_mb,
+        limits,
+        since_unload,
+        retiring,
+    );
+    let trim_is_due = since_trim.is_none_or(|elapsed| elapsed >= TRIM_COOLDOWN);
+    if raw == WatchdogAction::None || !trim_is_due {
+        return WatchdogTick {
+            action: raw,
+            trimmed: None,
+        };
+    }
+    let after = trim();
+    WatchdogTick {
+        action: decide_watchdog_action(
+            after.rss_mb,
+            after.available_mb,
+            limits,
+            since_unload,
+            retiring,
+        ),
+        trimmed: Some((reading, after)),
     }
 }
 
@@ -1182,6 +1281,7 @@ pub async fn run_daemon(
     );
     let mut last_gc = SystemTime::now();
     let mut last_unload: Option<SystemTime> = None;
+    let mut last_trim: Option<SystemTime> = None;
     // Once retiring, the socket file is gone and belongs to whoever binds it
     // next — this flag keeps the exit path from deleting a successor's socket.
     // `retiring_since` is what bounds the wait; see `retire_grace_expired`.
@@ -1242,10 +1342,39 @@ pub async fn run_daemon(
         // Memory watchdog. Runs on the same tick as the idle check, so it costs
         // one `/proc/self/status` and one `/proc/meminfo` read every 15 s and
         // nothing else.
-        if let Some(rss_mb) = rss_kib().map(|kib| kib / 1024) {
-            let available_mb = mem_available_kib().map(|kib| kib / 1024);
+        if let Some(reading) = MemoryReading::now() {
             let since_unload = last_unload.and_then(|at| at.elapsed().ok());
-            match decide_watchdog_action(rss_mb, available_mb, limits, since_unload, retiring) {
+            let since_trim = last_trim.and_then(|at| at.elapsed().ok());
+            // Blocking pool: the trim, when the tick asks for one, walks every
+            // arena and took 11.6 s on a 25 GB heap. The accept loop waits for it
+            // the same way it already waits for an unload.
+            let tick = tokio::task::spawn_blocking(move || {
+                watchdog_tick(reading, limits, since_unload, since_trim, retiring, || {
+                    release_free_memory();
+                    // Readable a moment ago; if it no longer is, deciding on the
+                    // old reading reproduces the pre-trim behaviour exactly.
+                    MemoryReading::now().unwrap_or(reading)
+                })
+            })
+            .await
+            .expect("watchdog tick is pure apart from the trim and cannot panic");
+            let MemoryReading {
+                rss_mb,
+                available_mb,
+            } = match tick.trimmed {
+                Some((before, after)) => {
+                    last_trim = Some(SystemTime::now());
+                    tracing::info!(
+                        "trimmed the allocator before acting on the memory limits: RSS {} -> {} MB; decided {:?}",
+                        before.rss_mb,
+                        after.rss_mb,
+                        tick.action
+                    );
+                    after
+                }
+                None => reading,
+            };
+            match tick.action {
                 WatchdogAction::None => {}
                 WatchdogAction::Unload => {
                     // Which of the two reasons fired is worth naming: "RSS 3 GB,
@@ -1364,6 +1493,105 @@ mod watchdog_tests {
 
     /// A machine with room to spare, so a case about RSS is only about RSS.
     const ROOMY: Option<u64> = Some(40_000);
+
+    fn reading(rss_mb: u64) -> MemoryReading {
+        MemoryReading {
+            rss_mb,
+            available_mb: ROOMY,
+        }
+    }
+
+    fn no_trim_expected() -> MemoryReading {
+        panic!("a tick that has nothing to settle must not pay for a trim")
+    }
+
+    /// A healthy tick costs two `/proc` reads, never an allocator walk.
+    #[test]
+    fn a_healthy_tick_does_not_trim() {
+        let tick = watchdog_tick(reading(3000), LIMITS, None, None, false, no_trim_expected);
+
+        assert_eq!(
+            tick,
+            WatchdogTick {
+                action: WatchdogAction::None,
+                trimmed: None
+            }
+        );
+    }
+
+    /// The incident: RSS over the hard limit that was mostly freed heap. The
+    /// raw reading retires the daemon; after the trim there is nothing to do.
+    #[test]
+    fn freed_heap_alone_does_not_retire_the_daemon() {
+        assert_eq!(
+            decide_watchdog_action(12000, ROOMY, LIMITS, None, false),
+            WatchdogAction::RetireAndUnload,
+            "precondition: the raw reading is past the hard limit"
+        );
+
+        let tick = watchdog_tick(reading(12000), LIMITS, None, None, false, || reading(3000));
+
+        assert_eq!(tick.action, WatchdogAction::None);
+        assert_eq!(tick.trimmed, Some((reading(12000), reading(3000))));
+    }
+
+    /// Freed heap alone must not unload a live context either — that is the
+    /// load/unload loop, one layer down from retirement.
+    #[test]
+    fn freed_heap_alone_does_not_unload() {
+        let tick = watchdog_tick(reading(5000), LIMITS, None, None, false, || reading(3000));
+
+        assert_eq!(tick.action, WatchdogAction::None);
+    }
+
+    /// Trimmed below hard but still above soft: unload, the cheaper remedy,
+    /// instead of retiring.
+    #[test]
+    fn a_trim_that_lands_between_the_limits_unloads_instead_of_retiring() {
+        let tick = watchdog_tick(reading(12000), LIMITS, None, None, false, || reading(5000));
+
+        assert_eq!(tick.action, WatchdogAction::Unload);
+    }
+
+    /// Positive control: memory a trim cannot return still retires the daemon.
+    #[test]
+    fn memory_that_a_trim_cannot_return_still_retires() {
+        let tick = watchdog_tick(reading(12000), LIMITS, None, None, false, || reading(11900));
+
+        assert_eq!(tick.action, WatchdogAction::RetireAndUnload);
+    }
+
+    /// Within the trim cooldown the raw reading decides, so RSS hovering over
+    /// a limit cannot buy a multi-second arena walk every 15 s.
+    #[test]
+    fn trims_are_rate_limited() {
+        let tick = watchdog_tick(
+            reading(12000),
+            LIMITS,
+            None,
+            Some(Duration::from_secs(10)),
+            false,
+            no_trim_expected,
+        );
+
+        assert_eq!(
+            tick,
+            WatchdogTick {
+                action: WatchdogAction::RetireAndUnload,
+                trimmed: None
+            }
+        );
+
+        let tick = watchdog_tick(
+            reading(12000),
+            LIMITS,
+            None,
+            Some(TRIM_COOLDOWN),
+            false,
+            || reading(3000),
+        );
+        assert_eq!(tick.action, WatchdogAction::None);
+    }
 
     #[test]
     fn ordinary_memory_use_is_left_alone() {
