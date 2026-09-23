@@ -5,6 +5,8 @@
 //! ```text
 //! <data_dir>/graphs/<workspace_hash>/
 //!   CURRENT                ← text file with active graph_id (hex)
+//!   BUILD.lock             ← advisory lock: one builder at a time stages,
+//!                            publishes and prunes (see snapshot.rs)
 //!   snapshots/
 //!     <graph_id>/
 //!       data.mdb           ← heed env
@@ -37,8 +39,9 @@ use super::model::{Binding, EmbeddingRecord, FunctionSignature, Node, StaticMeta
 // navigable. Schema layout is unchanged — only the extracted data is denser —
 // but bumping invalidates v2 snapshots so users see the new fields without
 // remembering to `--force`. v1/v2/v3 graph_ids are disjoint (graph_id_for
-// hashes SCHEMA_VERSION), so old snapshots stop being reused; they remain on
-// disk until a manual cleanup.
+// hashes SCHEMA_VERSION), so old snapshots stop being reused. (They used to
+// remain on disk until a manual cleanup; since 2026-09 every publish removes
+// the superseded ones — `snapshot::prune_superseded_snapshots`.)
 // v4 (2026-05): Binding gains `is_explicit_pub_use` — true iff the source
 // `use` statement carries an explicit `pub`/`pub(crate)`/`pub(in path)`
 // visibility token. Backs the `declared_reexports_of` query. Bincode reads
@@ -129,6 +132,7 @@ use super::model::{Binding, EmbeddingRecord, FunctionSignature, Node, StaticMeta
 // auto-rebuild via the schema-versioned graph id.
 pub(crate) const SCHEMA_VERSION: u32 = 12;
 pub(crate) const CURRENT_POINTER_FILENAME: &str = "CURRENT";
+pub(crate) const BUILD_LOCK_FILENAME: &str = "BUILD.lock";
 pub(crate) const SNAPSHOTS_DIRNAME: &str = "snapshots";
 pub(crate) const MANIFEST_FILENAME: &str = "manifest.json";
 
@@ -193,6 +197,12 @@ impl GraphPaths {
 
     pub fn manifest_path(&self, graph_id: &str) -> PathBuf {
         self.snapshot_dir(graph_id).join(MANIFEST_FILENAME)
+    }
+
+    /// Lives beside `CURRENT`, not inside `snapshots/`, so that the prune —
+    /// which walks `snapshots/` — never sees it as a snapshot.
+    pub fn build_lock_path(&self) -> PathBuf {
+        self.root_dir.join(BUILD_LOCK_FILENAME)
     }
 
     pub fn ensure_dirs(&self) -> std::io::Result<()> {

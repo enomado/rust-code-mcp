@@ -3,7 +3,9 @@
 //! `build_and_persist` is the high-level entry point: it loads, extracts,
 //! computes a fingerprint, opens a new heed env in a staging dir, writes the
 //! whole model in one transaction, writes manifest.json, then atomically swaps
-//! the workspace's `CURRENT` pointer.
+//! the workspace's `CURRENT` pointer and removes the snapshots it superseded.
+//! Staging, publish and prune run under the workspace's `BUILD.lock`
+//! ([`lock_workspace_builds`]).
 
 use std::collections::HashMap;
 use std::fs;
@@ -258,6 +260,11 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
             if timing {
                 eprintln!("build:   reused existing snapshot");
             }
+            // The snapshot matching today's tree need not be the one CURRENT
+            // names: build at X, edit and build Y, revert to X — X is still on
+            // disk if a reader held it open when Y pruned. Returning "reused X"
+            // while CURRENT stays at Y would make every query answer from Y.
+            publish_current_if_changed(&identity.paths, &identity.graph_id)?;
             return Ok(result);
         }
         Some(identity)
@@ -280,6 +287,9 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
         compute_snapshot_identity_timed(loaded.workspace_root.clone(), paths, timing)?
     };
     identity.paths.ensure_dirs()?;
+    // Taken after `loader::load` (the long part, and it touches nothing on
+    // disk here) and held to the end of the prune.
+    let _build_lock = lock_workspace_builds(&identity.paths)?;
 
     if identity.snapshot_dir.exists() {
         fs::remove_dir_all(&identity.snapshot_dir)
@@ -330,6 +340,7 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
     write_manifest(&identity.manifest_path, &manifest)?;
 
     publish_current(&identity.paths, &identity.graph_id)?;
+    prune_superseded_snapshots(&identity.paths, &identity.graph_id);
 
     Ok(BuildResult {
         graph_id: identity.graph_id,
@@ -351,6 +362,7 @@ pub(crate) fn persist_loaded(
     let paths = graph_paths_for_workspace(&loaded.workspace_root, options);
     paths.ensure_dirs()?;
     let identity = compute_snapshot_identity(loaded.workspace_root.clone(), paths)?;
+    let _build_lock = lock_workspace_builds(&identity.paths)?;
 
     if identity.snapshot_dir.exists() {
         fs::remove_dir_all(&identity.snapshot_dir)?;
@@ -380,6 +392,7 @@ pub(crate) fn persist_loaded(
     };
     write_manifest(&identity.manifest_path, &manifest)?;
     publish_current(&identity.paths, &identity.graph_id)?;
+    prune_superseded_snapshots(&identity.paths, &identity.graph_id);
 
     Ok(BuildResult {
         graph_id: identity.graph_id,
@@ -508,6 +521,7 @@ pub(crate) fn persist_test_model(
         paths,
         "test-fingerprint".to_string(),
     );
+    let _build_lock = lock_workspace_builds(&identity.paths)?;
     fs::create_dir_all(&identity.snapshot_dir)
         .with_context(|| format!("create snapshot dir {}", identity.snapshot_dir.display()))?;
     {
@@ -539,6 +553,7 @@ pub(crate) fn persist_test_model(
         write_manifest(&identity.manifest_path, &manifest)?;
     }
     publish_current(&identity.paths, &identity.graph_id)?;
+    prune_superseded_snapshots(&identity.paths, &identity.graph_id);
     open_current(&identity.paths, env_opts)?.context("test snapshot was not published")
 }
 
@@ -585,6 +600,121 @@ fn publish_current(paths: &GraphPaths, graph_id: &str) -> Result<()> {
         )
     })?;
     Ok(())
+}
+
+/// [`publish_current`] unless `CURRENT` already names `graph_id` — the reuse
+/// path runs on every `build_hypergraph` call, and the common case is a no-op
+/// that should not rewrite the file.
+fn publish_current_if_changed(paths: &GraphPaths, graph_id: &str) -> Result<()> {
+    let current = fs::read_to_string(&paths.current_pointer_path).unwrap_or_default();
+    if current.trim() == graph_id {
+        return Ok(());
+    }
+    publish_current(paths, graph_id)
+}
+
+/// Serialise staging → publish → prune across every builder of one workspace.
+///
+/// Builders really do run side by side: `build_hypergraph` goes through the
+/// server's SHARED analysis gate, so two agents building one workspace build
+/// it at once, and examples/tests/a second daemon are other processes on the
+/// same data dir. Without this lock the prune would remove a snapshot another
+/// builder is still writing — and two builders with the same fingerprint
+/// already wiped each other's staging dir via `remove_dir_all(snapshot_dir)`.
+///
+/// Advisory (`flock` / `LockFileEx`), released when the returned file drops —
+/// on panic and on process death too, so a crashed builder leaves no stale
+/// lock. Blocking: a second builder waits for the first one's write (seconds),
+/// which is cheaper than both writing the same graph.
+fn lock_workspace_builds(paths: &GraphPaths) -> Result<fs::File> {
+    let path = paths.build_lock_path();
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open build lock {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("take build lock {}", path.display()))?;
+    Ok(file)
+}
+
+/// Remove every snapshot of this workspace except `keep` (the one just
+/// published) and except those still open in this process. Returns what was
+/// removed.
+///
+/// Why it exists: `graph_id` hashes the tree fingerprint and SCHEMA_VERSION,
+/// so every edit-then-build and every schema bump writes a NEW directory, and
+/// nothing removed the old one — 45 snapshots of a single workspace, 8 GiB,
+/// were found on 2026-09-09. A superseded snapshot is never opened again: the
+/// only way back to it is the reuse preflight after reverting the tree, and a
+/// rebuild there is far cheaper than keeping every past tree state on disk.
+///
+/// PRECONDITION: the caller holds [`lock_workspace_builds`]. That, and only
+/// that, guarantees no other builder is mid-write in one of these directories.
+///
+/// Open snapshots are skipped, not removed: a query may be holding the previous
+/// graph's `OpenedSnapshot` while this build publishes. On Unix unlinking under
+/// a live mmap is harmless but frees nothing until the handle closes; on Windows
+/// it fails outright. A skipped one goes on the next publish, so the directory
+/// holds at most CURRENT plus whatever was open at that moment. A reader that
+/// read CURRENT just before the publish and opens the old id just after the
+/// removal gets "no snapshot" / an open error once — transient, the next call
+/// reads the new CURRENT.
+///
+/// Best effort: the new snapshot is already published, so a failed removal is
+/// logged and retried by the next build rather than failing this one.
+fn prune_superseded_snapshots(paths: &GraphPaths, keep: &str) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let entries = match fs::read_dir(&paths.snapshots_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(
+                dir = %paths.snapshots_dir.display(),
+                %error,
+                "snapshot prune: cannot list snapshots"
+            );
+            return removed;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_name() == keep || !path.is_dir() || snapshot_env_is_open(&path) {
+            continue;
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(()) => removed.push(path),
+            Err(error) => tracing::warn!(
+                dir = %path.display(),
+                %error,
+                "snapshot prune: cannot remove superseded snapshot, next build retries"
+            ),
+        }
+    }
+    if !removed.is_empty() {
+        tracing::info!(
+            workspace = %paths.workspace_hash,
+            removed = removed.len(),
+            "snapshot prune: removed superseded snapshots"
+        );
+    }
+    removed
+}
+
+/// Whether this process holds a live env for `snapshot_dir` — i.e. some
+/// `OpenedSnapshot` of it is still alive. Keyed like [`open_cached_env`]
+/// (canonical path); a dir that cannot be canonicalized cannot be in the cache.
+fn snapshot_env_is_open(snapshot_dir: &Path) -> bool {
+    let Ok(canonical) = snapshot_dir.canonicalize() else {
+        return false;
+    };
+    let Some(cache) = OPENED_GRAPH_ENVS.get() else {
+        return false;
+    };
+    let cache = cache.lock().expect("opened graph env cache poisoned");
+    cache
+        .get(&canonical)
+        .is_some_and(|cached| cached.env.strong_count() > 0)
 }
 
 fn now_unix() -> Result<u64> {
@@ -1033,6 +1163,136 @@ mod tests {
         assert!(Arc::ptr_eq(&snap.env, &reopened.env));
     }
 
+    fn empty_model(workspace: &Path) -> ExtractionModel {
+        ExtractionModel {
+            workspace_root: workspace.to_path_buf(),
+            workspace_hash: "test-workspace".to_string(),
+            workspace_id: NodeId::from_components(&["workspace"]),
+            nodes: BTreeMap::new(),
+            bindings: Vec::new(),
+            usages: Vec::new(),
+            contains: Vec::new(),
+            signatures: Vec::new(),
+            statics: Vec::new(),
+        }
+    }
+
+    fn snapshot_names(paths: &GraphPaths) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&paths.snapshots_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn prune_removes_every_snapshot_but_the_kept_one() {
+        let td = tempfile::tempdir().unwrap();
+        let paths = GraphPaths::for_workspace_in(td.path(), &td.path().join("ws"));
+        for id in ["old1", "old2", "keep"] {
+            fs::create_dir_all(paths.snapshot_dir(id)).unwrap();
+            fs::write(paths.snapshot_dir(id).join("data.mdb"), b"x").unwrap();
+        }
+
+        let removed = prune_superseded_snapshots(&paths, "keep");
+
+        assert_eq!(removed.len(), 2);
+        assert_eq!(snapshot_names(&paths), vec!["keep".to_string()]);
+    }
+
+    #[test]
+    fn prune_skips_a_snapshot_open_in_this_process_until_it_closes() {
+        let td = tempfile::tempdir().unwrap();
+        let workspace = td.path().join("workspace");
+        let data_dir = td.path().join("graphs");
+        fs::create_dir_all(&workspace).unwrap();
+        let snap = persist_test_model(
+            &data_dir,
+            &empty_model(&workspace),
+            GraphEnvOptions::default(),
+        )
+        .unwrap();
+        let open_id = snap.manifest.graph_id.clone();
+        let paths = GraphPaths::for_workspace_in(&data_dir, &workspace);
+        fs::create_dir_all(paths.snapshot_dir("stale")).unwrap();
+
+        // A newer graph got published while `snap` is still being read.
+        let removed = prune_superseded_snapshots(&paths, "newer");
+        assert_eq!(removed, vec![paths.snapshot_dir("stale")]);
+        assert_eq!(snapshot_names(&paths), vec![open_id.clone()]);
+
+        drop(snap);
+        let removed = prune_superseded_snapshots(&paths, "newer");
+        assert_eq!(removed, vec![paths.snapshot_dir(&open_id)]);
+        assert!(snapshot_names(&paths).is_empty());
+    }
+
+    #[test]
+    fn publishing_a_snapshot_prunes_the_superseded_ones() {
+        let td = tempfile::tempdir().unwrap();
+        let workspace = td.path().join("workspace");
+        let data_dir = td.path().join("graphs");
+        fs::create_dir_all(&workspace).unwrap();
+        let paths = GraphPaths::for_workspace_in(&data_dir, &workspace);
+        fs::create_dir_all(paths.snapshot_dir("from-an-older-tree")).unwrap();
+
+        let snap = persist_test_model(
+            &data_dir,
+            &empty_model(&workspace),
+            GraphEnvOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot_names(&paths), vec![snap.manifest.graph_id.clone()]);
+    }
+
+    #[test]
+    fn reuse_points_current_at_the_reused_snapshot() {
+        let td = tempfile::tempdir().unwrap();
+        let workspace = td.path().join("not-cargo");
+        let data_dir = td.path().join("graphs");
+        create_non_cargo_workspace(&workspace);
+        let (graph_id, _) = write_fake_snapshot(&workspace, &data_dir, SCHEMA_VERSION, true);
+        let paths = GraphPaths::for_workspace_in(&data_dir, &workspace.canonicalize().unwrap());
+        // The tree went X → Y → back to X: CURRENT still names Y.
+        fs::write(&paths.current_pointer_path, "graph-of-the-edited-tree").unwrap();
+
+        let result = build_and_persist(&workspace, BuildOptions {
+            data_dir_override: Some(data_dir),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(result.reused);
+        assert_eq!(
+            fs::read_to_string(&paths.current_pointer_path).unwrap(),
+            graph_id
+        );
+    }
+
+    #[test]
+    fn build_lock_is_exclusive_and_released_on_drop() {
+        let td = tempfile::tempdir().unwrap();
+        let paths = GraphPaths::for_workspace_in(td.path(), &td.path().join("ws"));
+        paths.ensure_dirs().unwrap();
+        let rival = || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(paths.build_lock_path())
+                .unwrap()
+        };
+
+        let held = lock_workspace_builds(&paths).unwrap();
+        assert!(matches!(
+            rival().try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+
+        drop(held);
+        rival().try_lock().unwrap();
+    }
+
     #[test]
     fn build_and_open_self_workspace() {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -1041,9 +1301,20 @@ mod tests {
             data_dir_override: Some(tempdir.path().to_path_buf()),
             ..Default::default()
         };
+        // A snapshot left by an earlier tree state: the build must prune it.
+        let stale_paths = GraphPaths::for_workspace_in(
+            tempdir.path(),
+            &Path::new(manifest_dir).canonicalize().unwrap(),
+        );
+        let stale = stale_paths.snapshot_dir("from-an-older-tree");
+        fs::create_dir_all(&stale).unwrap();
 
         let result = build_and_persist(Path::new(manifest_dir), opts.clone()).unwrap();
         assert!(!result.reused, "first build should not be reused");
+        assert!(
+            !stale.exists(),
+            "build_and_persist must prune superseded snapshots"
+        );
         assert!(result.node_count > 0);
         assert!(result.binding_count > 0);
         assert!(
