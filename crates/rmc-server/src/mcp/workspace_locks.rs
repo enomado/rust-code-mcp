@@ -4,16 +4,31 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 fn workspace_key(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
 /// Registry of async locks keyed by canonical workspace directory.
+///
+/// Two levels:
+/// - `global` is a read/write lock. Every per-workspace operation holds it
+///   for READ, so operations on different workspaces run concurrently;
+///   `lock_all` (whole-cache operations such as a directory-less
+///   `clear_cache`) takes it for WRITE and so excludes everyone.
+/// - `locks` holds one mutex per canonical workspace, serialising
+///   operations on the same workspace.
+///
+/// The global level used to be a plain mutex taken by every workspace
+/// operation. On a shared daemon that made the per-workspace mutex
+/// meaningless: the first `search` on a not-yet-indexed checkout runs a
+/// full index under its lock (an hour on a large repo), and every other
+/// session's `search` on its own, already-indexed workspace queued behind
+/// it with no log line at all.
 #[derive(Clone, Default)]
 pub struct WorkspaceLockRegistry {
-    global: Arc<Mutex<()>>,
+    global: Arc<RwLock<()>>,
     locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
 }
 
@@ -35,8 +50,13 @@ impl WorkspaceLockRegistry {
     }
 
     /// Take an exclusive workspace lock.
+    ///
+    /// Excludes other operations on the same workspace and `lock_all`, but
+    /// not operations on other workspaces. The global read guard is taken
+    /// first, so a pending `lock_all` writer is never starved by a stream
+    /// of workspace operations (tokio's `RwLock` is fair).
     pub async fn lock_exclusive(&self, dir: &Path) -> WorkspaceLockGuard {
-        let global_guard = self.global.clone().lock_owned().await;
+        let global_guard = self.global.clone().read_owned().await;
         let (workspace, lock) = self.lock_for(dir).await;
         let guard = lock.lock_owned().await;
         WorkspaceLockGuard {
@@ -55,10 +75,11 @@ impl WorkspaceLockRegistry {
         self.lock_exclusive(dir).await
     }
 
-    /// Take the global operation lock.
+    /// Take the global operation lock: waits for every in-flight workspace
+    /// operation and blocks new ones until dropped.
     pub async fn lock_all(&self) -> WorkspaceGlobalLockGuard {
         WorkspaceGlobalLockGuard {
-            _global_guard: self.global.clone().lock_owned().await,
+            _global_guard: self.global.clone().write_owned().await,
         }
     }
 }
@@ -66,7 +87,7 @@ impl WorkspaceLockRegistry {
 /// Held workspace operation lock.
 pub struct WorkspaceLockGuard {
     workspace: PathBuf,
-    _global_guard: OwnedMutexGuard<()>,
+    _global_guard: OwnedRwLockReadGuard<()>,
     _guard: OwnedMutexGuard<()>,
 }
 
@@ -78,7 +99,7 @@ impl WorkspaceLockGuard {
 
 /// Held global operation lock.
 pub struct WorkspaceGlobalLockGuard {
-    _global_guard: OwnedMutexGuard<()>,
+    _global_guard: OwnedRwLockWriteGuard<()>,
 }
 
 #[cfg(test)]
@@ -120,6 +141,43 @@ mod tests {
         let waiter_workspace = workspace.clone();
         let waiter = tokio::spawn(async move {
             let _guard = waiter_registry.lock_exclusive(&waiter_workspace).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        drop(guard);
+        waiter.await.unwrap();
+    }
+
+    /// The regression this registry exists to prevent: a long operation on
+    /// one workspace (first `search` on an unindexed checkout = full index)
+    /// must not stall an operation on another workspace.
+    #[tokio::test]
+    async fn different_workspaces_do_not_block_each_other() {
+        let registry = WorkspaceLockRegistry::new();
+        let temp_dir = TempDir::new().unwrap();
+        let a = temp_dir.path().join("a");
+        let b = temp_dir.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+
+        let _held_a = registry.lock_exclusive(&a).await;
+        let other = tokio::time::timeout(Duration::from_secs(5), registry.lock_shared(&b)).await;
+        assert!(other.is_ok(), "lock on workspace b waited for workspace a");
+    }
+
+    #[tokio::test]
+    async fn global_lock_waits_for_workspace_lock() {
+        let registry = WorkspaceLockRegistry::new();
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+
+        let guard = registry.lock_exclusive(&workspace).await;
+        let waiter_registry = registry.clone();
+        let waiter = tokio::spawn(async move {
+            let _guard = waiter_registry.lock_all().await;
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
