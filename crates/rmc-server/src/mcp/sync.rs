@@ -304,6 +304,10 @@ impl SyncManager {
                 continue;
             }
 
+            let mem = rmc_engine::mem_trace::MemSpan::start(format!(
+                "background sync of {}",
+                dir.display()
+            ));
             let outcome = index_project_incrementally(IncrementalIndexRequest {
                 codebase_path: dir,
                 cache_path: &paths.cache_path,
@@ -319,6 +323,7 @@ impl SyncManager {
                 repair_coverage: false,
             })
             .await?;
+            mem.finish();
             let stats = outcome.stats;
 
             if stats.indexed_files > 0 {

@@ -27,7 +27,32 @@ use rmc_server::mcp::{
 use rmc_server::tools::SearchTool;
 use rmcp::{ServiceExt, transport::stdio};
 use std::time::Duration;
-use tracing_subscriber::{self, EnvFilter};
+use tracing_subscriber::{self, EnvFilter, fmt::time::FormatTime};
+
+/// Log filter when `RUST_LOG` is unset.
+///
+/// `rmc_mem` is `rmc_engine::mem_trace::LOG_TARGET`, spelled out because the
+/// binary does not depend on `rmc-engine` at runtime (see Cargo.toml); the
+/// test `default_filter_enables_memory_lines` keeps the two in step.
+const DEFAULT_LOG_FILTER: &str =
+    "warn,rust_code_mcp=info,rmc_server=info,rmc_indexing=info,rmc_mem=info";
+
+/// The default timestamp followed by `[pid]`.
+///
+/// Successive and overlapping daemons append to ONE log file per socket key,
+/// and a retired daemon keeps writing next to its successor for up to half
+/// an hour. Without the pid on every line their sync cycles, watchdog
+/// decisions and memory lines interleave indistinguishably — on 2026-10-19 the
+/// two daemons could be told apart only by the phase of their 5-minute sync
+/// timers.
+struct TimeWithPid(u32);
+
+impl FormatTime for TimeWithPid {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        tracing_subscriber::fmt::time::SystemTime.format_time(w)?;
+        write!(w, " [{}]", self.0)
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,10 +65,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // on a multi-crate workspace went from ~7s to 7+ minutes purely from log
     // formatting overhead. Keep this at WARN unless explicitly overridden.
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("warn,rust_code_mcp=info,rmc_server=info,rmc_indexing=info")
+        EnvFilter::new(DEFAULT_LOG_FILTER)
     });
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
+        .with_timer(TimeWithPid(std::process::id()))
         .with_writer(std::io::stderr)
         .with_ansi(false)
         .init();
@@ -212,4 +238,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     service_result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_LOG_FILTER;
+
+    /// Without this the `mem:` lines are filtered out silently — exactly what
+    /// the first live probe of `mem_trace` showed.
+    #[test]
+    fn default_filter_enables_memory_lines() {
+        let directive = format!("{}=info", rmc_engine::mem_trace::LOG_TARGET);
+        assert!(
+            DEFAULT_LOG_FILTER.split(',').any(|d| d == directive),
+            "{DEFAULT_LOG_FILTER:?} must contain {directive:?}"
+        );
+    }
 }

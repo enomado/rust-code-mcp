@@ -522,6 +522,22 @@ pub fn should_collect_garbage(since_last_gc: Duration, interval: Duration) -> bo
     since_last_gc >= interval
 }
 
+/// How far RSS must move from the last logged value before the watchdog tick
+/// logs it again.
+///
+/// The per-operation `mem:` lines (`rmc_engine::mem_trace`) say what each call
+/// left behind; this line is the timeline between them — including growth no
+/// instrumented operation owns. A gigabyte keeps it to a few lines an hour on
+/// a quiet daemon: the tick runs every 15 s, and logging every reading would
+/// bury everything else.
+const RSS_LOG_STEP_MB: u64 = 1024;
+
+/// Whether this tick's RSS is far enough from the last logged one to log.
+/// The first reading is always logged — it is the baseline.
+pub fn rss_moved_enough(last_logged_mb: Option<u64>, now_mb: u64) -> bool {
+    last_logged_mb.is_none_or(|last| now_mb.abs_diff(last) >= RSS_LOG_STEP_MB)
+}
+
 /// The retire deadline, read from the environment.
 ///
 /// Kept out of [`WatchdogLimits`] on purpose: those three numbers are the inputs
@@ -1287,6 +1303,7 @@ pub async fn run_daemon(
     // `retiring_since` is what bounds the wait; see `retire_grace_expired`.
     let mut retiring = false;
     let mut retiring_since: Option<SystemTime> = None;
+    let mut last_logged_rss_mb: Option<u64> = None;
 
     // Signals must reach the same exit path as an idle timeout. A daemon killed
     // outright leaves its socket file behind; clients survive that (they clear it
@@ -1374,6 +1391,17 @@ pub async fn run_daemon(
                 }
                 None => reading,
             };
+            if rss_moved_enough(last_logged_rss_mb, rss_mb) {
+                tracing::info!(
+                    "mem: RSS moved {} -> {} MB ({} live client(s), {}retired; machine has {:?} MB available)",
+                    last_logged_rss_mb.map_or_else(|| "start".to_string(), |mb| mb.to_string()),
+                    rss_mb,
+                    live.load(Ordering::SeqCst),
+                    if retiring { "" } else { "not " },
+                    available_mb,
+                );
+                last_logged_rss_mb = Some(rss_mb);
+            }
             match tick.action {
                 WatchdogAction::None => {}
                 WatchdogAction::Unload => {
@@ -1399,6 +1427,16 @@ pub async fn run_daemon(
                     // reloads to 15–19 GB over one grace period, next to a
                     // successor growing its own copy).
                     runtime.state().refuse_new_analyses();
+                    // And no more background sync. The successor tracks the
+                    // same directories and keeps their index current; a retired
+                    // daemon syncing alongside it re-embeds every changed file a
+                    // second time and maintains the same vector table in
+                    // parallel. Measured 2026-10-19: two interleaved sync series
+                    // in one log, the retired daemon's running until its
+                    // deadline, while it sat at 25 GB with no analysis loaded.
+                    // The background sync is the only task on the runtime's
+                    // shutdown channel; a sync already in flight finishes first.
+                    runtime.request_shutdown();
                     // Unlinking is what makes this graceful: the address stops
                     // resolving to us, so the next client spawns a successor,
                     // while the connections already open keep working.
@@ -1956,6 +1994,20 @@ mod watchdog_tests {
             Duration::from_secs(86400),
             Duration::ZERO
         ));
+    }
+
+    /// The memory timeline: a baseline first, then only real moves, in
+    /// either direction — a drop is as telling as a rise.
+    #[test]
+    fn rss_is_logged_on_baseline_and_on_gigabyte_moves_only() {
+        assert!(
+            rss_moved_enough(None, 3000),
+            "first reading is the baseline"
+        );
+        assert!(!rss_moved_enough(Some(3000), 3000 + RSS_LOG_STEP_MB - 1));
+        assert!(rss_moved_enough(Some(3000), 3000 + RSS_LOG_STEP_MB));
+        assert!(rss_moved_enough(Some(25000), 25000 - RSS_LOG_STEP_MB));
+        assert!(!rss_moved_enough(Some(25000), 24500));
     }
 
     /// Collecting garbage and unloading contexts buy the same thing — memory in
