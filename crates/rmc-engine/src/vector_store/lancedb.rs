@@ -32,6 +32,36 @@ use crate::embeddings::Embedding;
 const TABLE_NAME: &str = "vectors";
 const METADATA_FILE: &str = "metadata.json";
 
+/// Fragments below this many rows are what compaction merges.
+///
+/// Deliberately equal to the threshold `lancedb`'s `Table::stats()` uses for
+/// `num_small_fragments` (a literal `100000` in its `table.rs`): the gate in
+/// `maintain` counts with that number, and counting by one threshold while
+/// compacting by another would make the gate fire on fragments the
+/// compaction then leaves alone, or the reverse.
+///
+/// Why not lance's own default (1M rows): a project store is usually below
+/// it, so its main fragment never "fills" and every compaction rewrites the
+/// whole table. With this target a full fragment is left in place until more
+/// than `materialize_deletions_threshold` (10%) of it has been deleted —
+/// re-indexed files delete their old rows — and only then rewritten, once,
+/// and split into fragments of this size.
+const COMPACT_TARGET_ROWS: usize = 100_000;
+
+/// How many small fragments must pile up before maintenance compacts.
+///
+/// Each background-sync write adds one, so this is roughly "compact every
+/// eighth changed sync" instead of every one. Search reads every fragment,
+/// so the pile is not free either; eight keeps that cost small.
+const COMPACT_MIN_SMALL_FRAGMENTS: usize = 8;
+
+fn compaction_options() -> CompactionOptions {
+    CompactionOptions {
+        target_rows_per_fragment: COMPACT_TARGET_ROWS,
+        ..CompactionOptions::default()
+    }
+}
+
 /// On-disk fingerprint stored next to the LanceDB table. Records which
 /// embedder produced the vectors so that a switch is detected on reopen
 /// instead of silently corrupting search results.
@@ -630,20 +660,39 @@ impl VectorStoreBackend for LanceDbBackend {
     ) -> Result<VectorStoreMaintenance, VectorStoreError> {
         let table = self.get_table().await?;
 
-        // Compaction FIRST, and the order is not cosmetic: pruning is what
-        // deletes files, but a fragment stays referenced by the current
-        // version until compaction has rewritten its rows elsewhere.
-        // Pruned-then-compacted would drop the manifests and leave the
-        // data, which is the larger half.
-        let compacted = table
-            .optimize(OptimizeAction::Compact {
-                options: CompactionOptions::default(),
-                remap_options: None,
-            })
+        // Compact only once enough small fragments piled up. Every write of
+        // the background sync appends one small fragment, so compacting on
+        // every pass means compacting every five minutes — and with lance's
+        // default target (1M rows) the store's main fragment is "small" too,
+        // so each pass rewrote the WHOLE table to absorb a handful of rows.
+        // Measured 2026-10-19 on a large workspace's store (891 883 rows, 2.9 GB):
+        // 8 appended rows -> the 2.9 GB fragment rewritten, 10.6 s, process
+        // peak +2.4 GB, ~1.8 GB of heap left behind, on every changed sync.
+        let small_fragments = table
+            .stats()
             .await
-            .map_err(|e| {
-                VectorStoreError::backend(format!("Failed to compact vector table: {}", e))
-            })?;
+            .map_err(|e| VectorStoreError::backend(format!("Failed to read table stats: {}", e)))?
+            .fragment_stats
+            .num_small_fragments;
+        let compacted = if small_fragments >= COMPACT_MIN_SMALL_FRAGMENTS {
+            // Compaction FIRST, and the order is not cosmetic: pruning is
+            // what deletes files, but a fragment stays referenced by the
+            // current version until compaction has rewritten its rows
+            // elsewhere. Pruned-then-compacted would drop the manifests and
+            // leave the data, which is the larger half.
+            table
+                .optimize(OptimizeAction::Compact {
+                    options: compaction_options(),
+                    remap_options: None,
+                })
+                .await
+                .map_err(|e| {
+                    VectorStoreError::backend(format!("Failed to compact vector table: {}", e))
+                })?
+                .compaction
+        } else {
+            None
+        };
 
         // `older_than` is the load-bearing argument, and it must be passed:
         // lance defaults it to SEVEN DAYS, and on a store written every few
@@ -671,7 +720,7 @@ impl VectorStoreBackend for LanceDbBackend {
                 VectorStoreError::backend(format!("Failed to prune vector table: {}", e))
             })?;
 
-        let compaction = compacted.compaction.unwrap_or_default();
+        let compaction = compacted.unwrap_or_default();
         let removal = pruned.prune;
         Ok(VectorStoreMaintenance {
             fragments_removed: compaction.fragments_removed,
@@ -974,6 +1023,67 @@ mod tests {
         // data files the current version points at.
         let hits = backend.search(vec![0.1, 0.2, 0.3, 0.0], 5).await.unwrap();
         assert!(!hits.is_empty(), "search must still work after maintenance");
+    }
+
+    /// `VmRSS` and `VmHWM` of this process, in MiB.
+    fn rss_and_peak_mib() -> (u64, u64) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let field = |name: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(name))
+                .unwrap()
+                .trim()
+                .trim_end_matches(" kB")
+                .trim()
+                .parse::<u64>()
+                .unwrap()
+                / 1024
+        };
+        (field("VmRSS:"), field("VmHWM:"))
+    }
+
+    /// Memory probe, not a test: what ONE background-sync cycle's
+    /// maintenance costs on a real store. Point `RMC_LANCE_PROBE_DIR` at a
+    /// COPY of a live vector store (maintenance rewrites it) and
+    /// `RMC_LANCE_PROBE_EMBEDDER` at the `embedder_version` in its
+    /// `metadata.json`; dim is 384 (bge-small).
+    ///
+    /// Each round repeats the sync's own shape — a few new rows appended as
+    /// a fresh fragment, then `maintain` — and prints RSS before, after and
+    /// the process peak, so the gigabytes are attributed by measurement.
+    #[tokio::test]
+    #[ignore]
+    async fn probe_maintain_memory_on_real_store() {
+        let dir = std::env::var("RMC_LANCE_PROBE_DIR").unwrap();
+        let embedder = std::env::var("RMC_LANCE_PROBE_EMBEDDER").unwrap();
+        let backend = LanceDbBackend::open_existing(PathBuf::from(dir), 384, &embedder)
+            .await
+            .unwrap();
+        let rows = backend.count().await.unwrap();
+        let (rss, peak) = rss_and_peak_mib();
+        eprintln!("opened: {rows} rows, RSS {rss} MiB, peak {peak} MiB");
+        for round in 0..10 {
+            let mut batch = Vec::new();
+            for i in 0..8 {
+                let id = ChunkId::new();
+                let chunk =
+                    create_test_chunk(id, "fn probe() {}", &format!("probe_{round}_{i}.rs"));
+                batch.push((id, vec![0.01 * i as f32; 384], chunk));
+            }
+            backend.upsert_chunks(batch).await.unwrap();
+            let (before, _) = rss_and_peak_mib();
+            let started = std::time::Instant::now();
+            let stats = backend
+                .maintain(std::time::Duration::from_secs(0))
+                .await
+                .unwrap();
+            let (after, peak) = rss_and_peak_mib();
+            eprintln!(
+                "round {round}: {stats:?} in {:.1}s; RSS {before} -> {after} MiB, process peak {peak} MiB",
+                started.elapsed().as_secs_f64()
+            );
+        }
     }
 
     #[tokio::test]

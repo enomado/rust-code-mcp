@@ -132,6 +132,12 @@ impl IncrementalIndexer {
     async fn ensure_indexer(&mut self) -> Result<&mut UnifiedIndexer> {
         if self.indexer.is_none() {
             let config = self.config.clone();
+            // Measured because it is the suspect: every changed background
+            // sync builds a fresh indexer, and with it a fresh ONNX session.
+            let mem = rmc_engine::mem_trace::MemSpan::start(format!(
+                "indexer init for {}",
+                config.collection_name
+            ));
             let indexer = UnifiedIndexer::for_embedded_with_backend(
                 &config.cache_path,
                 &config.tantivy_path,
@@ -142,6 +148,7 @@ impl IncrementalIndexer {
                 config.backend,
             )
             .await?;
+            mem.finish();
             self.indexer = Some(indexer);
         }
 
@@ -282,6 +289,12 @@ impl IncrementalIndexer {
         // too, and the maintenance gate at the end needs to know about them.
         let deleted_count = changes.deleted.len();
         let indexer = self.ensure_indexer().await?;
+        let mem = rmc_engine::mem_trace::MemSpan::start(format!(
+            "index changes ({} added, {} modified, {} deleted)",
+            changes.added.len(),
+            changes.modified.len(),
+            deleted_count
+        ));
 
         // Handle deletions
         for deleted_path in &changes.deleted {
@@ -367,6 +380,7 @@ impl IncrementalIndexer {
 
         // Commit changes to Tantivy
         indexer.commit()?;
+        mem.finish();
 
         tracing::info!(
             "✓ Incremental update complete: {} files indexed, {} chunks, {} retryable failures",

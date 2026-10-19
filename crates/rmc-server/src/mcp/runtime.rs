@@ -406,6 +406,10 @@ impl ServerRuntime {
             .push(handle);
     }
 
+    /// Stop the background tasks — today that is the background sync and
+    /// nothing else. A retiring daemon calls this long before it exits, so a
+    /// task added to this channel later must be one a draining daemon can do
+    /// without.
     pub fn request_shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
     }

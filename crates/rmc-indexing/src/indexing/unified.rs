@@ -594,7 +594,10 @@ impl UnifiedIndexer {
             return;
         }
         let started = std::time::Instant::now();
-        match self.vector_store.maintain(vector_prune_keep()).await {
+        let mem = rmc_engine::mem_trace::MemSpan::start("vector store maintenance");
+        let result = self.vector_store.maintain(vector_prune_keep()).await;
+        mem.finish();
+        match result {
             Ok(stats) => tracing::info!(
                 "Vector store maintenance: {} fragment(s) merged into {}, {} old version(s) pruned, {:.1} MiB reclaimed in {:.2}s",
                 stats.fragments_removed,
