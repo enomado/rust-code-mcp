@@ -38,6 +38,10 @@ pub(crate) async fn build_hypergraph(
     }
     let opts = BuildOptions {
         force_rebuild: params.force_rebuild.unwrap_or(false),
+        // The per-crate build gives rust-analyzer's caches back between
+        // crates; this returns the pages to the kernel with the allocator
+        // this binary actually links.
+        release_free_memory: Some(crate::mcp::memory::release_free_memory),
         ..Default::default()
     };
     // build_and_persist runs `loader::load` + the full extract pass + LMDB

@@ -907,9 +907,15 @@ mod tests {
         // One name resolves, one doesn't — so we get 1 seed + 1 diagnostic.
         assert_eq!(cm.stats.seed_count, 1);
         assert_eq!(cm.diagnostics.len(), 1);
-        assert_eq!(
-            cm.diagnostics[0],
-            "unresolved seed: synthetic_codemap_crate::does_not_exist_xyzzy",
+        // The parent is the crate root, so the diagnostic carries the
+        // "not indexed" hint whichever of the crate and root-module nodes the
+        // name lookup lands on.
+        let diagnostic = &cm.diagnostics[0];
+        assert!(
+            diagnostic.starts_with(
+                "unresolved seed: synthetic_codemap_crate::does_not_exist_xyzzy (parent module resolves;"
+            ),
+            "{diagnostic}",
         );
     }
 

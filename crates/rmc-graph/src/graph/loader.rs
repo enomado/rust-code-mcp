@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use cargo_metadata::{MetadataCommand, TargetKind};
 use ra_ap_hir::Crate;
-use ra_ap_hir_def::nameres::crate_def_map;
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
 use ra_ap_project_model::{CargoConfig, CargoFeatures, RustLibSource};
@@ -62,7 +61,51 @@ pub struct LoadedWorkspace {
     pub crate_target_kinds_by_root_file: HashMap<String, String>,
 }
 
+/// Load `directory` with every crate's caches primed in parallel — what every
+/// one-shot analysis (audits, skeleton, tests) wants.
 pub fn load(directory: &Path) -> Result<LoadedWorkspace> {
+    load_with(directory, true)
+}
+
+/// Load `directory` without priming anything: the caller primes the crates it
+/// is about to walk with [`prime_for`]. The per-crate snapshot build does
+/// this, so a build of a few crates does not pay for the whole crate graph.
+pub(crate) fn load_unprimed(directory: &Path) -> Result<LoadedWorkspace> {
+    load_with(directory, false)
+}
+
+/// Prime, in parallel, the caches of `crates` and of everything they depend
+/// on, transitively — DefMaps first, as `prefill_caches` does for the whole
+/// graph. Without it the extraction walk builds DefMaps lazily, one at a time
+/// (measured ~30× slower on burn, see [`load`]).
+///
+/// The scope is closed under dependencies because the scheduler only waits
+/// for in-scope dependencies (`parallel_prime_caches`). For a full build it
+/// is every crate a local lib/bin target reaches — less than `prefill_caches`
+/// primes, which also takes the tests, benches, examples and build scripts
+/// the graph never walks.
+pub(crate) fn prime_for(loaded: &LoadedWorkspace, crates: &[Crate]) {
+    let db = &loaded.db;
+    let mut scope: Vec<Crate> = Vec::new();
+    let mut seen: HashSet<Crate> = HashSet::new();
+    let mut stack: Vec<Crate> = crates.to_vec();
+    while let Some(krate) = stack.pop() {
+        if !seen.insert(krate) {
+            continue;
+        }
+        scope.push(krate);
+        stack.extend(krate.dependencies(db).into_iter().map(|dep| dep.krate));
+    }
+    let scope: Vec<_> = scope.into_iter().map(Crate::base).collect();
+    ra_ap_ide_db::prime_caches::parallel_prime_caches(
+        db,
+        &scope,
+        num_cpus::get_physical(),
+        &|_| (),
+    );
+}
+
+fn load_with(directory: &Path, prefill_caches: bool) -> Result<LoadedWorkspace> {
     let canonical = directory
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", directory.display()))?;
@@ -83,8 +126,9 @@ pub fn load(directory: &Path) -> Result<LoadedWorkspace> {
         with_proc_macro_server: ProcMacroServerChoice::None,
         // Build every workspace crate's DefMap in parallel during load. Without
         // this, DefMaps are constructed lazily on first access during the
-        // serial extraction walk — measured ~30× slower on burn.
-        prefill_caches: true,
+        // serial extraction walk — measured ~30× slower on burn. When it is
+        // off, the caller primes its own scope (`prime_for`).
+        prefill_caches,
         num_worker_threads: num_cpus::get_physical(),
         proc_macro_processes: 1,
     };
@@ -163,13 +207,13 @@ fn should_index_crate_root(root_file: &Path, targets: &WorkspaceTargets) -> bool
 }
 
 /// Absolute, canonicalized path of the crate's root file (`lib.rs`/`main.rs`).
+///
+/// Read from the crate graph, not from the crate's DefMap: this runs for every
+/// local-origin crate before anything is primed, and a DefMap asked for here
+/// would be built serially — the whole graph's, tests and build scripts
+/// included.
 fn crate_root_abs_path(db: &RootDatabase, vfs: &Vfs, krate: Crate) -> Option<PathBuf> {
-    let def_map = crate_def_map(db, krate.base());
-    let root_module_id = def_map.crate_root(db);
-    let root_file_id = def_map[root_module_id]
-        .definition_source_file_id()
-        .original_file(db)
-        .file_id(db);
+    let root_file_id = krate.root_file(db);
     let abs: PathBuf = vfs.file_path(root_file_id).as_path()?.to_path_buf().into();
     Some(canonical_or_self(&abs))
 }
