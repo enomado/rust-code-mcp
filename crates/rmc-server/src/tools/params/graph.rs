@@ -401,7 +401,7 @@ pub(crate) struct BuildCodemapParams {
     #[schemars(description = "Optional embedding profile for task_prompt HybridSearch seed lookup. Default: local-cpu-small. Use local-gpu-small or another local-qwen3 profile to explicitly opt into local CUDA.")]
     #[serde(default)]
     pub embedding_profile: Option<String>,
-    #[schemars(description = "Override seeds by qualified name. The hypergraph indexes only `pub` and `pub(crate)` items — module-local private functions and trait-impl method bodies are not stored as standalone nodes and can't be referenced this way. Names that fail to resolve are surfaced in Codemap.diagnostics rather than erroring out; if the leaf fails but its parent module resolves, the diagnostic notes 'likely private or not indexed'.")]
+    #[schemars(description = "Override seeds by qualified name. The hypergraph indexes items of every visibility, private ones included; items declared inside function bodies, methods of trait impls and items under `#[cfg(test)]` are not stored as nodes and can't be referenced this way. Names that fail to resolve are surfaced in Codemap.diagnostics rather than erroring out; if the leaf fails but its parent module resolves, the diagnostic says the leaf is a typo or not indexed.")]
     #[serde(default)]
     pub seed_qualified_names: Option<Vec<String>>,
     #[schemars(description = "Maximum number of retained nodes. Default 80; capped at 500.")]
