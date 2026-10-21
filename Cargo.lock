@@ -3241,7 +3241,7 @@ dependencies = [
  "either",
  "hir-def",
  "hir-expand",
- "hir-ty",
+ "hir-ide",
  "intern",
  "itertools 0.15.0",
  "la-arena",
@@ -3317,6 +3317,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "hir-ide"
+version = "0.0.0"
+dependencies = [
+ "base-db",
+ "cov-mark",
+ "either",
+ "hir-def",
+ "hir-expand",
+ "hir-ty",
+ "intern",
+ "itertools 0.15.0",
+ "la-arena",
+ "macros",
+ "ra-ap-rustc_abi",
+ "ra-ap-rustc_ast_ir",
+ "ra-ap-rustc_pattern_analysis",
+ "ra-ap-rustc_type_ir",
+ "rustc-hash 2.1.1",
+ "rustc_apfloat",
+ "salsa",
+ "smallvec",
+ "span",
+ "stdx",
+ "syntax",
+ "tracing",
+ "triomphe",
+ "typed-arena",
+]
+
+[[package]]
 name = "hir-ty"
 version = "0.0.0"
 dependencies = [
@@ -3339,7 +3369,6 @@ dependencies = [
  "ra-ap-rustc_ast_ir",
  "ra-ap-rustc_index",
  "ra-ap-rustc_next_trait_solver",
- "ra-ap-rustc_pattern_analysis",
  "ra-ap-rustc_type_ir",
  "rustc-hash 2.1.1",
  "rustc_apfloat",
@@ -3355,7 +3384,6 @@ dependencies = [
  "tracing-subscriber",
  "tracing-tree",
  "triomphe",
- "typed-arena",
 ]
 
 [[package]]
@@ -7448,7 +7476,7 @@ dependencies = [
 
 [[package]]
 name = "salsa"
-version = "0.28.4"
+version = "0.28.5"
 dependencies = [
  "boxcar",
  "crossbeam-queue",
@@ -7473,11 +7501,11 @@ dependencies = [
 
 [[package]]
 name = "salsa-macro-rules"
-version = "0.28.4"
+version = "0.28.5"
 
 [[package]]
 name = "salsa-macros"
-version = "0.28.4"
+version = "0.28.5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8137,6 +8165,7 @@ dependencies = [
  "stdx",
  "tracing",
  "triomphe",
+ "unicode-ident",
 ]
 
 [[package]]

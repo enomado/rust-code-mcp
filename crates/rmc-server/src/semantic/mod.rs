@@ -198,12 +198,17 @@ pub struct ProjectMemoryReport {
 
 /// Flatten salsa's two families — interned/tracked structs and query memo
 /// tables — into one list, sorted by what it can see.
-fn ingredient_rows(host: &AnalysisHost) -> Vec<IngredientMemory> {
+///
+/// Takes the host by `&mut`: since salsa 0.28.5 measuring memo storage needs
+/// exclusive access, and `memory_usage` cancels and waits out every other
+/// handle the way a write does. The analysis thread owns the host, so no other
+/// handle is alive on it when this runs.
+fn ingredient_rows(host: &mut AnalysisHost) -> Vec<IngredientMemory> {
     use ra_ap_ide_db::base_db::salsa;
 
     // `memory_usage` is implemented on `dyn Database`, not on the trait, so the
     // unsize coercion here is required rather than stylistic.
-    let db: &dyn salsa::Database = host.raw_database();
+    let db: &mut dyn salsa::Database = host.raw_database_mut();
     let info = db.memory_usage();
 
     let mut rows: Vec<IngredientMemory> = info
@@ -445,26 +450,31 @@ impl SemanticService {
     /// `metadata_bytes` only — enough to say which memos are numerous, never
     /// how many bytes they are worth. `accounted_bytes` against RSS is printed
     /// precisely so the gap cannot be mistaken for a full budget.
-    pub(crate) fn memory_breakdown(&self, project: &Path, top: usize) -> Result<ProjectMemoryReport> {
+    pub(crate) fn memory_breakdown(
+        &mut self,
+        project: &Path,
+        top: usize,
+    ) -> Result<ProjectMemoryReport> {
         let canonical = project
             .canonicalize()
             .with_context(|| format!("resolving {}", project.display()))?;
-        let ctx = self.projects.get(&canonical).ok_or_else(|| {
+        if !self.projects.contains_key(&canonical) {
             let loaded: Vec<String> = self
                 .projects
                 .keys()
                 .map(|path| path.display().to_string())
                 .collect();
-            anyhow::anyhow!(
+            anyhow::bail!(
                 "no analysis is loaded for {}; this reports what a live daemon is holding and \
                  will not load a project to answer, because a database built for the question \
                  measures a cold start rather than the daemon. Loaded: {}",
                 canonical.display(),
                 if loaded.is_empty() { "nothing".to_owned() } else { loaded.join(", ") }
-            )
-        })?;
+            );
+        }
+        let ctx = self.projects.get_mut(&canonical).unwrap();
 
-        let mut rows = ingredient_rows(&ctx.host);
+        let mut rows = ingredient_rows(&mut ctx.host);
         let instances = rows.iter().map(|row| row.count).sum();
         let accounted_bytes = rows.iter().map(IngredientMemory::bytes).sum();
         let ingredients = rows.len();
@@ -2178,9 +2188,9 @@ pub fn a_local_of_the_same_name() -> u32 {
         // Borrowed inline, not held: `collect_garbage` below needs `&mut` on the
         // service, so no borrow of a host may outlive a single measurement.
         let rows = breakdown(
-            &service
+            &mut service
                 .projects
-                .get(&canonical)
+                .get_mut(&canonical)
                 .expect("the query above must have cached a context for this path")
                 .host,
         );
@@ -2335,9 +2345,9 @@ pub fn a_local_of_the_same_name() -> u32 {
         service.collect_garbage();
 
         let after_rows = breakdown(
-            &service
+            &mut service
                 .projects
-                .get(&canonical)
+                .get_mut(&canonical)
                 .expect("collecting garbage must not drop the context")
                 .host,
         );
