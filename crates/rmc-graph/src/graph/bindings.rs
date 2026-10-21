@@ -276,14 +276,13 @@ fn create_local_item_node(
 
     let qualified = format!("{module_qual}::{name}");
 
-    let node_id = NodeId::from_components(&[
+    let node_id = local_item_node_id(
         model.workspace_hash.as_str(),
-        "item",
         from_crate_name,
         module_qual.as_str(),
-        item_kind_label(item_kind),
+        item_kind,
         name.as_str(),
-    ]);
+    );
 
     let crate_id = model.nodes.get(&module_node_id).and_then(|n| n.crate_id);
 
@@ -305,7 +304,28 @@ fn create_local_item_node(
     Some(node_id)
 }
 
-fn item_kind_for_def(def_id: ModuleDefId) -> Option<ItemKind> {
+/// NodeId of a module-level local item. The one place this id is minted:
+/// the bindings pass creates the node with it, and the consumer-side usages
+/// pass (`usages::TargetIds`) recomputes it for a reference without needing
+/// the producer crate's extracted rows.
+pub(super) fn local_item_node_id(
+    workspace_hash: &str,
+    crate_name: &str,
+    module_qual: &str,
+    item_kind: ItemKind,
+    name: &str,
+) -> NodeId {
+    NodeId::from_components(&[
+        workspace_hash,
+        "item",
+        crate_name,
+        module_qual,
+        item_kind_label(item_kind),
+        name,
+    ])
+}
+
+pub(super) fn item_kind_for_def(def_id: ModuleDefId) -> Option<ItemKind> {
     Some(match def_id {
         ModuleDefId::FunctionId(_) => ItemKind::Function,
         ModuleDefId::AdtId(AdtId::StructId(_)) => ItemKind::Struct,
@@ -319,7 +339,7 @@ fn item_kind_for_def(def_id: ModuleDefId) -> Option<ItemKind> {
     })
 }
 
-fn name_for_def(db: &RootDatabase, def_id: ModuleDefId) -> Option<String> {
+pub(super) fn name_for_def(db: &RootDatabase, def_id: ModuleDefId) -> Option<String> {
     use ra_ap_hir::{Const, Enum, Function, Static, Struct, Trait, TypeAlias, Union};
     Some(match def_id {
         ModuleDefId::FunctionId(id) => Function::from(id).name(db).as_str().to_string(),
@@ -334,7 +354,7 @@ fn name_for_def(db: &RootDatabase, def_id: ModuleDefId) -> Option<String> {
     })
 }
 
-fn module_def_owner_module(db: &RootDatabase, def_id: ModuleDefId) -> Option<ModuleId> {
+pub(super) fn module_def_owner_module(db: &RootDatabase, def_id: ModuleDefId) -> Option<ModuleId> {
     Some(match def_id {
         ModuleDefId::ModuleId(id) => id,
         ModuleDefId::FunctionId(id) => id.module(db),

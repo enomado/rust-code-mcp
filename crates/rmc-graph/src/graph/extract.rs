@@ -23,9 +23,13 @@ use super::loader::LoadedWorkspace;
 use super::model::{ExtractionModel, Node, NodeKind};
 use super::signatures::extract_signatures;
 use super::statics::extract_statics;
-use super::usages::extract_usages;
+use super::usages::{UsagesPass, extract_usages};
 
 pub fn extract(loaded: &LoadedWorkspace) -> ExtractionModel {
+    extract_with(loaded, UsagesPass::from_env())
+}
+
+pub(crate) fn extract_with(loaded: &LoadedWorkspace, usages_pass: UsagesPass) -> ExtractionModel {
     let timing = std::env::var_os("EXTRACT_TIMING").is_some();
     let t_total = std::time::Instant::now();
 
@@ -115,9 +119,9 @@ pub fn extract(loaded: &LoadedWorkspace) -> ExtractionModel {
 
     // Layer 4: extend def_to_node with methods, assoc consts, assoc types from
     // inherent impls and trait declarations BEFORE running the usages pass —
-    // extract_usages iterates def_to_node and queries `Definition::usages`
-    // for each Item, so adding the new defs here makes who_uses(Foo::bar)
-    // and who_uses(Trait::method) work for free.
+    // that makes them usage targets (who_uses(Foo::bar),
+    // who_uses(Trait::method)). The consumer-side usages pass recomputes their
+    // ids itself (`usages::TargetIds`); which defs count is mirrored there.
     let t = std::time::Instant::now();
     let nodes_before_impls = model.nodes.len();
     extract_impl_items(
@@ -197,10 +201,11 @@ pub fn extract(loaded: &LoadedWorkspace) -> ExtractionModel {
         &loaded.local_crates,
         &def_to_node,
         &module_node_for,
+        usages_pass,
     );
     if timing {
         eprintln!(
-            "extract: extract_usages               {:>9.2?}  ({} usages)",
+            "extract: extract_usages ({usages_pass:?}) {:>9.2?}  ({} usages)",
             t.elapsed(),
             model.usages.len()
         );
