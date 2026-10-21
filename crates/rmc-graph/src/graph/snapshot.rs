@@ -1,8 +1,9 @@
 //! Snapshot lifecycle: staging → write → publish.
 //!
-//! `build_and_persist` is the high-level entry point: it loads, extracts,
-//! computes a fingerprint, opens a new heed env in a staging dir, writes the
-//! whole model in one transaction, writes manifest.json, then atomically swaps
+//! `build_and_persist` is the high-level entry point: it loads, computes a
+//! fingerprint, opens a new heed env in a staging dir, extracts and writes
+//! crate by crate (one transaction per crate, memory given back between
+//! them), writes manifest.json, then atomically swaps
 //! the workspace's `CURRENT` pointer and removes the snapshots it superseded.
 //! Staging, publish and prune run under the workspace's `BUILD.lock`
 //! ([`lock_workspace_builds`]).
@@ -29,19 +30,29 @@ struct CachedGraphEnv {
 use super::extract;
 use super::ids::{BindingId, NodeId, UsageId};
 use super::loader::{self, LoadedWorkspace};
-use super::model::{Binding, ExtractionModel, Namespace, Usage};
+#[cfg(test)]
+use super::model::ExtractionModel;
+use super::model::{Binding, Namespace, NodeKind, Usage};
 use super::ownership;
 use super::storage::{
     CURRENT_POINTER_FILENAME, GraphDatabases, GraphEnvOptions, GraphManifest, GraphPaths,
     SCHEMA_VERSION, compute_fingerprint, default_data_dir, graph_id_for, read_manifest,
     read_manifest_compatible, write_manifest,
 };
+use super::usages::UsagesPass;
 
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
     pub force_rebuild: bool,
     pub data_dir_override: Option<PathBuf>,
     pub env: GraphEnvOptions,
+    /// Called after each crate of the build, once rust-analyzer has dropped
+    /// that crate's caches, to give the freed pages back to the kernel.
+    /// Which call does that depends on the allocator the binary links
+    /// (`malloc_trim` against mimalloc is a no-op), so the binary passes it;
+    /// `rmc-server` has `mcp::memory::release_free_memory`. `None`: the pages
+    /// stay with the allocator for reuse by the next crate.
+    pub release_free_memory: Option<fn() -> bool>,
 }
 
 impl Default for BuildOptions {
@@ -50,6 +61,7 @@ impl Default for BuildOptions {
             force_rebuild: false,
             data_dir_override: None,
             env: GraphEnvOptions::default(),
+            release_free_memory: None,
         }
     }
 }
@@ -272,7 +284,8 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
     };
 
     let t = std::time::Instant::now();
-    let loaded = loader::load(&workspace_root)?;
+    // Unprimed: the per-crate build primes the crates it walks itself.
+    let mut loaded = loader::load_unprimed(&workspace_root)?;
     if timing {
         eprintln!(
             "build:   loader::load                 {:>9.2?}  ({} local crates)",
@@ -306,20 +319,18 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
             .with_context(|| format!("open heed env at {}", identity.snapshot_dir.display()))?
     };
 
-    let model = extract::extract(&loaded);
-
     let t = std::time::Instant::now();
-    let (node_count, binding_count, usage_count) = write_model(
+    let (node_count, binding_count, usage_count) = write_by_crate(
         &env,
-        options.env,
-        &model,
+        &mut loaded,
+        options.release_free_memory,
         &identity.paths.workspace_hash,
         &identity.fingerprint,
         &identity.graph_id,
     )?;
     if timing {
         eprintln!(
-            "build:   write_model (LMDB)           {:>9.2?}  ({} nodes, {} bindings, {} usages)",
+            "build:   extract + write by crate     {:>9.2?}  ({} nodes, {} bindings, {} usages)",
             t.elapsed(),
             node_count,
             binding_count,
@@ -355,58 +366,10 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
     })
 }
 
-/// Lower-level entry for tests that already have a `LoadedWorkspace` in hand.
-pub(crate) fn persist_loaded(
-    loaded: &LoadedWorkspace,
-    options: &BuildOptions,
-) -> Result<BuildResult> {
-    let paths = graph_paths_for_workspace(&loaded.workspace_root, options);
-    paths.ensure_dirs()?;
-    let identity = compute_snapshot_identity(loaded.workspace_root.clone(), paths)?;
-    let _build_lock = lock_workspace_builds(&identity.paths)?;
-
-    if identity.snapshot_dir.exists() {
-        fs::remove_dir_all(&identity.snapshot_dir)?;
-    }
-    fs::create_dir_all(&identity.snapshot_dir)?;
-    let env = unsafe { options.env.to_open_options().open(&identity.snapshot_dir)? };
-
-    let model = extract::extract(loaded);
-    let (node_count, binding_count, usage_count) = write_model(
-        &env,
-        options.env,
-        &model,
-        &identity.paths.workspace_hash,
-        &identity.fingerprint,
-        &identity.graph_id,
-    )?;
-    let manifest = GraphManifest {
-        graph_id: identity.graph_id.clone(),
-        workspace_root: loaded.workspace_root.display().to_string(),
-        workspace_hash: identity.paths.workspace_hash.clone(),
-        fingerprint: identity.fingerprint.clone(),
-        schema_version: SCHEMA_VERSION,
-        created_at_unix: now_unix()?,
-        node_count,
-        binding_count,
-        usage_count,
-    };
-    write_manifest(&identity.manifest_path, &manifest)?;
-    publish_current(&identity.paths, &identity.graph_id)?;
-    prune_superseded_snapshots(&identity.paths, &identity.graph_id);
-
-    Ok(BuildResult {
-        graph_id: identity.graph_id,
-        workspace_root: identity.workspace_root,
-        fingerprint: identity.fingerprint,
-        node_count,
-        binding_count,
-        usage_count,
-        reused: false,
-        snapshot_path: identity.snapshot_dir,
-    })
-}
-
+/// The whole-workspace model written in one transaction — the reference the
+/// per-crate build ([`write_by_crate`]) is compared against, so test-only
+/// until the whole-model path goes.
+#[cfg(test)]
 fn write_model(
     env: &Env<WithoutTls>,
     _env_opts: GraphEnvOptions,
@@ -430,27 +393,115 @@ fn write_model(
             model.nodes.len()
         );
     }
-    let (node_count, binding_count, usage_count) =
-        (written.nodes, written.bindings, written.usages);
-
-    // 5. Meta
-    dbs.meta_by_key
-        .put(&mut wtxn, "workspace_hash", workspace_hash.as_bytes())?;
-    dbs.meta_by_key
-        .put(&mut wtxn, "fingerprint", fingerprint.as_bytes())?;
-    dbs.meta_by_key
-        .put(&mut wtxn, "graph_id", graph_id.as_bytes())?;
-    dbs.meta_by_key
-        .put(&mut wtxn, "schema_version", &SCHEMA_VERSION.to_le_bytes())?;
-    dbs.meta_by_key
-        .put(&mut wtxn, "node_count", &node_count.to_le_bytes())?;
-    dbs.meta_by_key
-        .put(&mut wtxn, "binding_count", &binding_count.to_le_bytes())?;
-    dbs.meta_by_key
-        .put(&mut wtxn, "usage_count", &usage_count.to_le_bytes())?;
+    let counts = (written.nodes, written.bindings, written.usages);
+    write_meta(
+        &mut wtxn,
+        &dbs,
+        workspace_hash,
+        fingerprint,
+        graph_id,
+        counts,
+    )?;
 
     wtxn.commit().context("commit graph write txn")?;
-    Ok((node_count, binding_count, usage_count))
+    Ok(counts)
+}
+
+/// Build and write the snapshot one crate group at a time
+/// (`extract::extract_by_crate`): one write transaction per group holding
+/// exactly that group's rows, then the meta rows. Returns the same counts as
+/// [`write_model`] of the whole-workspace model.
+fn write_by_crate(
+    env: &Env<WithoutTls>,
+    loaded: &mut LoadedWorkspace,
+    release_free_memory: Option<fn() -> bool>,
+    workspace_hash: &str,
+    fingerprint: &str,
+    graph_id: &str,
+) -> Result<(u64, u64, u64)> {
+    let mut wtxn = env.write_txn().context("open write txn")?;
+    let dbs = GraphDatabases::create(env, &mut wtxn)?;
+    wtxn.commit().context("commit graph table creation")?;
+
+    let dirty = loaded.local_crates.clone();
+    let (mut binding_count, mut usage_count) = (0u64, 0u64);
+    extract::extract_by_crate(
+        loaded,
+        &dirty,
+        UsagesPass::from_env(),
+        release_free_memory,
+        &mut |model, group| {
+            let mut wtxn = env.write_txn().context("open write txn")?;
+            let written = ownership::write_owned_rows(&mut wtxn, &dbs, model, &|c| c == group.id)?;
+            // The whole-model write checks that every node was written. Here
+            // nodes of other crates are left out on purpose, so the check is
+            // that the group's own, the workspace node and every stub (all
+            // named by the group's bindings — the only rows that create one)
+            // made it.
+            let expected = model
+                .nodes
+                .values()
+                .filter(|n| match n.kind {
+                    NodeKind::Workspace | NodeKind::ExternalSymbol => true,
+                    NodeKind::Crate | NodeKind::Module | NodeKind::Item => {
+                        n.crate_id == Some(group.id)
+                    }
+                })
+                .count() as u64;
+            if written.nodes != expected {
+                bail!(
+                    "crate `{}`: wrote {} of its {expected} nodes; the rest have no owning crate",
+                    group.name,
+                    written.nodes
+                );
+            }
+            wtxn.commit()
+                .with_context(|| format!("commit rows of crate `{}`", group.name))?;
+            binding_count += written.bindings;
+            usage_count += written.usages;
+            Ok(())
+        },
+    )?;
+
+    let mut wtxn = env.write_txn().context("open write txn")?;
+    // Distinct nodes: the workspace node and the stubs are written by every
+    // group that has them.
+    let node_count = dbs.nodes_by_id.len(&wtxn)?;
+    let counts = (node_count, binding_count, usage_count);
+    write_meta(
+        &mut wtxn,
+        &dbs,
+        workspace_hash,
+        fingerprint,
+        graph_id,
+        counts,
+    )?;
+    wtxn.commit().context("commit graph meta")?;
+    Ok(counts)
+}
+
+fn write_meta(
+    wtxn: &mut heed::RwTxn<'_>,
+    dbs: &GraphDatabases,
+    workspace_hash: &str,
+    fingerprint: &str,
+    graph_id: &str,
+    (node_count, binding_count, usage_count): (u64, u64, u64),
+) -> Result<()> {
+    dbs.meta_by_key
+        .put(wtxn, "workspace_hash", workspace_hash.as_bytes())?;
+    dbs.meta_by_key
+        .put(wtxn, "fingerprint", fingerprint.as_bytes())?;
+    dbs.meta_by_key.put(wtxn, "graph_id", graph_id.as_bytes())?;
+    dbs.meta_by_key
+        .put(wtxn, "schema_version", &SCHEMA_VERSION.to_le_bytes())?;
+    dbs.meta_by_key
+        .put(wtxn, "node_count", &node_count.to_le_bytes())?;
+    dbs.meta_by_key
+        .put(wtxn, "binding_count", &binding_count.to_le_bytes())?;
+    dbs.meta_by_key
+        .put(wtxn, "usage_count", &usage_count.to_le_bytes())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -459,11 +510,39 @@ pub(crate) fn persist_test_model(
     model: &ExtractionModel,
     env_opts: GraphEnvOptions,
 ) -> Result<OpenedSnapshot> {
-    let paths = GraphPaths::for_workspace_in(data_dir, &model.workspace_root);
+    persist_test_with(
+        data_dir,
+        &model.workspace_root,
+        env_opts,
+        |env, hash, fp, id| write_model(env, env_opts, model, hash, fp, id),
+    )
+}
+
+/// [`persist_test_model`] through the per-crate build instead of a model.
+#[cfg(test)]
+pub(crate) fn persist_test_by_crate(
+    data_dir: &Path,
+    loaded: &mut LoadedWorkspace,
+    env_opts: GraphEnvOptions,
+) -> Result<OpenedSnapshot> {
+    let workspace_root = loaded.workspace_root.clone();
+    persist_test_with(data_dir, &workspace_root, env_opts, |env, hash, fp, id| {
+        write_by_crate(env, loaded, None, hash, fp, id)
+    })
+}
+
+#[cfg(test)]
+fn persist_test_with(
+    data_dir: &Path,
+    workspace_root: &Path,
+    env_opts: GraphEnvOptions,
+    write: impl FnOnce(&Env<WithoutTls>, &str, &str, &str) -> Result<(u64, u64, u64)>,
+) -> Result<OpenedSnapshot> {
+    let paths = GraphPaths::for_workspace_in(data_dir, workspace_root);
     paths.ensure_dirs()
         .with_context(|| format!("create graph dirs under {}", paths.root_dir.display()))?;
     let identity = snapshot_identity(
-        model.workspace_root.clone(),
+        workspace_root.to_path_buf(),
         paths,
         "test-fingerprint".to_string(),
     );
@@ -477,17 +556,15 @@ pub(crate) fn persist_test_model(
                 .open(&identity.snapshot_dir)
                 .with_context(|| format!("open heed env at {}", identity.snapshot_dir.display()))?
         };
-        let (node_count, binding_count, usage_count) = write_model(
+        let (node_count, binding_count, usage_count) = write(
             &env,
-            env_opts,
-            model,
             &identity.paths.workspace_hash,
             &identity.fingerprint,
             &identity.graph_id,
         )?;
         let manifest = GraphManifest {
             graph_id: identity.graph_id.clone(),
-            workspace_root: model.workspace_root.display().to_string(),
+            workspace_root: workspace_root.display().to_string(),
             workspace_hash: identity.paths.workspace_hash.clone(),
             fingerprint: identity.fingerprint.clone(),
             schema_version: SCHEMA_VERSION,

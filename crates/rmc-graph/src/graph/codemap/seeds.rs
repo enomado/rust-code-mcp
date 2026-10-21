@@ -141,13 +141,16 @@ pub(super) fn resolve_override_seeds(
 /// path resolved to.
 ///
 /// A parent that is a module means the leaf name is either a typo or an item
-/// the graph does not store. Visibility is not the reason — private items are
+/// the graph does not store. A crate parent is the same case: the crate and
+/// its root module share one qualified name, and which of the two a lookup of
+/// that name returns depends on their ids (hashes of the workspace path), so
+/// the hint must not. Visibility is not the reason — private items are
 /// indexed like public ones; the gaps are items declared inside function
 /// bodies, methods of trait impls, and anything under `#[cfg(test)]` (the
 /// workspace is loaded with `cfg(test)` off).
 fn unresolved_seed_hint(parent_kind: Option<NodeKind>) -> &'static str {
     match parent_kind {
-        Some(NodeKind::Module) => {
+        Some(NodeKind::Module | NodeKind::Crate) => {
             " (parent module resolves; the leaf is a typo or not indexed: items inside fn bodies, \
              trait-impl methods and #[cfg(test)] items are not stored)"
         }
@@ -273,7 +276,11 @@ mod tests {
             !hint(Some(NodeKind::Module)).contains("private"),
             "private items are indexed, so the hint must not blame visibility",
         );
-        assert_eq!(hint(Some(NodeKind::Crate)), "", "crate parent is terse");
+        assert_eq!(
+            hint(Some(NodeKind::Crate)),
+            hint(Some(NodeKind::Module)),
+            "a crate parent is its root module",
+        );
         assert_eq!(hint(Some(NodeKind::Item)), "", "item parent is terse");
         assert_eq!(hint(None), "", "no parent → terse");
     }
