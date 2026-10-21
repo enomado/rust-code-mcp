@@ -743,12 +743,13 @@ against documented APIs; the underlying hybrid search (BM25 + vector
 embeddings against doc comments) favors public surfaces with rich
 docstrings, and many search hits fail to snap to an indexed Item span
 (reported in `Codemap.diagnostics`). For pinpoint navigation to a
-specific implementation, prefer `seed_qualified_names`. Note that the
-hypergraph indexes only `pub` and `pub(crate)` items — module-local
-private functions can't be referenced by qualified name. Unresolved
-names go to `Codemap.diagnostics`; if the leaf fails but its parent
-module resolves, the diagnostic notes 'likely private or not indexed'
-to distinguish that from a typo.
+specific implementation, prefer `seed_qualified_names`. The hypergraph
+indexes items of every visibility, private ones included; what it does
+not store is items declared inside function bodies, methods of trait
+impls, and anything under `#[cfg(test)]` — those can't be referenced by
+qualified name. Unresolved names go to `Codemap.diagnostics`; if the
+leaf fails but its parent module resolves, the diagnostic says the leaf
+is a typo or not indexed.
 
 Output: `format='json'` returns the full `Codemap` JSON (nodes, edges,
 hierarchy, stats, diagnostics). `format='mermaid'` returns a
