@@ -210,8 +210,8 @@ pub struct ProjectMemoryReport {
 /// ```text
 /// held = file mappings                       (smaps: Rss − Anonymous)
 ///      + anonymous, of which
-///          outside the allocator             (anonymous + swap − arenas − mmapped chunks)
-///          free in the allocator             (mallinfo2: fordblks)
+///          outside the allocator             (anonymous + swap − arenas held − mmapped chunks)
+///          free in the allocator             (arenas held − in use in arenas)
 ///          in use, of which
 ///              salsa, every loaded project   (ingredient rows, as in `rows`)
 ///              rust-analyzer's interners     (`intern::interner_memory`)
@@ -220,9 +220,13 @@ pub struct ProjectMemoryReport {
 ///
 /// The last line is the finding, not a rounding error: it is heap in use whose
 /// owner nothing measures yet — salsa memos without a `heap_size`, the search
-/// index, the embedder. "Outside the allocator" can be negative: arena space
-/// glibc reserved but never touched is in `arenas` without being resident or
-/// swapped.
+/// index, the embedder.
+///
+/// "Arenas held" is the kernel's count over the arena mappings
+/// ([`crate::mcp::memory::ArenaResidency`]), not `mallinfo2`'s: glibc keeps
+/// pages a trim returned in its own totals, and cutting from those put 6.1 GiB
+/// the daemon no longer held into "free" and the same amount, negative, into
+/// "outside".
 ///
 /// Without allocator statistics (the `mimalloc` build) the middle splits
 /// disappear and the unattributed line is everything anonymous that salsa and
@@ -232,6 +236,10 @@ pub struct ProcessPortrait {
     pub mappings: crate::mcp::memory::ProcessMappings,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allocator: Option<crate::mcp::memory::AllocatorUsage>,
+    /// What of `allocator.arena_bytes` the kernel actually holds; present
+    /// exactly when `allocator` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arenas: Option<crate::mcp::memory::ArenaResidency>,
     /// Loaded analyses whose salsa ingredients are in the `salsa` line.
     pub salsa_projects: usize,
     pub lines: Vec<PortraitLine>,
@@ -296,23 +304,33 @@ fn process_portrait(
         what: "resident file and shared mappings: the binary and its libraries, mapped model \
                and index files",
     }];
-    let in_use = match allocator {
-        Some(allocator) => {
+    // Read only with allocator statistics: without them there is no in-use
+    // figure to subtract from the arenas.
+    let arenas = match allocator {
+        Some(_) => Some(memory::arena_residency()?),
+        None => None,
+    };
+    let in_use = match (allocator, arenas) {
+        (Some(allocator), Some(arenas)) => {
+            let arena_held = kib(arenas.held_kib);
+            // Chunks with an `mmap` of their own are outside the arenas and are
+            // in use for as long as they exist, so resident in full.
+            let mmapped = allocator.mmapped_bytes as i64;
             lines.push(PortraitLine {
                 owner: LINE_OUTSIDE,
-                bytes: held_anonymous - (allocator.arena_bytes + allocator.mmapped_bytes) as i64,
-                what: "anonymous memory (resident or swapped) the allocator did not hand out: \
-                       thread stacks, runtimes mapping their own memory; negative when arenas \
-                       hold reserved pages never touched",
+                bytes: held_anonymous - arena_held - mmapped,
+                what: "anonymous memory (resident or swapped) outside the allocator's arenas and \
+                       chunks: thread stacks, runtimes mapping their own memory",
             });
             lines.push(PortraitLine {
                 owner: LINE_FREE,
-                bytes: allocator.free_bytes as i64,
-                what: "freed into the allocator's arenas and kept: fragmentation",
+                bytes: arena_held - (allocator.in_use_bytes as i64 - mmapped),
+                what: "resident or swapped arena pages holding no live chunk: fragmentation a \
+                       trim has not returned (negative if live chunks hold untouched pages)",
             });
             allocator.in_use_bytes as i64
         }
-        None => held_anonymous,
+        _ => held_anonymous,
     };
     lines.push(PortraitLine {
         owner: LINE_SALSA,
@@ -354,6 +372,7 @@ fn process_portrait(
         held_bytes: kib(mappings.held_kib()),
         mappings,
         allocator,
+        arenas,
         salsa_projects,
         lines,
         interners,
@@ -2212,6 +2231,22 @@ pub fn a_local_of_the_same_name() -> u32 {
                 process.lines
             );
             assert!(line(LINE_FREE) >= 0);
+            assert!(
+                line(LINE_OUTSIDE) >= 0,
+                "the arenas held more than the anonymous memory the kernel reports: {:?}",
+                process.lines
+            );
+            let arenas = process
+                .arenas
+                .expect("allocator statistics come with arena residency");
+            // The writable arena mappings cover what glibc took for its arenas:
+            // a heap the alignment rule missed would leave its bytes behind, and
+            // its resident pages would land in "outside" instead of "free".
+            assert!(
+                arenas.mapped_kib * 1024 >= allocator.arena_bytes * 9 / 10,
+                "arena recognition found {arenas:?} of {allocator:?}"
+            );
+            assert!(arenas.held_kib > 0 && arenas.held_kib <= arenas.mapped_kib);
         }
         assert!(!process.largest_mappings.is_empty() && process.largest_mappings.len() <= 10);
     }

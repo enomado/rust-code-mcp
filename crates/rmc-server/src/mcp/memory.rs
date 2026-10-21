@@ -137,23 +137,50 @@ pub fn largest_mappings(top: usize) -> Vec<MappingUsage> {
     }
 }
 
+/// The header line of one mapping in `/proc/<pid>/smaps`.
+struct MappingHeader<'a> {
+    start: u64,
+    end: u64,
+    perms: &'a str,
+    /// The mapped file's path or the kernel's bracketed name; `[anonymous]`
+    /// for an unnamed mapping.
+    name: &'a str,
+}
+
+/// `None` for the field lines (`Rss:`, `VmFlags:` …) that follow a header.
+fn parse_mapping_header(line: &str) -> Option<MappingHeader<'_>> {
+    // A header is `start-end perms offset dev inode [name]`; every field line
+    // starts with a `Name:` token instead.
+    let mut fields = line.splitn(6, char::is_whitespace);
+    let range = fields.next()?;
+    if range.ends_with(':') {
+        return None;
+    }
+    let (start, end) = range.split_once('-')?;
+    let perms = fields.next()?;
+    // The name may itself contain spaces, so it is the rest of the line after
+    // the fifth field rather than the sixth token.
+    let name = fields
+        .nth(3)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("[anonymous]");
+    Some(MappingHeader {
+        start: u64::from_str_radix(start, 16).ok()?,
+        end: u64::from_str_radix(end, 16).ok()?,
+        perms,
+        name,
+    })
+}
+
 pub(crate) fn parse_smaps(text: &str, top: usize) -> Vec<MappingUsage> {
     let mut by_name: std::collections::HashMap<String, MappingUsage> = Default::default();
     let mut current: Option<String> = None;
     for line in text.lines() {
         let mut tokens = line.split_whitespace();
         let Some(first) = tokens.next() else { continue };
-        if !first.ends_with(':') {
-            // A mapping header: `start-end perms offset dev inode [name]`.
-            // The name may itself contain spaces, so it is the rest of the line
-            // after the fifth field rather than the sixth token.
-            let name = line
-                .splitn(6, char::is_whitespace)
-                .nth(5)
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .unwrap_or("[anonymous]")
-                .to_owned();
+        if let Some(header) = parse_mapping_header(line) {
+            let name = header.name.to_owned();
             by_name
                 .entry(name.clone())
                 .or_insert_with(|| MappingUsage {
@@ -188,6 +215,81 @@ pub(crate) fn parse_smaps(text: &str, top: usize) -> Vec<MappingUsage> {
     });
     usages.truncate(top);
     usages
+}
+
+/// glibc's `HEAP_MAX_SIZE` on 64-bit targets (`2 * DEFAULT_MMAP_THRESHOLD_MAX`).
+///
+/// Every heap of a non-main arena is mapped at an address aligned to it —
+/// `new_heap` maps twice the size and cuts to the boundary — because `free`
+/// finds a chunk's heap by masking the chunk's address. That alignment is what
+/// tells an arena heap apart from the other anonymous mappings in `smaps`.
+const GLIBC_HEAP_ALIGN: u64 = 64 << 20;
+
+/// How much of glibc's arenas is resident or swapped, read from the kernel.
+///
+/// `mallinfo2` cannot say: its `arena` and `fordblks` count address space, and
+/// pages that `malloc_trim` returned with `MADV_DONTNEED` — or that were never
+/// touched — stay in both. On the live daemon (2026-10-21) that was 6.1 GiB of
+/// 16.4 GB of arenas, exactly what a trim 22 minutes earlier had returned, and a
+/// portrait cut from `mallinfo2` alone read 10.8 GB of "fragmentation" where
+/// 4.2 GB was resident, with the line beside it at −6.4 GB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ArenaResidency {
+    /// `[heap]` (the main arena) plus the writable anonymous mappings that
+    /// start on a heap boundary (every other arena).
+    pub mappings: usize,
+    /// Their writable size. The cross-check of the recognition: it covers
+    /// [`AllocatorUsage::arena_bytes`], or the alignment rule missed heaps.
+    pub mapped_kib: u64,
+    /// Of that, resident or in swap. `mapped − held` is what trims returned
+    /// plus what was never touched.
+    pub held_kib: u64,
+}
+
+/// `None` off Linux.
+pub fn arena_residency() -> Option<ArenaResidency> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/smaps")
+            .ok()
+            .map(|text| parse_arena_residency(&text))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+pub(crate) fn parse_arena_residency(text: &str) -> ArenaResidency {
+    let mut residency = ArenaResidency {
+        mappings: 0,
+        mapped_kib: 0,
+        held_kib: 0,
+    };
+    // Whether the mapping whose field lines are being read is an arena's.
+    let mut in_arena = false;
+    for line in text.lines() {
+        if let Some(header) = parse_mapping_header(line) {
+            in_arena = header.name == "[heap]"
+                || (header.name == "[anonymous]"
+                    && header.perms.starts_with("rw")
+                    && header.start % GLIBC_HEAP_ALIGN == 0);
+            if in_arena {
+                residency.mappings += 1;
+                residency.mapped_kib += (header.end - header.start) / 1024;
+            }
+            continue;
+        }
+        if !in_arena {
+            continue;
+        }
+        let mut tokens = line.split_whitespace();
+        if let Some("Rss:" | "Swap:") = tokens.next() {
+            // The kernel's own format: `Rss:   1234 kB`.
+            residency.held_kib += tokens.next().unwrap().parse::<u64>().unwrap();
+        }
+    }
+    residency
 }
 
 /// What the allocator says about its heap: how much is handed out and how
@@ -473,6 +575,43 @@ VmFlags: rd wr mr mw me ac
             ]
         );
         assert_eq!(parse_smaps(text, 1).len(), 1);
+    }
+
+    /// Arena heaps are `[heap]` and the writable anonymous mappings on a
+    /// 64 MiB boundary; a thread stack, a file, an unaligned anonymous mapping
+    /// and a heap's `PROT_NONE` reserve are not.
+    #[test]
+    fn arena_residency_counts_only_the_allocators_mappings() {
+        let text = "\
+7f0004000000-7f0008000000 rw-p 00000000 00:00 0
+Size:              65536 kB
+Rss:               40000 kB
+Swap:               1000 kB
+7f0008000000-7f000a000000 rw-p 00000000 00:00 0
+Rss:               20000 kB
+Swap:                  0 kB
+7f000a000000-7f000c000000 ---p 00000000 00:00 0
+Rss:                   0 kB
+Swap:                  0 kB
+7f000c001000-7f000c801000 rw-p 00000000 00:00 0
+Rss:                 100 kB
+Swap:                  0 kB
+7f0010000000-7f0010100000 rw-p 00000000 08:01 42 /data/index.lmdb
+Rss:                 900 kB
+Swap:                  0 kB
+55d000000000-55d000400000 rw-p 00000000 00:00 0                          [heap]
+Rss:                3000 kB
+Swap:                 10 kB
+VmFlags: rd wr mr mw me ac
+";
+        assert_eq!(
+            parse_arena_residency(text),
+            ArenaResidency {
+                mappings: 3,
+                mapped_kib: 65536 + 32768 + 4096,
+                held_kib: 41000 + 20000 + 3010,
+            }
+        );
     }
 
     /// On the build that ships (glibc, no mimalloc) the allocator reports, and

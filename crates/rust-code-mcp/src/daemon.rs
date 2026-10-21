@@ -68,7 +68,7 @@ use std::pin::pin;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
@@ -283,6 +283,9 @@ Memory watchdog (daemon only; 0 disables a threshold):
   RMC_GC_INTERVAL_SECS=300   how often loaded analyses are garbage-collected;
                              this is also what makes salsa's LRU capacities
                              evict anything at all
+  RMC_TRIM_GROWTH_MB=2048    return freed heap to the kernel (malloc_trim)
+                             whenever RSS grows this much above what the last
+                             trim left, at most every 5 minutes
   RMC_MAX_PROJECTS=3         how many analysis contexts stay loaded; past the
                              cap the least recently used one is dropped
 
@@ -702,6 +705,59 @@ pub fn watchdog_tick(
         ),
         trimmed: Some((reading, after)),
     }
+}
+
+/// Two gigabytes of RSS growth above what the last trim left, and the number is
+/// read off the two daemons of 2026-10-21 rather than picked.
+///
+/// The pressure trim in [`watchdog_tick`] only runs once a limit is crossed,
+/// and between crossings RSS is mostly heap the program already freed. The
+/// daemon serving twelve sessions trimmed 24.9 → 7.7 GB at 19:03, was back at
+/// 14.6 GB nine minutes later and at ~20 GB for the next hour with no trim in
+/// sight: its limits sit at 24/28 GB, and the machine floor of 6 GB available
+/// fires only after the rest of the machine has gone to swap. Its successor,
+/// serving one large workspace alone, trimmed 15.3 → 9.2 GB at the floor. Both times the
+/// trim returned more than the analysis itself holds in salsa (1.9 GB).
+///
+/// Two gigabytes is a handful of heavy tool calls' worth of freed heap — well
+/// above the noise of indexing a few files — and under a tenth of what was
+/// being held back. A trim that finds real growth instead of free heap
+/// returns little, its result becomes the new baseline, and the next one waits
+/// for another two gigabytes: the trigger cannot fire on memory that is
+/// genuinely in use.
+const DEFAULT_TRIM_GROWTH_MB: u64 = 2048;
+
+/// RSS growth above the last trim's result that buys a trim on its own, in MB.
+/// `0` disables it — see [`growth_trim_is_due`].
+pub const TRIM_GROWTH_ENV: &str = "RMC_TRIM_GROWTH_MB";
+
+/// Five minutes between growth trims, the GC interval's pace for the same
+/// reason: each trim stalls the threads allocating in an arena while it walks
+/// that arena (11.6 s over a 25 GB heap, see [`TRIM_COOLDOWN`]), and the accept
+/// loop waits for it. At this pace a trim costs at most a few percent of one
+/// core, and growth faster than two gigabytes in five minutes is a load, which
+/// the next tick after it settles anyway.
+const GROWTH_TRIM_COOLDOWN: Duration = Duration::from_secs(300);
+
+/// Whether RSS has grown enough above the last trim's result to trim for that
+/// alone, without any limit having been crossed.
+///
+/// `baseline_mb` is RSS right after the last trim, or at startup before the
+/// first. `since_trim` covers trims of either kind: a pressure trim a minute
+/// ago has just done this one's work.
+pub fn growth_trim_is_due(
+    rss_mb: u64,
+    baseline_mb: u64,
+    growth_mb: u64,
+    since_trim: Option<Duration>,
+) -> bool {
+    if growth_mb == 0 {
+        return false;
+    }
+    if since_trim.is_some_and(|elapsed| elapsed < GROWTH_TRIM_COOLDOWN) {
+        return false;
+    }
+    rss_mb >= baseline_mb.saturating_add(growth_mb)
 }
 
 /// Where sockets live. `$XDG_RUNTIME_DIR` is preferred: it is private, on tmpfs,
@@ -1295,9 +1351,18 @@ pub async fn run_daemon(
         gc_interval,
         GC_INTERVAL_ENV,
     );
+    let trim_growth_mb = env_u64(TRIM_GROWTH_ENV, DEFAULT_TRIM_GROWTH_MB);
+    tracing::info!(
+        "allocator trim: whenever RSS grows {} MB above what the last trim left, at most every {:?} ({} to change; 0 disables)",
+        trim_growth_mb,
+        GROWTH_TRIM_COOLDOWN,
+        TRIM_GROWTH_ENV,
+    );
     let mut last_gc = SystemTime::now();
     let mut last_unload: Option<SystemTime> = None;
     let mut last_trim: Option<SystemTime> = None;
+    // RSS right after the last trim of either kind; startup's before the first.
+    let mut trim_baseline_mb = MemoryReading::now().map_or(0, |reading| reading.rss_mb);
     // Once retiring, the socket file is gone and belongs to whoever binds it
     // next — this flag keeps the exit path from deleting a successor's socket.
     // `retiring_since` is what bounds the wait; see `retire_grace_expired`.
@@ -1381,6 +1446,7 @@ pub async fn run_daemon(
             } = match tick.trimmed {
                 Some((before, after)) => {
                     last_trim = Some(SystemTime::now());
+                    trim_baseline_mb = after.rss_mb;
                     tracing::info!(
                         "trimmed the allocator before acting on the memory limits: RSS {} -> {} MB; decided {:?}",
                         before.rss_mb,
@@ -1389,8 +1455,39 @@ pub async fn run_daemon(
                     );
                     after
                 }
+                None if growth_trim_is_due(
+                    reading.rss_mb,
+                    trim_baseline_mb,
+                    trim_growth_mb,
+                    since_trim,
+                ) =>
+                {
+                    // Same pool and the same wait as the pressure trim above.
+                    let (after, took) = tokio::task::spawn_blocking(move || {
+                        let started = Instant::now();
+                        release_free_memory();
+                        (MemoryReading::now().unwrap_or(reading), started.elapsed())
+                    })
+                    .await
+                    .expect("an allocator trim cannot panic");
+                    last_trim = Some(SystemTime::now());
+                    tracing::info!(
+                        "trimmed the allocator on growth: RSS {} -> {} MB in {:.1}s ({} MB above the last trim's {} MB)",
+                        reading.rss_mb,
+                        after.rss_mb,
+                        took.as_secs_f64(),
+                        reading.rss_mb - trim_baseline_mb,
+                        trim_baseline_mb,
+                    );
+                    trim_baseline_mb = after.rss_mb;
+                    after
+                }
                 None => reading,
             };
+            // Memory returned any other way — an unload, `clear_runtime` — moves
+            // the baseline down with it, or growth would be measured from a level
+            // the daemon has left.
+            trim_baseline_mb = trim_baseline_mb.min(rss_mb);
             if rss_moved_enough(last_logged_rss_mb, rss_mb) {
                 tracing::info!(
                     "mem: RSS moved {} -> {} MB ({} live client(s), {}retired; machine has {:?} MB available)",
@@ -1967,6 +2064,45 @@ mod watchdog_tests {
             "a retired daemon outliving the idle timeout defeats the deadline: an idle daemon \
              would already have exited by then"
         );
+    }
+
+    /// The 2026-10-21 shape: trimmed to 7.7 GB, back at 14.6 GB nine minutes
+    /// later with every limit far away. That must trim; growth under the step
+    /// must not, and neither may anything inside the cooldown of a trim of
+    /// either kind.
+    #[test]
+    fn growth_above_the_last_trim_trims_without_any_limit() {
+        let growth = DEFAULT_TRIM_GROWTH_MB;
+        let base = 7_677;
+        let later = Some(Duration::from_secs(540));
+        let cooldown = GROWTH_TRIM_COOLDOWN;
+
+        assert!(growth_trim_is_due(14_610, base, growth, later));
+        assert!(
+            growth_trim_is_due(2_100, 30, growth, None),
+            "before any trim the baseline is startup's RSS, and no cooldown applies"
+        );
+        assert!(growth_trim_is_due(base + growth, base, growth, later));
+        assert!(!growth_trim_is_due(base + growth - 1, base, growth, later));
+        let inside = Some(cooldown - Duration::from_secs(1));
+        assert!(!growth_trim_is_due(14_610, base, growth, inside));
+        assert!(growth_trim_is_due(14_610, base, growth, Some(cooldown)));
+        assert!(
+            !growth_trim_is_due(u64::MAX - 1, u64::MAX - 1, growth, None),
+            "a baseline near the top must not wrap into a trim on every tick"
+        );
+    }
+
+    #[test]
+    fn zero_growth_disables_the_growth_trim() {
+        assert!(!growth_trim_is_due(60_000, 0, 0, None));
+    }
+
+    /// The growth trim is paced no faster than the pressure trim it sits
+    /// beside: otherwise it would be the one stalling the arenas every minute.
+    #[test]
+    fn the_growth_trim_is_paced_no_faster_than_the_pressure_trim() {
+        assert!(GROWTH_TRIM_COOLDOWN >= TRIM_COOLDOWN);
     }
 
     const GC_EVERY: Duration = Duration::from_secs(300);
