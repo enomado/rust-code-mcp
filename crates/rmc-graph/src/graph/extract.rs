@@ -729,6 +729,94 @@ mod tests {
         assert_same(&whole, &by_crate, "whole build (left) vs by crate (right)");
     }
 
+    /// The two-crate fixture plus a method returning `impl Iterator` (RPIT) in
+    /// `alpha`, called from a module file walked before its own and from
+    /// `beta`, where the iterator's item type decides what `.number()` is.
+    /// Shaped after a real-world `Shape::faces` accessor.
+    fn write_fixture_with_rpit(root: &Path) {
+        crate::graph::test_support::write_two_crate_fixture(root);
+        let lib = root.join("alpha/src/lib.rs");
+        let text = std::fs::read_to_string(&lib).unwrap();
+        std::fs::write(&lib, format!("pub mod user;\npub mod solid;\n{text}")).unwrap();
+        std::fs::write(
+            root.join("alpha/src/solid.rs"),
+            "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\n\
+             pub struct FaceIx(pub u32);\n\n\
+             impl FaceIx {\n    pub fn number(self) -> u32 {\n        self.0\n    }\n}\n\n\
+             pub struct Solid(pub u32);\n\n\
+             impl Solid {\n    \
+             pub fn face_count(&self) -> u32 {\n        self.0\n    }\n\n    \
+             pub fn faces(&self) -> impl Iterator<Item = FaceIx> + use<> {\n        \
+             (0..self.face_count()).map(FaceIx)\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("alpha/src/user.rs"),
+            "use crate::solid::{FaceIx, Solid};\n\n\
+             pub fn all(solid: &Solid) -> Vec<FaceIx> {\n    \
+             solid.faces().collect::<Vec<_>>()\n}\n",
+        )
+        .unwrap();
+        let beta = root.join("beta/src/lib.rs");
+        let mut text = std::fs::read_to_string(&beta).unwrap();
+        text.push_str(
+            "\npub fn face_numbers(solid: &alpha::solid::Solid) -> Vec<u32> {\n    \
+             solid.faces().map(|f| f.number()).collect()\n}\n",
+        );
+        std::fs::write(&beta, text).unwrap();
+    }
+
+    /// Types behind an `impl Trait` return survive the per-crate build: the
+    /// LRU capacity 1 and the revision bump after each group evict the
+    /// inference of `Solid::faces` while its caller in `beta` is still to come.
+    /// Each side gets its own fresh load, as each build in the daemon does.
+    #[test]
+    fn by_crate_build_keeps_types_behind_impl_trait() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_fixture_with_rpit(workspace.path());
+        let (data_a, data_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let by_crate = {
+            let mut loaded = loader::load_unprimed(workspace.path()).unwrap();
+            persist_test_by_crate(data_a.path(), &mut loaded, GraphEnvOptions::default()).unwrap()
+        };
+        let whole = {
+            let loaded = loader::load_unprimed(workspace.path()).unwrap();
+            persist_test_model(data_b.path(), &extract(&loaded), GraphEnvOptions::default())
+                .unwrap()
+        };
+        assert_same(&whole, &by_crate, "whole build (left) vs by crate (right)");
+    }
+
+    /// rust-analyzer bug, not ours (found 2026-10-21 on a private workspace, plan step
+    /// `per-crate-build-loop`): in a database that already went through a
+    /// per-crate build — `InferenceResult::for_body` at LRU capacity 1 and a
+    /// revision bump per group — a later whole extraction loses the usages in
+    /// the body of `Solid::faces` (`-> impl Iterator`): its inference comes back
+    /// empty. Gone with either the LRU cap on `for_body` left alone or no bump
+    /// (the cap on the other LRU queries is harmless). The fork's
+    /// `lru = 2024` on `for_body` (RA `792fc9fd96`) exposes a long-lived
+    /// database to the same thing. The graph build is not affected — each build
+    /// loads fresh ([`by_crate_build_keeps_types_behind_impl_trait`]) — so this
+    /// test only pins the bug down for whoever fixes it in the fork.
+    #[test]
+    #[ignore = "rust-analyzer bug: an evicted inference re-run loses an RPIT body"]
+    fn evicted_inference_of_an_impl_trait_fn_comes_back_whole() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_fixture_with_rpit(workspace.path());
+        let mut loaded = loader::load_unprimed(workspace.path()).unwrap();
+        let (data_a, data_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let by_crate =
+            persist_test_by_crate(data_a.path(), &mut loaded, GraphEnvOptions::default()).unwrap();
+        let whole_after =
+            persist_test_model(data_b.path(), &extract(&loaded), GraphEnvOptions::default())
+                .unwrap();
+        assert_same(
+            &by_crate,
+            &whole_after,
+            "by crate (left) vs whole build in the same database afterwards (right)",
+        );
+    }
+
     /// An external module imported under different names by two crates is one
     /// stub, whichever crate the walk meets first. Its stub used to be named
     /// `<module path>::<name of the first import>`, so the whole build (one
@@ -837,16 +925,22 @@ mod tests {
     }
 
     /// Acceptance on a real workspace, `RMC_SNAPSHOT_COMPARE_WORKSPACE=<path>`:
-    /// one RA load, three snapshots — the whole-workspace build with usages
-    /// from targets, the same from consumers (plan step
-    /// `consumer-centric-usages`), and the per-crate build — compared in turn.
-    /// Each model is written to disk and dropped before the next is built.
+    /// three snapshots — the whole-workspace build with usages from targets,
+    /// the same from consumers (plan step `consumer-centric-usages`), both from
+    /// one primed load, and the per-crate build — compared in turn. Each model
+    /// is written to disk and dropped before the next is built.
+    ///
+    /// The per-crate build gets a fresh unprimed load of its own, as in the
+    /// daemon, and the first load is dropped before it. Built in the database
+    /// the whole builds had used, it lost the bodies of `impl Trait` fns on
+    /// a private workspace — a rust-analyzer bug, see
+    /// [`evicted_inference_of_an_impl_trait_fn_comes_back_whole`].
     #[test]
     #[ignore = "needs RMC_SNAPSHOT_COMPARE_WORKSPACE and three extractions of it"]
     fn by_crate_build_equals_whole_build_on_a_real_workspace() {
         let workspace = std::env::var("RMC_SNAPSHOT_COMPARE_WORKSPACE")
             .expect("set RMC_SNAPSHOT_COMPARE_WORKSPACE to a workspace root");
-        let mut loaded = loader::load(Path::new(&workspace)).unwrap();
+        let loaded = loader::load(Path::new(&workspace)).unwrap();
         let env = GraphEnvOptions::default();
         let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
 
@@ -866,7 +960,9 @@ mod tests {
         )
         .unwrap();
         eprintln!("whole, usages from consumers: {:.2?}", t.elapsed());
+        drop(loaded);
         let t = std::time::Instant::now();
+        let mut loaded = loader::load_unprimed(Path::new(&workspace)).unwrap();
         let by_crate = persist_test_by_crate(dirs[2].path(), &mut loaded, env).unwrap();
         eprintln!("by crate:                     {:.2?}", t.elapsed());
 
