@@ -210,9 +210,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     if let daemon::Mode::Daemon { socket, idle } = &mode {
         let result = daemon::run_daemon(socket, *idle, &runtime).await;
-        let shutdown = runtime.shutdown_gracefully(Duration::from_secs(10)).await;
-        tracing::info!("Runtime shutdown after daemon exit: {:?}", shutdown);
-        return result.map_err(|e| -> Box<dyn std::error::Error> { e });
+        match daemon::shutdown_within(&runtime, daemon::EXIT_BUDGET).await {
+            Some(shutdown) => {
+                tracing::info!("Runtime shutdown after daemon exit: {:?}", shutdown)
+            }
+            None => tracing::warn!(
+                "runtime still winding down after {:?} (an in-flight sync or tool call holds a workspace lock); exiting without it",
+                daemon::EXIT_BUDGET
+            ),
+        }
+        // Exit, not return: returning drops the tokio runtime, and that drop
+        // waits for every blocking task — an in-flight sync's embedder runs on
+        // that pool for minutes. The socket is already gone, so every minute
+        // spent here is this process's memory held next to its successor's.
+        // An interrupted sync is what a SIGKILL leaves too; the next sync
+        // redoes the files whose snapshot was not written.
+        if let Err(e) = &result {
+            tracing::error!("daemon failed: {e}");
+        }
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
 
     let service = match SearchTool::with_server_runtime(&runtime)

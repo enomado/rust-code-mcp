@@ -51,8 +51,8 @@
 use fs2::FileExt;
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENV, EMBEDDING_PROFILE_ENV, EP_CENSUS_ENV, RuntimeClearRequest,
-    RuntimeClearScope, RuntimeState, ServerRuntime, mem_available_kib, release_free_memory,
-    rss_kib,
+    RuntimeClearScope, RuntimeState, RuntimeTaskReport, ServerRuntime, mem_available_kib,
+    release_free_memory, rss_kib,
 };
 use rmc_server::tools::SearchTool;
 use rmcp::ServiceExt;
@@ -1606,6 +1606,33 @@ pub async fn run_daemon(
     Ok(())
 }
 
+/// How long a daemon that has left its accept loop gives the runtime to wind
+/// down before it exits anyway. Twice the task wait inside, so the clear after
+/// it gets the same again.
+pub const EXIT_BUDGET: Duration = Duration::from_secs(20);
+
+/// Wind the runtime down after [`run_daemon`] returned, for at most `budget`.
+/// `None` — the budget ran out and the caller must exit regardless.
+///
+/// The bound is the point. By the time this runs the socket file is gone, so
+/// the next client already starts a successor; a daemon that lingers here
+/// holds its whole analysis next to that successor's fresh copy. Measured
+/// 2026-10-21: pid 466024 got SIGTERM at 23:54 with a large workspace loaded and an
+/// incremental sync re-embedding hundreds of files; the successor bound the
+/// address at 00:01, and the old process was still indexing at 14 GB RSS
+/// minutes later. `shutdown_gracefully` aborts its task after 10 s, but its
+/// `clear(All)` takes `lock_all`, which waits for every workspace lock — and
+/// an in-flight sync (`SyncManager`) or a client's tool call holds one for as
+/// long as its work takes.
+pub async fn shutdown_within(
+    runtime: &ServerRuntime,
+    budget: Duration,
+) -> Option<RuntimeTaskReport> {
+    tokio::time::timeout(budget, runtime.shutdown_gracefully(budget / 2))
+        .await
+        .ok()
+}
+
 async fn serve_connection(stream: UnixStream, state: RuntimeState) -> Result<(), BoxError> {
     let (read_half, write_half) = stream.into_split();
     let service = SearchTool::with_runtime_state(state)
@@ -2167,6 +2194,48 @@ mod tests {
     fn mode_of(args: &[&str]) -> Mode {
         let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         resolve_mode(&owned).expect("mode")
+    }
+
+    /// A workspace lock held past the daemon's exit — an in-flight sync, a
+    /// client's tool call — must not hold the process. Without the bound,
+    /// `shutdown_gracefully`'s `clear(All)` waits in `lock_all` for as long as
+    /// the lock is held: here, forever, which the outer timeout turns into a
+    /// failure instead of a hung test.
+    #[tokio::test]
+    async fn a_held_workspace_lock_cannot_hold_the_exit() {
+        let runtime = ServerRuntime::new(3600);
+        let held = runtime
+            .state()
+            .workspace_locks()
+            .lock_exclusive(Path::new("/nonexistent/held-by-a-sync"))
+            .await;
+
+        let started = Instant::now();
+        let report = tokio::time::timeout(
+            Duration::from_secs(30),
+            shutdown_within(&runtime, Duration::from_millis(200)),
+        )
+        .await
+        .expect("the exit waited for the held workspace lock");
+        assert!(
+            report.is_none(),
+            "a held lock cannot let the shutdown finish"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(held);
+    }
+
+    /// Control for the test above: with nothing held, the runtime winds down
+    /// inside the budget and the report comes back — so `None` there is the
+    /// lock's doing, not a budget too small for any shutdown.
+    #[tokio::test]
+    async fn an_idle_runtime_winds_down_inside_the_budget() {
+        let runtime = ServerRuntime::new(3600);
+        assert!(
+            shutdown_within(&runtime, Duration::from_millis(200))
+                .await
+                .is_some()
+        );
     }
 
     #[test]
