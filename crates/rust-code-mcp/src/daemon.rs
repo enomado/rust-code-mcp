@@ -716,7 +716,7 @@ pub fn watchdog_tick(
 /// 14.6 GB nine minutes later and at ~20 GB for the next hour with no trim in
 /// sight: its limits sit at 24/28 GB, and the machine floor of 6 GB available
 /// fires only after the rest of the machine has gone to swap. Its successor,
-/// serving rust_app alone, trimmed 15.3 → 9.2 GB at the floor. Both times the
+/// serving one large workspace, trimmed 15.3 → 9.2 GB at the floor. Both times the
 /// trim returned more than the analysis itself holds in salsa (1.9 GB).
 ///
 /// Two gigabytes is a handful of heavy tool calls' worth of freed heap — well
