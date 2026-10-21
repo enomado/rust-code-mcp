@@ -422,12 +422,11 @@ fn run_passes(
         &loaded.db,
         crates,
         crate_node_for,
-        crate_name_for,
         module_node_for,
     );
     if timing {
         eprintln!(
-            "extract: extract_bindings             {:>9.2?}  ({} bindings, {} def→node)",
+            "extract: extract_bindings            {:>9.2?}  ({} bindings, {} def→node)",
             t.elapsed(),
             model.bindings.len(),
             def_to_node.len()
@@ -728,6 +727,44 @@ mod tests {
             persist_test_model(data_b.path(), &extract(&loaded), GraphEnvOptions::default())
                 .unwrap();
         assert_same(&whole, &by_crate, "whole build (left) vs by crate (right)");
+    }
+
+    /// An external module imported under different names by two crates is one
+    /// stub, whichever crate the walk meets first. Its stub used to be named
+    /// `<module path>::<name of the first import>`, so the whole build (one
+    /// walk over both crates) and the per-crate build (a walk per crate) minted
+    /// different stubs for the same `std::fmt`.
+    #[test]
+    fn an_external_module_imported_under_two_names_is_one_stub() {
+        let workspace = tempfile::tempdir().unwrap();
+        write_fixture_with_bin(workspace.path());
+        for (file, import) in [
+            ("alpha/src/lib.rs", "pub use std::fmt;\n"),
+            ("beta/src/lib.rs", "pub use std::fmt as f;\n"),
+        ] {
+            let path = workspace.path().join(file);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, format!("{import}{text}")).unwrap();
+        }
+        let mut loaded = loader::load_unprimed(workspace.path()).unwrap();
+
+        let whole_model = extract(&loaded);
+        let (data_a, data_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let whole =
+            persist_test_model(data_a.path(), &whole_model, GraphEnvOptions::default()).unwrap();
+        let by_crate =
+            persist_test_by_crate(data_b.path(), &mut loaded, GraphEnvOptions::default()).unwrap();
+        assert_same(&whole, &by_crate, "whole build (left) vs by crate (right)");
+
+        // `std::fmt` is a re-export of `alloc::fmt`.
+        let fmt_stubs: Vec<&str> = whole_model
+            .nodes
+            .values()
+            .filter(|n| n.kind == NodeKind::ExternalSymbol)
+            .filter(|n| matches!(n.display_name.as_str(), "fmt" | "f"))
+            .map(|n| n.qualified_name.as_str())
+            .collect();
+        assert_eq!(fmt_stubs, vec!["alloc::fmt"], "the stub is the module's own path");
     }
 
     /// Deleting one crate's rows from a full snapshot and building only that
