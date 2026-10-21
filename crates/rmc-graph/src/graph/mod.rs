@@ -27,6 +27,7 @@ mod recursion_check;
 mod signatures;
 mod skeleton;
 pub mod snapshot;
+pub mod snapshot_compare;
 mod statics;
 mod storage;
 #[cfg(test)]

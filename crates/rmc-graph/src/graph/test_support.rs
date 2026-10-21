@@ -40,3 +40,112 @@ pub(crate) fn shared_snapshot() -> &'static OpenedSnapshot {
         })
         .snap
 }
+
+/// Write a two-crate workspace into `root`: `alpha` (a library with a module,
+/// a struct with inherent methods and an associated const, a trait and its
+/// impl, an enum, a `static`) and `beta`, which depends on `alpha` by path and
+/// uses all of it from inside functions.
+///
+/// Small enough to load in seconds, and shaped so that every snapshot table
+/// gets rows — cross-crate usages, usages inside function bodies, use-bindings,
+/// signatures, static metadata. No registry dependencies, so it loads offline.
+pub(crate) fn write_two_crate_fixture(root: &Path) {
+    const FILES: &[(&str, &str)] = &[
+        (
+            "Cargo.toml",
+            r#"[workspace]
+members = ["alpha", "beta"]
+resolver = "2"
+"#,
+        ),
+        (
+            "alpha/Cargo.toml",
+            r#"[package]
+name = "alpha"
+version = "0.1.0"
+edition = "2021"
+"#,
+        ),
+        (
+            "alpha/src/lib.rs",
+            r#"pub mod shapes;
+
+pub static ORIGIN_NAME: &str = "origin";
+
+pub trait Area {
+    fn area(&self) -> f64;
+}
+
+pub fn double(x: i32) -> i32 {
+    x * 2
+}
+
+pub fn quadruple(x: i32) -> i32 {
+    double(double(x))
+}
+"#,
+        ),
+        (
+            "alpha/src/shapes.rs",
+            r#"use crate::Area;
+
+pub struct Square {
+    pub side: f64,
+}
+
+impl Square {
+    pub const SIDES: u32 = 4;
+
+    pub fn new(side: f64) -> Self {
+        Square { side }
+    }
+}
+
+impl Area for Square {
+    fn area(&self) -> f64 {
+        self.side * self.side
+    }
+}
+
+pub enum Kind {
+    Square,
+    Round,
+}
+"#,
+        ),
+        (
+            "beta/Cargo.toml",
+            r#"[package]
+name = "beta"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alpha = { path = "../alpha" }
+"#,
+        ),
+        (
+            "beta/src/lib.rs",
+            r#"use alpha::shapes::{Kind, Square};
+use alpha::Area;
+
+pub fn total(sides: &[f64]) -> f64 {
+    sides.iter().map(|&s| Square::new(s).area()).sum()
+}
+
+pub fn kind_of(n: u32) -> Kind {
+    if n == Square::SIDES { Kind::Square } else { Kind::Round }
+}
+
+pub fn twice(x: i32) -> i32 {
+    alpha::double(x) + alpha::ORIGIN_NAME.len() as i32
+}
+"#,
+        ),
+    ];
+    for (path, text) in FILES {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+}
