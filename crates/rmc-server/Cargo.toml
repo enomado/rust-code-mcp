@@ -12,7 +12,11 @@ directml = ["rmc-engine/embeddings-directml", "rmc-indexing/directml"]
 # Same switch as on the binary: when the global allocator is mimalloc,
 # returning memory must go through `mi_collect`, not glibc `malloc_trim`
 # (that would trim a foreign, nearly empty heap and look like a broken switch).
-mimalloc = ["dep:libmimalloc-sys"]
+#
+# `mimalloc` itself is here only for this crate's own test binary, which must
+# run under the allocator it is built for (see the `#[global_allocator]` in
+# `lib.rs`); the shipped binary sets its own.
+mimalloc = ["dep:libmimalloc-sys", "dep:mimalloc"]
 
 [dependencies]
 # In-workspace dependencies
@@ -62,6 +66,10 @@ libc = "0.2"
 
 # The same return, but when the allocator is replaced by mimalloc; see the `mimalloc` feature.
 [dependencies.libmimalloc-sys]
+version = "0.1"
+optional = true
+
+[dependencies.mimalloc]
 version = "0.1"
 optional = true
 
