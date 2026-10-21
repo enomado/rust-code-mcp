@@ -18,6 +18,7 @@
 //! NodeId/BindingId as both key and value (well under LMDB's 511-byte limit).
 //! Human-readable names live inside the bincode-serialized record values.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -233,12 +234,89 @@ pub(in crate::graph) fn is_source_walk_excluded(path: &Path) -> bool {
     })
 }
 
-/// Hash inputs that determine whether a snapshot is still current.
-/// For v1: Cargo.toml + Cargo.lock + every `.rs` file under the workspace,
-/// excluding generated/tooling directories. Kept simple — change detection is
-/// a rebuild trigger, nothing more.
+/// The tree's fingerprint — what decides whether a snapshot is still current
+/// (and, through [`graph_id_for`], names it). Every input of
+/// [`compute_build_inputs`]. The build takes it from there; tests want it alone.
+#[cfg(test)]
 pub(crate) fn compute_fingerprint(workspace_root: &Path) -> Result<String> {
-    let mut entries: Vec<(String, [u8; 32])> = Vec::new();
+    Ok(compute_build_inputs(workspace_root)?.fingerprint())
+}
+
+/// What a build reads from the tree, split the way an incremental build
+/// invalidates it (plan step `package-fingerprint`).
+///
+/// A *package* here is a directory holding a `Cargo.toml` — a workspace
+/// member, a vendored patch crate, a nested workspace the build never loads —
+/// plus the workspace root itself (key `""`), which exists even when the root
+/// has no manifest. Every fingerprinted file belongs to the deepest package
+/// directory above it.
+///
+/// Fingerprinted are `.rs` files, every `Cargo.toml` and `Cargo.lock`, and
+/// at the root `rust-toolchain.toml` / `rust-toolchain` and
+/// `.cargo/config.toml` / `.cargo/config`; `target/`, `.git/` and
+/// `.skeleton/` are not walked ([`is_source_walk_excluded`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildInputs {
+    /// Hash of what makes any edit a full rebuild: the root `Cargo.lock`, the
+    /// toolchain and cargo config files, and every `Cargo.toml` with its path
+    /// — so the set of packages too.
+    pub global: String,
+    /// Package directory, workspace-relative with `/` separators (`""` for
+    /// the root) → hash of the files that belong to it, `Cargo.toml` included.
+    pub packages: BTreeMap<String, String>,
+}
+
+impl BuildInputs {
+    /// One hash over [`Self::global`] and every package's.
+    pub fn fingerprint(&self) -> String {
+        let mut h = Sha256::new();
+        h.update(b"global\0");
+        h.update(self.global.as_bytes());
+        h.update(&[0]);
+        for (dir, hash) in &self.packages {
+            h.update(dir.as_bytes());
+            h.update(&[0]);
+            h.update(hash.as_bytes());
+            h.update(&[0]);
+        }
+        hex(&h.finalize())
+    }
+
+    /// The package `rel_path` (workspace-relative, `/` separators) belongs
+    /// to: the deepest package directory above it, the root at worst.
+    pub fn package_of<'a>(&'a self, rel_path: &str) -> &'a str {
+        let mut dir = rel_path;
+        while let Some(cut) = dir.rfind('/') {
+            dir = &dir[..cut];
+            if let Some((key, _)) = self.packages.get_key_value(dir) {
+                return key;
+            }
+        }
+        ""
+    }
+
+    /// Packages whose hash differs between `self` and `other`, or that only
+    /// one of them has.
+    pub fn changed_packages(&self, other: &BuildInputs) -> BTreeSet<String> {
+        let mut changed = BTreeSet::new();
+        for (dir, hash) in &self.packages {
+            if other.packages.get(dir) != Some(hash) {
+                changed.insert(dir.clone());
+            }
+        }
+        for dir in other.packages.keys() {
+            if !self.packages.contains_key(dir) {
+                changed.insert(dir.clone());
+            }
+        }
+        changed
+    }
+}
+
+/// Walk the tree once and hash it into [`BuildInputs`].
+pub(crate) fn compute_build_inputs(workspace_root: &Path) -> Result<BuildInputs> {
+    // (workspace-relative path with `/`, sha of the bytes), sorted by path.
+    let mut files: Vec<(String, [u8; 32])> = Vec::new();
 
     for entry in WalkDir::new(workspace_root)
         .follow_links(false)
@@ -250,48 +328,96 @@ pub(crate) fn compute_fingerprint(workspace_root: &Path) -> Result<String> {
         if !entry.file_type().is_file() {
             continue;
         }
-        let interesting = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|ext| ext == "rs")
-            .unwrap_or(false)
-            || matches!(
-                path.file_name().and_then(|s| s.to_str()),
-                Some("Cargo.toml") | Some("Cargo.lock")
-            );
-        if !interesting {
-            continue;
-        }
-
         let rel = path
             .strip_prefix(workspace_root)
             .unwrap_or(path)
             .to_string_lossy()
-            .to_string();
+            .replace('\\', "/");
+        if !is_fingerprinted(&rel) {
+            continue;
+        }
         let bytes = fs::read(path)
             .with_context(|| format!("failed to read {} for fingerprint", path.display()))?;
-        let mut h = Sha256::new();
-        h.update(&bytes);
         let mut digest = [0u8; 32];
-        digest.copy_from_slice(&h.finalize());
-        entries.push((rel, digest));
+        digest.copy_from_slice(&Sha256::digest(&bytes));
+        files.push((rel, digest));
     }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut packages: BTreeMap<String, String> = BTreeMap::new();
+    packages.insert(String::new(), String::new());
+    for (rel, _) in &files {
+        if let Some(dir) = rel.strip_suffix("Cargo.toml") {
+            // `"Cargo.toml"` → `""`, `"a/b/Cargo.toml"` → `"a/b"`.
+            if dir.is_empty() || dir.ends_with('/') {
+                packages.insert(dir.trim_end_matches('/').to_string(), String::new());
+            }
+        }
+    }
+    let shape = BuildInputs {
+        global: String::new(),
+        packages,
+    };
 
-    let mut h = Sha256::new();
-    for (rel, digest) in &entries {
+    let mut global = Sha256::new();
+    let mut per_package: BTreeMap<&str, Sha256> = BTreeMap::new();
+    for (rel, digest) in &files {
+        let is_global = rel.ends_with("Cargo.toml")
+            || matches!(
+                rel.as_str(),
+                "Cargo.lock"
+                    | "rust-toolchain.toml"
+                    | "rust-toolchain"
+                    | ".cargo/config.toml"
+                    | ".cargo/config"
+            );
+        if is_global {
+            global.update(rel.as_bytes());
+            global.update(&[0]);
+            global.update(digest);
+            global.update(&[0]);
+        }
+        let h = per_package.entry(shape.package_of(rel)).or_default();
         h.update(rel.as_bytes());
         h.update(&[0]);
         h.update(digest);
         h.update(&[0]);
     }
-    let final_digest = h.finalize();
-    let mut hex = String::with_capacity(64);
-    for byte in final_digest {
-        hex.push_str(&format!("{byte:02x}"));
+    let packages = shape
+        .packages
+        .keys()
+        .map(|dir| {
+            let hash = per_package
+                .remove(dir.as_str())
+                .unwrap_or_default()
+                .finalize();
+            (dir.clone(), hex(&hash))
+        })
+        .collect();
+    Ok(BuildInputs {
+        global: hex(&global.finalize()),
+        packages,
+    })
+}
+
+/// Whether a workspace-relative path is one of the files
+/// [`compute_build_inputs`] hashes.
+fn is_fingerprinted(rel: &str) -> bool {
+    let file_name = rel.rsplit('/').next().unwrap_or(rel);
+    rel.ends_with(".rs")
+        || matches!(file_name, "Cargo.toml" | "Cargo.lock")
+        || matches!(
+            rel,
+            "rust-toolchain.toml" | "rust-toolchain" | ".cargo/config.toml" | ".cargo/config"
+        )
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(2 * bytes.len());
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
     }
-    Ok(hex)
+    out
 }
 
 pub(crate) fn graph_id_for(workspace_hash: &str, fingerprint: &str) -> String {
@@ -631,6 +757,17 @@ pub struct GraphManifest {
     pub binding_count: u64,
     #[serde(default)]
     pub usage_count: u64,
+    /// What the snapshot was built from, by package — the base an
+    /// incremental build diffs today's tree against. `None` in manifests
+    /// written before incremental builds: the next build is a full one.
+    #[serde(default)]
+    pub inputs: Option<BuildInputs>,
+    /// Crate (group) name → the packages its module files lie in
+    /// ([`BuildInputs::package_of`]). Usually just its own; more when a
+    /// `#[path]` reaches into another package. An incremental build rebuilds a
+    /// crate when one of these packages changed.
+    #[serde(default)]
+    pub crate_packages: BTreeMap<String, BTreeSet<String>>,
 }
 
 pub(crate) fn write_manifest(path: &Path, manifest: &GraphManifest) -> Result<()> {
@@ -821,6 +958,45 @@ mod tests {
         let a = compute_fingerprint(root).unwrap();
         let b = compute_fingerprint(root).unwrap();
         assert_eq!(a, b, "fingerprint must be deterministic across calls");
+    }
+
+    /// A file belongs to the deepest package above it; a nested package's
+    /// edit changes only that package; any `Cargo.toml` edit is global.
+    #[test]
+    fn build_inputs_split_the_tree_by_package() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        write_minimal_crate(root);
+        fs::create_dir_all(root.join("tools/probe/src")).unwrap();
+        fs::write(
+            root.join("tools/probe/Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("tools/probe/src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("tools/loose.rs"), "fn loose() {}\n").unwrap();
+
+        let before = compute_build_inputs(root).unwrap();
+        assert_eq!(
+            before.packages.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["", "tools/probe"]
+        );
+        assert_eq!(before.package_of("tools/probe/src/main.rs"), "tools/probe");
+        assert_eq!(before.package_of("tools/loose.rs"), "");
+        assert_eq!(before.package_of("src/lib.rs"), "");
+
+        fs::write(root.join("tools/probe/src/main.rs"), "fn main() { }\n").unwrap();
+        let body_edit = compute_build_inputs(root).unwrap();
+        assert_eq!(body_edit.global, before.global);
+        assert!(body_edit.changed_packages(&before).iter().eq(["tools/probe"]));
+        assert_ne!(body_edit.fingerprint(), before.fingerprint());
+
+        fs::write(
+            root.join("tools/probe/Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.0.1\"\n",
+        )
+        .unwrap();
+        assert_ne!(compute_build_inputs(root).unwrap().global, body_edit.global);
     }
 
     #[test]

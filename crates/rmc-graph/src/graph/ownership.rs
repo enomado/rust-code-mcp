@@ -389,9 +389,6 @@ fn record_owner(
 /// Fails if a listed row is not in its table: the ownership record and the
 /// tables disagree, and going on would leave the snapshot half-deleted in a
 /// way no later check could tell apart from a correct one.
-// The incremental rebuild (plan step `package-fingerprint`) is the caller;
-// until it lands only the tests here call it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn delete_crate_rows(
     wtxn: &mut RwTxn<'_>,
     dbs: &GraphDatabases,
