@@ -18,7 +18,7 @@ use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -43,12 +43,26 @@ fn hermetic_env(command: &mut Command) {
     command.env_remove("RMC_EP_CENSUS");
 }
 
-/// An MCP client: the binary plus a pipe to it.
+/// An MCP client: the binary plus a pipe to it — or, for a test about the
+/// daemon itself, a socket straight to the daemon with no client in between.
 struct Session {
-    child: Child,
-    stdin: ChildStdin,
+    child: Option<Child>,
+    stdin: Box<dyn Write + Send>,
     rx: Receiver<std::io::Result<String>>,
     next_id: u64,
+}
+
+/// Lines from `source`, on a channel, read by a thread of their own.
+fn line_channel(source: impl std::io::Read + Send + 'static) -> Receiver<std::io::Result<String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(source).lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 impl Session {
@@ -75,7 +89,28 @@ impl Session {
         cwd: Option<&Path>,
         env: &[(&str, &str)],
     ) -> Result<Self> {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_rust-code-mcp"));
+        Self::start_from(
+            Path::new(env!("CARGO_BIN_EXE_rust-code-mcp")),
+            &[],
+            socket_dir,
+            shared,
+            cwd,
+            env,
+        )
+    }
+
+    /// As [`Session::start_with`], from a binary at `exe` and with `args` —
+    /// the tests that replace the binary under a running session.
+    fn start_from(
+        exe: &Path,
+        args: &[&std::ffi::OsStr],
+        socket_dir: &Path,
+        shared: bool,
+        cwd: Option<&Path>,
+        env: &[(&str, &str)],
+    ) -> Result<Self> {
+        let mut command = Command::new(exe);
+        command.args(args);
         for (key, value) in env {
             command.env(key, value);
         }
@@ -102,23 +137,35 @@ impl Session {
         let stdout = child.stdout.take().context("child stdout was not piped")?;
         let stdin = child.stdin.take().context("child stdin was not piped")?;
 
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-
         let mut session = Self {
-            child,
-            stdin,
-            rx,
+            child: Some(child),
+            stdin: Box::new(stdin),
+            rx: line_channel(stdout),
             next_id: 1,
         };
         session.handshake()?;
         Ok(session)
+    }
+
+    /// A session on the daemon's socket itself, without the client relay: what
+    /// the daemon does to a connection, unmasked by a client that would move it
+    /// elsewhere.
+    fn over_socket(socket: &Path) -> Result<Self> {
+        let stream = std::os::unix::net::UnixStream::connect(socket)
+            .with_context(|| format!("connect {}", socket.display()))?;
+        let mut session = Self {
+            child: None,
+            rx: line_channel(stream.try_clone()?),
+            stdin: Box::new(stream),
+            next_id: 1,
+        };
+        session.handshake()?;
+        Ok(session)
+    }
+
+    /// Pid of the client process, when there is one.
+    fn client_pid(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
     }
 
     fn handshake(&mut self) -> Result<()> {
@@ -216,8 +263,10 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -250,11 +299,11 @@ fn two_clients_share_one_server_process() -> Result<()> {
         "two sessions were served by different processes, so each holds its own copy of the analysis"
     );
     assert_ne!(
-        first_pid,
-        first.child.id(),
+        Some(first_pid),
+        first.client_pid(),
         "the call was served by the client itself, so no daemon came up and nothing is shared"
     );
-    assert_ne!(second_pid, second.child.id());
+    assert_ne!(Some(second_pid), second.client_pid());
 
     drop(first);
     drop(second);
@@ -294,8 +343,8 @@ fn two_clients_from_different_directories_share_one_process() -> Result<()> {
     // rule out both calls having been served in-process by two clients that
     // happen to be compared wrongly.
     assert_ne!(
-        first_pid,
-        first.child.id(),
+        Some(first_pid),
+        first.client_pid(),
         "the call was served by the client itself, so no daemon came up and nothing is shared"
     );
 
@@ -402,18 +451,22 @@ fn piped_response_ids(socket_dir: &Path, shared: bool) -> Result<Vec<u64>> {
 /// input with `RMC_DAEMON=0` answered normally. The daemon looked broken to
 /// every non-interactive caller and fine to every editor.
 ///
-/// The oracle is the in-process path rather than a fixed list: whatever that
-/// one answers for this input, the shared daemon has to answer too.
+/// The oracle is the script itself: every request in it is owed an answer.
+/// It used to be the in-process path, and that path is no oracle — rmcp ends a
+/// service the moment its input ends and drops the answers still being
+/// computed, so `RMC_DAEMON=0` answers this script with `[1]`, the `tools/call`
+/// lost; the comparison could only pass while the daemon lost the same answer.
+/// Now the client passes the EOF on only after the last answer.
 ///
-/// Mutation that must fail it: drop the drain after the half-close (a plain
-/// `select!` over both directions), and the shared side comes back empty.
+/// This test judges the outcome. Which mechanism delivers it is judged by
+/// `relay::tests::a_one_shot_session_gets_every_answer`: a relay that
+/// half-closed at once would still get here, by losing the connection and
+/// replaying the call — the long way round.
 #[test]
 fn a_piped_session_keeps_its_replies() -> Result<()> {
     let shared_dir = TempDir::new()?;
-    let direct_dir = TempDir::new()?;
 
     let through_daemon = piped_response_ids(shared_dir.path(), true)?;
-    let in_process = piped_response_ids(direct_dir.path(), false)?;
 
     // The piped session leaves its daemon behind and its replies carry no pid,
     // so ask an ordinary session which process is listening, and stop it.
@@ -422,13 +475,10 @@ fn a_piped_session_keeps_its_replies() -> Result<()> {
     drop(probe);
     kill_pid(daemon_pid);
 
-    assert!(
-        !in_process.is_empty(),
-        "the in-process oracle itself answered nothing, so it proves nothing about the daemon"
-    );
     assert_eq!(
-        through_daemon, in_process,
-        "the daemon dropped replies that the in-process server delivered for the same input"
+        through_daemon,
+        vec![1, 2],
+        "the daemon dropped replies owed to a one-shot session"
     );
     Ok(())
 }
@@ -490,16 +540,38 @@ fn find_probe_target(session: &mut Session, project: &Path) -> Result<Value> {
     )
 }
 
-/// Whether any socket file is left in `dir` — the daemon unlinks its own on
-/// retiring, which is the one externally visible sign that it has.
-fn has_socket(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "sock"))
-        })
-        .unwrap_or(false)
+
+/// A daemon started on `socket` with `env`, once it listens.
+fn start_daemon(socket: &Path, env: &[(&str, &str)]) -> Result<Child> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_rust-code-mcp"));
+    command
+        .arg("--daemon")
+        .arg("--socket")
+        .arg(socket)
+        .envs(env.iter().copied())
+        .env("RUST_LOG", "error")
+        .env("RMC_DAEMON_IDLE_SECS", "5")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hermetic_env(&mut command);
+    let mut daemon = command.spawn()?;
+    if wait_until(Duration::from_secs(60), || socket.exists()).is_none() {
+        let _ = daemon.kill();
+        return Err(anyhow!("the daemon never bound {}", socket.display()));
+    }
+    Ok(daemon)
+}
+
+/// Whether `pid` has exited: gone from /proc, or a zombie nobody reaped yet —
+/// a daemon's parent is the client that spawned it, and a test's client lives on.
+fn process_gone(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(_) => true,
+        Ok(stat) => stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z')),
+    }
 }
 
 /// A retired daemon must refuse analysis instead of loading it again.
@@ -513,24 +585,30 @@ fn has_socket(dir: &Path) -> bool {
 /// `RMC_RSS_HARD_MB=1` makes the very first watchdog tick retire the daemon,
 /// with this client still attached — the draining session of the incident.
 ///
+/// Straight on the daemon's socket, not through a client: a client moves its
+/// session off a retired daemon (`relay`), and then this call would be
+/// answered by the successor — which is the point of the client, and not what
+/// this test is about.
+///
 /// Mutation that must fail it: drop the `refuse_new_analyses()` call on the
 /// retire branch, and the call below loads the crate and finds the symbol.
 #[test]
 fn a_retired_daemon_refuses_analysis_instead_of_loading_it() -> Result<()> {
     let socket_dir = TempDir::new()?;
+    let socket = socket_dir.path().join("retiring.sock");
     let project = probe_crate()?;
 
-    let mut session =
-        Session::start_with(socket_dir.path(), true, None, &[("RMC_RSS_HARD_MB", "1")])?;
-    let daemon_pid = session.serving_pid()?;
+    let mut daemon = start_daemon(&socket, &[("RMC_RSS_HARD_MB", "1")])?;
+    let mut session = Session::over_socket(&socket)?;
 
     // The watchdog ticks every 15 s; the unlinked socket is the retirement.
-    wait_until(Duration::from_secs(60), || !has_socket(socket_dir.path()))
+    wait_until(Duration::from_secs(60), || !socket.exists())
         .ok_or_else(|| anyhow!("the daemon never retired, so there is nothing to judge"))?;
 
     let response = find_probe_target(&mut session, project.path())?;
     drop(session);
-    kill_pid(daemon_pid);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
 
     let message = response
         .pointer("/error/message")
@@ -552,13 +630,15 @@ fn a_retired_daemon_refuses_analysis_instead_of_loading_it() -> Result<()> {
 #[test]
 fn a_serving_daemon_answers_the_same_analysis() -> Result<()> {
     let socket_dir = TempDir::new()?;
+    let socket = socket_dir.path().join("serving.sock");
     let project = probe_crate()?;
 
-    let mut session = Session::start(socket_dir.path(), true)?;
-    let daemon_pid = session.serving_pid()?;
+    let mut daemon = start_daemon(&socket, &[])?;
+    let mut session = Session::over_socket(&socket)?;
     let response = find_probe_target(&mut session, project.path())?;
     drop(session);
-    kill_pid(daemon_pid);
+    let _ = daemon.kill();
+    let _ = daemon.wait();
 
     let text = response
         .pointer("/result/content/0/text")
@@ -580,9 +660,125 @@ fn opt_out_serves_in_process() -> Result<()> {
     let serving_pid = session.serving_pid()?;
 
     assert_eq!(
-        serving_pid,
-        session.child.id(),
+        Some(serving_pid),
+        session.client_pid(),
         "with RMC_DAEMON=0 the client process itself must serve the session"
     );
+    Ok(())
+}
+
+/// Ask `session` for its serving pid until it is not `old`, for up to `timeout`.
+fn wait_for_new_pid(session: &mut Session, old: u32, timeout: Duration) -> Result<u32> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let pid = session.serving_pid()?;
+        if pid != old {
+            return Ok(pid);
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!("still served by {old} after {timeout:?}"));
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// A daemon that dies under a session must not take the session's tools with
+/// it: the client starts a successor, replays the handshake, and the next call
+/// is answered there — no error, a different pid.
+///
+/// SIGKILL, the OOM killer's signal and the shape of a GPU abort: the socket
+/// file stays behind and nothing gets to say goodbye.
+///
+/// Mutation that must fail it: end the relay on a lost connection instead of
+/// dialing again, and the call below finds stdout closed.
+#[test]
+fn a_session_survives_its_daemon_being_killed() -> Result<()> {
+    let socket_dir = TempDir::new()?;
+    let mut session = Session::start(socket_dir.path(), true)?;
+    let first = session.serving_pid()?;
+
+    let _ = Command::new("kill").arg("-KILL").arg(first.to_string()).status();
+    wait_until(Duration::from_secs(10), || process_gone(first))
+        .ok_or_else(|| anyhow!("SIGKILL did not end {first}"))?;
+
+    let second = session.serving_pid()?;
+    drop(session);
+    kill_pid(second);
+    assert_ne!(second, first, "a killed daemon cannot have answered");
+    Ok(())
+}
+
+/// The binary under test, linked into a directory of its own — the launch
+/// path a test can replace. A hard link, so staging costs no copy; the
+/// directory sits in the target dir because a hard link cannot cross into
+/// the tmpfs that holds ordinary temp directories.
+fn staged_binary() -> Result<(TempDir, std::path::PathBuf)> {
+    let dir = tempfile::Builder::new()
+        .prefix("rebuilt-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+    let exe = dir.path().join("rust-code-mcp");
+    std::fs::hard_link(env!("CARGO_BIN_EXE_rust-code-mcp"), &exe)?;
+    Ok((dir, exe))
+}
+
+/// A rebuild as the deploy does it: a new file renamed over the launch path.
+/// A copy, because only a new file has a new identity (size, mtime).
+fn replace_binary(exe: &Path) -> Result<()> {
+    let next = exe.with_extension("next");
+    std::fs::copy(env!("CARGO_BIN_EXE_rust-code-mcp"), &next)?;
+    std::fs::rename(&next, exe)?;
+    Ok(())
+}
+
+/// A replaced binary retires its daemon, and every session moves to a daemon of
+/// the new binary between requests, without losing its tools; the old daemon
+/// then exits on its own instead of living for as long as its longest session.
+///
+/// Two sessions, one per way a client finds its daemon: `--socket` (the path
+/// stays, only the daemon's retirement can tell the client to move) and the
+/// derived key (the path itself changes with the binary). Measured before
+/// this existed: two daemons of a deleted binary held ≈ 30 GB, one of them
+/// with twelve sessions attached since the morning.
+///
+/// Mutation that must fail it: skip the retirement on `Launch::replacement`
+/// in the daemon, and the `--socket` session is still served by its old pid.
+#[test]
+fn a_replaced_binary_moves_its_sessions_and_retires_its_daemons() -> Result<()> {
+    let socket_dir = TempDir::new()?;
+    let (_staged, exe) = staged_binary()?;
+    let socket = socket_dir.path().join("named.sock");
+    let named_args = [std::ffi::OsStr::new("--socket"), socket.as_os_str()];
+
+    let mut named = Session::start_from(&exe, &named_args, socket_dir.path(), true, None, &[])?;
+    let mut keyed = Session::start_from(&exe, &[], socket_dir.path(), true, None, &[])?;
+    let named_old = named.serving_pid()?;
+    let keyed_old = keyed.serving_pid()?;
+    assert_ne!(named_old, keyed_old, "two sockets, two daemons");
+
+    replace_binary(&exe)?;
+
+    // Daemon tick (15 s) to retire, client tick (15 s) to move, then a start.
+    let budget = Duration::from_secs(120);
+    let named_new = wait_for_new_pid(&mut named, named_old, budget);
+    let keyed_new = wait_for_new_pid(&mut keyed, keyed_old, budget);
+    // Both old daemons are left without clients: they exit on their next tick.
+    let named_exited = wait_until(Duration::from_secs(60), || process_gone(named_old));
+    let keyed_exited = wait_until(Duration::from_secs(60), || process_gone(keyed_old));
+
+    let successors = [&named_new, &keyed_new].map(|pid| pid.as_ref().ok().copied());
+    for pid in [Some(named_old), Some(keyed_old)]
+        .into_iter()
+        .chain(successors)
+        .flatten()
+    {
+        kill_pid(pid);
+    }
+    drop(named);
+    drop(keyed);
+
+    named_new.context("the --socket session never left the replaced binary's daemon")?;
+    keyed_new.context("the keyed session never moved to the new binary's daemon")?;
+    named_exited.ok_or_else(|| anyhow!("the --socket session's old daemon {named_old} never exited"))?;
+    keyed_exited.ok_or_else(|| anyhow!("the keyed session's old daemon {keyed_old} never exited"))?;
     Ok(())
 }

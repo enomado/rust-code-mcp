@@ -7276,6 +7276,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "sha2",
+ "signal-hook-registry",
  "sled",
  "syntax",
  "sysinfo",
