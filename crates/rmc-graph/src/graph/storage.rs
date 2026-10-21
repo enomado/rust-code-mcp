@@ -138,7 +138,14 @@ use super::model::{Binding, EmbeddingRecord, FunctionSignature, Node, StaticMeta
 // `stub_owners` (ExternalSymbol NodeId → crate NodeId, one per crate whose
 // bindings name the stub). No existing table changes; v12 snapshots
 // auto-rebuild because `graph_id_for` hashes `SCHEMA_VERSION`.
-pub(crate) const SCHEMA_VERSION: u32 = 13;
+// v14 (2026-10): an ExternalSymbol stub for a module is named by the module's
+// own path (`alloc::fmt`), not `<path>::<name of the first import met>`
+// (`alloc::fmt::f`), so its NodeId no longer depends on which crate's walk
+// met it first — the per-crate build split one module into a stub per crate.
+// No table changes, but a v13 snapshot's module stubs carry the old ids and an
+// incremental rebuild over it would mix both namings: the bump forces one
+// full rebuild.
+pub(crate) const SCHEMA_VERSION: u32 = 14;
 pub(crate) const CURRENT_POINTER_FILENAME: &str = "CURRENT";
 pub(crate) const BUILD_LOCK_FILENAME: &str = "BUILD.lock";
 pub(crate) const SNAPSHOTS_DIRNAME: &str = "snapshots";
