@@ -47,6 +47,19 @@
 //! [`run_client`], and the caller serves the session in-process exactly as it did
 //! before this module existed. The daemon is a memory optimisation, not a new
 //! point of failure.
+//!
+//! # A replaced binary retires its daemon
+//!
+//! The key covers the binary, so a rebuild starts a new daemon for new
+//! sessions — and the old one used to live on for as long as any session it
+//! had was open (2026-10-21: ≈ 30 GB held by two daemons of a deleted binary).
+//! Now both sides notice the replacement: the daemon compares the file at its
+//! launch path with the image it runs ([`Launch::replacement`]) and retires,
+//! and the client moves its session to the daemon of the current binary
+//! between requests (`relay`). A lost daemon — crash, OOM killer, deadline —
+//! is replaced the same way, without the session losing its tools.
+
+mod relay;
 
 use fs2::FileExt;
 use rmc_server::mcp::{
@@ -64,12 +77,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::pin::pin;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -159,6 +170,14 @@ const SPAWN_POLL: Duration = Duration::from_millis(50);
 /// it is a failure, not a shutdown, because replies the host is waiting for
 /// never arrived.
 const DRAIN_AFTER_EOF: Duration = Duration::from_secs(60);
+/// How often a client checks whether its daemon was superseded — the same
+/// cadence as the daemon's own tick, so a replaced binary empties its daemon
+/// within two ticks of the last request in flight.
+const CLIENT_TICK: Duration = IDLE_TICK;
+/// How long a client waits before trying again to reach a successor it could
+/// not start — a binary still being written, say. The old daemon keeps
+/// answering meanwhile.
+const MOVE_RETRY: Duration = Duration::from_secs(60);
 
 /// How this process was started. Resolved *before* the expensive startup: a
 /// client needs neither a `ServerRuntime` nor a background sync task — it is a pipe.
@@ -175,9 +194,14 @@ pub enum Mode {
     /// default stays a daemon-side concern: the spawned process inherits the
     /// variable itself, and forwarding it here would turn "unset" into an
     /// explicit argument.
+    ///
+    /// `follow_key` — the socket was derived from the key rather than named by
+    /// `--socket`, so a rebuilt binary means a different socket and the session
+    /// moves there.
     Client {
         socket: PathBuf,
         idle: Option<Duration>,
+        follow_key: bool,
     },
     /// `--print-socket`: print the resolved socket path and exit (diagnostics).
     PrintSocket { socket: PathBuf },
@@ -222,6 +246,7 @@ pub fn resolve_mode(args: &[String]) -> Result<Mode, BoxError> {
         }
     }
 
+    let follow_key = socket.is_none();
     let socket = match socket {
         Some(path) => path,
         None => default_socket_path()?,
@@ -231,11 +256,15 @@ pub fn resolve_mode(args: &[String]) -> Result<Mode, BoxError> {
             socket,
             idle: idle.unwrap_or_else(idle_from_env),
         },
-        Some("--client") => Mode::Client { socket, idle },
         Some("--in-process") => Mode::InProcess,
         Some("--print-socket") => Mode::PrintSocket { socket },
-        _ if daemon_disabled() => Mode::InProcess,
-        _ => Mode::Client { socket, idle },
+        None if daemon_disabled() => Mode::InProcess,
+        // `--client`, or nothing said.
+        Some(_) | None => Mode::Client {
+            socket,
+            idle,
+            follow_key,
+        },
     })
 }
 
@@ -869,22 +898,18 @@ fn ensure_dir(dir: &Path) -> io::Result<()> {
 /// anything here splits the fleet, so a new part earns its place only by
 /// changing what the server *computes*.
 fn daemon_key() -> Result<String, BoxError> {
-    let exe = std::env::current_exe()?;
-    let exe_meta = fs::metadata(&exe).ok();
-    let exe_len = exe_meta.as_ref().map(|m| m.len()).unwrap_or(0);
-    let exe_mtime = exe_meta
-        .as_ref()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let exe = &launch()?.exe;
+    // Unreadable (mid-swap, deleted) keys as zeros, as it always did: the key
+    // is then one no daemon of a real binary has, and spawning from the path
+    // fails loudly instead of attaching to the wrong server.
+    let identity = BinaryIdentity::at(exe).unwrap_or_default();
 
     // `vars_os`, not `vars`: the latter panics on a non-UTF-8 name or value
     // ANYWHERE in this process. This runs before the in-process fallback exists,
     // so that panic would kill the session instead of degrading it.
     let env = keyed_env_pairs(std::env::vars_os());
     let data_dir = rmc_server::mcp::project_paths::data_dir();
-    let key = key_from_parts(&data_dir, &exe, exe_len, exe_mtime, &env);
+    let key = key_from_parts(&data_dir, exe, identity.len, identity.mtime_ns, &env);
 
     // Names, never values: the keyed set now includes OPENROUTER_API_KEY, and a
     // secret written to a log stays in that log.
@@ -958,6 +983,78 @@ pub fn default_socket_path() -> Result<PathBuf, BoxError> {
     Ok(socket_dir()?.join(format!("{}.sock", daemon_key()?)))
 }
 
+/// The two parts of the key that name the binary: its size and mtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BinaryIdentity {
+    pub len: u64,
+    pub mtime_ns: u128,
+}
+
+impl BinaryIdentity {
+    fn at(path: &Path) -> Option<Self> {
+        let meta = fs::metadata(path).ok()?;
+        let mtime_ns = meta
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some(Self {
+            len: meta.len(),
+            mtime_ns,
+        })
+    }
+}
+
+/// Where this process was started from, and what it runs.
+///
+/// Captured once, at the first call — `main` makes that call before anything
+/// else — because both halves drift. After `mv new rust-code-mcp` the path
+/// names the new binary while this process still runs the old image, and
+/// `current_exe()` then names the old image's new name (`….prev`, or
+/// `… (deleted)`). The path is what a client spawns successors from and keys
+/// sockets by; the image is what a daemon compares that path against.
+#[derive(Debug)]
+pub struct Launch {
+    exe: PathBuf,
+    running: Option<BinaryIdentity>,
+}
+
+static LAUNCH: OnceLock<Launch> = OnceLock::new();
+
+pub fn launch() -> io::Result<&'static Launch> {
+    if let Some(launch) = LAUNCH.get() {
+        return Ok(launch);
+    }
+    let exe = std::env::current_exe()?;
+    // `/proc/self/exe` resolves to the inode being executed, however it has
+    // been renamed or unlinked since; without procfs, the path as it is now.
+    let running =
+        BinaryIdentity::at(Path::new("/proc/self/exe")).or_else(|| BinaryIdentity::at(&exe));
+    Ok(LAUNCH.get_or_init(|| Launch { exe, running }))
+}
+
+impl Launch {
+    /// The binary now at the launch path, when it is readable and is not the
+    /// one this process runs. `None` while the path is missing: `mv a b; mv c a`
+    /// passes through that state, and retiring there would retire every daemon
+    /// for a binary that is about to come back.
+    pub fn replacement(&self) -> Option<BinaryIdentity> {
+        let running = self.running?;
+        BinaryIdentity::at(&self.exe).filter(|now| *now != running)
+    }
+}
+
+/// `(dev, ino)` of the socket file at `path`: whether the address a client
+/// connected through still belongs to the daemon it reached. A retired daemon
+/// unlinks its socket, and a successor binds a new one.
+fn socket_file_id(path: &Path) -> Option<(u64, u64)> {
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|meta| meta.file_type().is_socket())
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
 fn lock_path(socket: &Path) -> PathBuf {
     socket.with_extension("lock")
 }
@@ -1004,27 +1101,121 @@ async fn try_connect(socket: &Path) -> Option<UnixStream> {
 /// no daemon could be reached or started, and the caller must serve the session
 /// itself, in-process.
 /// `idle` is this client's `--idle-secs`, passed on to a daemon it starts.
-pub async fn run_client(socket: &Path, idle: Option<Duration>) -> Result<bool, BoxError> {
+/// `follow_key` — see [`Mode::Client`].
+pub async fn run_client(
+    socket: &Path,
+    idle: Option<Duration>,
+    follow_key: bool,
+) -> Result<bool, BoxError> {
+    let mut dialer = SocketDialer {
+        socket: socket.to_path_buf(),
+        idle,
+        follow_key,
+        connected: None,
+        retry_after: None,
+    };
+    let Some(stream) = relay::Dialer::dial(&mut dialer).await else {
+        return Ok(false);
+    };
+    // The verdict is the relay's, not ours: a session where nothing was
+    // exchanged can still be served in-process, and discarding that here
+    // would report an empty session as a completed one.
+    relay::relay(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        stream,
+        &mut dialer,
+        CLIENT_TICK,
+        DRAIN_AFTER_EOF,
+    )
+    .await
+}
+
+/// The socket this client reached, as it was when it connected.
+struct Connected {
+    path: PathBuf,
+    file: Option<(u64, u64)>,
+}
+
+/// The real [`relay::Dialer`]: the socket of this configuration, its daemon
+/// started on demand.
+struct SocketDialer {
+    /// `--socket`, or the key's path at startup.
+    socket: PathBuf,
+    idle: Option<Duration>,
+    follow_key: bool,
+    connected: Option<Connected>,
+    /// Set after a failed dial: no move is attempted before it.
+    retry_after: Option<Instant>,
+}
+
+impl SocketDialer {
+    /// The socket a new connection should go to. With `follow_key` it is
+    /// recomputed, because a rebuilt binary has a different key; `None` while
+    /// the binary is unreadable — mid-swap, nothing to follow yet.
+    fn target(&self) -> Option<PathBuf> {
+        if !self.follow_key {
+            return Some(self.socket.clone());
+        }
+        let exe = &launch().ok()?.exe;
+        BinaryIdentity::at(exe)?;
+        default_socket_path().ok()
+    }
+}
+
+impl relay::Dialer for SocketDialer {
+    async fn dial(&mut self) -> Option<UnixStream> {
+        let socket = self.target().unwrap_or_else(|| self.socket.clone());
+        let stream = connect_or_spawn(&socket, self.idle).await;
+        match &stream {
+            Some(_) => {
+                self.retry_after = None;
+                self.connected = Some(Connected {
+                    file: socket_file_id(&socket),
+                    path: socket,
+                });
+            }
+            None => self.retry_after = Some(Instant::now() + MOVE_RETRY),
+        }
+        stream
+    }
+
+    fn superseded(&mut self) -> bool {
+        if self.retry_after.is_some_and(|at| Instant::now() < at) {
+            return false;
+        }
+        let Some(connected) = &self.connected else {
+            return false;
+        };
+        if self
+            .target()
+            .is_some_and(|target| target != connected.path)
+        {
+            return true;
+        }
+        socket_file_id(&connected.path) != connected.file
+    }
+}
+
+/// Reach the daemon listening on `socket`, starting one when nobody does.
+async fn connect_or_spawn(socket: &Path, idle: Option<Duration>) -> Option<UnixStream> {
     if let Some(stream) = try_connect(socket).await {
         tracing::info!("connected to shared daemon at {}", socket.display());
-        // The verdict is the proxy's, not ours: a session where nothing was
-        // exchanged can still be served in-process, and discarding that here
-        // would report an empty session as a completed one.
-        return proxy(stream).await;
+        return Some(stream);
     }
 
     if let Some(parent) = socket.parent() {
         if let Err(e) = ensure_dir(parent) {
             tracing::warn!("socket dir {} unusable: {e}", parent.display());
-            return Ok(false);
+            return None;
         }
     }
 
     let lock = match SpawnLock::acquire(&lock_path(socket)) {
         Ok(lock) => lock,
         Err(e) => {
-            tracing::warn!("spawn lock unavailable: {e}; serving in-process");
-            return Ok(false);
+            tracing::warn!("spawn lock unavailable: {e}");
+            return None;
         }
     };
 
@@ -1044,19 +1235,13 @@ pub async fn run_client(socket: &Path, idle: Option<Duration>) -> Result<bool, B
             match fs::symlink_metadata(socket) {
                 Ok(meta) if meta.file_type().is_socket() => {
                     if let Err(e) = fs::remove_file(socket) {
-                        tracing::warn!(
-                            "cannot remove stale {}: {e}; serving in-process",
-                            socket.display()
-                        );
-                        return Ok(false);
+                        tracing::warn!("cannot remove stale {}: {e}", socket.display());
+                        return None;
                     }
                 }
                 Ok(_) => {
-                    tracing::warn!(
-                        "{} exists and is not a socket; serving in-process",
-                        socket.display()
-                    );
-                    return Ok(false);
+                    tracing::warn!("{} exists and is not a socket", socket.display());
+                    return None;
                 }
                 // Nothing there: the ordinary first-start case.
                 Err(_) => {}
@@ -1064,18 +1249,14 @@ pub async fn run_client(socket: &Path, idle: Option<Duration>) -> Result<bool, B
             match spawn_daemon(socket, idle) {
                 Ok(child) => wait_for_daemon(socket, child).await,
                 Err(e) => {
-                    tracing::warn!("failed to spawn daemon: {e}; serving in-process");
+                    tracing::warn!("failed to spawn daemon: {e}");
                     None
                 }
             }
         }
     };
     drop(lock);
-
-    match stream {
-        Some(stream) => proxy(stream).await,
-        None => Ok(false),
-    }
+    stream
 }
 
 /// Size at which a daemon log is rolled aside on the next spawn. Generous on
@@ -1115,8 +1296,12 @@ fn open_daemon_log(socket: &Path) -> io::Result<File> {
 /// given one. Without that forwarding the flag was parsed and dropped: only the
 /// environment variable reached the daemon, by inheritance, so `--idle-secs 5`
 /// through the ordinary client path did nothing at all.
+///
+/// From the launch path, not `current_exe()`: a client moving its session off
+/// a replaced binary must start the binary that is there NOW, and
+/// `current_exe()` by then names the old image (`….prev`, `… (deleted)`).
 fn spawn_daemon(socket: &Path, idle: Option<Duration>) -> io::Result<Child> {
-    let exe = std::env::current_exe()?;
+    let exe = &launch()?.exe;
     let log = open_daemon_log(socket)?;
 
     let mut cmd = Command::new(exe);
@@ -1169,86 +1354,6 @@ async fn wait_for_daemon(socket: &Path, mut child: Child) -> Option<UnixStream> 
             return None;
         }
         tokio::time::sleep(SPAWN_POLL).await;
-    }
-}
-
-/// Pump stdin/stdout ↔ socket for one session, returning [`run_client`]'s
-/// verdict: `true` when the daemon served it, `false` when nothing was
-/// exchanged and the caller may still serve it in-process.
-///
-/// Half-close, not cancel. At stdin EOF the write half is shut down, the daemon
-/// sees that EOF, finishes the answers it still owes and closes — and those
-/// answers arrive BETWEEN the half-close and the close. Ending the session at
-/// stdin EOF (a plain `select!` over both directions) dropped every reply still
-/// in flight, so a piped one-shot returned nothing at all while the same input
-/// through `RMC_DAEMON=0` answered normally. Hence the drain below.
-///
-/// The socket reaching EOF while stdin is still open is the opposite case: that
-/// daemon died mid-session. It is a failure, not a shutdown, and reporting it as
-/// success would hand the host a silence it cannot tell from an answer.
-async fn proxy(stream: UnixStream) -> Result<bool, BoxError> {
-    let (mut from_daemon, mut to_daemon) = stream.into_split();
-    let mut stdout = tokio::io::stdout();
-    // Whether stdin gave up a single byte decides which failure this is, and it
-    // must be readable while the copy still runs. A flag, not a count: nothing
-    // here needs the total.
-    let consumed = AtomicBool::new(false);
-
-    let mut upstream = pin!(async {
-        let mut stdin = tokio::io::stdin();
-        let mut head = [0u8; 8 * 1024];
-        let n = stdin.read(&mut head).await?;
-        if n > 0 {
-            consumed.store(true, Ordering::Relaxed);
-            to_daemon.write_all(&head[..n]).await?;
-            copy(&mut stdin, &mut to_daemon).await?;
-        }
-        to_daemon.shutdown().await
-    });
-    let mut downstream = pin!(async {
-        copy(&mut from_daemon, &mut stdout).await?;
-        stdout.flush().await
-    });
-
-    // Bytes already taken from stdin are gone from the pipe, so an in-process
-    // server started afterwards would answer a truncated stream. A session that
-    // never started can still be served locally.
-    let ended = |reason: BoxError| -> Result<bool, BoxError> {
-        if consumed.load(Ordering::Relaxed) {
-            return Err(reason);
-        }
-        tracing::warn!("daemon session ended with nothing exchanged: {reason}; serving in-process");
-        Ok(false)
-    };
-
-    tokio::select! {
-        result = &mut upstream => {
-            if let Err(e) = result {
-                return ended(e.into());
-            }
-        }
-        // Nobody is left to answer requests that were already sent, and the host
-        // is waiting for them: exiting cleanly here would report a crash as a
-        // shutdown.
-        result = &mut downstream => {
-            return ended(match result {
-                Ok(()) => "daemon closed the connection while stdin was still open".into(),
-                Err(e) => format!("daemon connection failed mid-session: {e}").into(),
-            });
-        }
-    }
-
-    match tokio::time::timeout(DRAIN_AFTER_EOF, &mut downstream).await {
-        Ok(Ok(())) => Ok(true),
-        Ok(Err(e)) => ended(e.into()),
-        // Not `ended`: stdin has run to EOF and everything it held went to the
-        // daemon, so no in-process server can serve this session even if not a
-        // single byte moved.
-        Err(_elapsed) => Err(format!(
-            "daemon held the connection open for longer than DRAIN_AFTER_EOF \
-             ({DRAIN_AFTER_EOF:?}) after stdin closed; replies may have been lost"
-        )
-        .into()),
     }
 }
 
@@ -1374,15 +1479,23 @@ pub async fn run_daemon(
     // outright leaves its socket file behind; clients survive that (they clear it
     // and start a new one), but `--print-socket` plus `ls` then point at an
     // address where nobody listens — diagnostics lying exactly when consulted.
+    record_sigterm_sender();
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
+
+    let launch = launch()?;
+    tracing::info!(
+        "binary watch: {} (running {:?}); a different binary there retires this daemon",
+        launch.exe.display(),
+        launch.running,
+    );
 
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => Some(accepted),
             _ = tokio::time::sleep(IDLE_TICK) => None,
             _ = sigterm.recv() => {
-                tracing::info!("SIGTERM, shutting down");
+                tracing::info!("SIGTERM from {}, shutting down", describe_sigterm_sender());
                 break;
             }
             _ = sigint.recv() => {
@@ -1551,6 +1664,28 @@ pub async fn run_daemon(
             }
         }
 
+        // A rebuilt binary at the launch path: every client of this daemon is
+        // the same build and moves to the daemon of the new one between
+        // requests (`relay`), so all this daemon has to do is stop being found
+        // and stop working in the background. Not refusing analyses and not
+        // unloading, unlike the hard-limit retirement: a session's request can
+        // still land here in the tick before its client moves, and it should be
+        // answered rather than refused.
+        if !retiring {
+            if let Some(now) = launch.replacement() {
+                tracing::warn!(
+                    "{} was replaced ({:?} -> {:?}); retiring: clients move to the new binary's daemon between requests, background sync stops",
+                    launch.exe.display(),
+                    launch.running,
+                    now,
+                );
+                runtime.request_shutdown();
+                let _ = fs::remove_file(socket);
+                retiring = true;
+                retiring_since = Some(SystemTime::now());
+            }
+        }
+
         // Garbage collection, on its own timer rather than on the watchdog's
         // thresholds: its job is to keep the working set from growing in the
         // first place, so waiting for the soft limit would be waiting for the
@@ -1604,6 +1739,62 @@ pub async fn run_daemon(
         let _ = fs::remove_file(socket);
     }
     Ok(())
+}
+
+/// Pid of the last SIGTERM's sender; 0 — none seen, or not knowable here.
+static SIGTERM_SENDER: AtomicI32 = AtomicI32::new(0);
+
+/// Remember who sends SIGTERM, beside tokio's own handler.
+///
+/// 2026-10-21 23:54 a daemon got SIGTERM from outside and nobody could say
+/// from whom: no journal entry, no audit. The sender's pid is in the
+/// `siginfo_t` the kernel hands a `SA_SIGINFO` handler, and signal-hook's
+/// registry (which tokio's own handler goes through) runs every action
+/// registered for a signal, so this one only adds a recorder.
+fn record_sigterm_sender() {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: the action stores into an atomic and nothing else, which is
+        // async-signal-safe; `si_pid` reads a field the kernel filled in.
+        let registered = unsafe {
+            signal_hook_registry::register_sigaction(libc::SIGTERM, |info: &libc::siginfo_t| {
+                SIGTERM_SENDER.store(info.si_pid(), Ordering::Relaxed);
+            })
+        };
+        if let Err(e) = registered {
+            tracing::warn!("cannot record SIGTERM senders: {e}");
+        }
+    }
+}
+
+/// `pid 123 (comm, parent 45): cmdline`, read from /proc while the sender may
+/// still be alive; whatever is gone by then is left out.
+fn describe_sigterm_sender() -> String {
+    let pid = SIGTERM_SENDER.load(Ordering::Relaxed);
+    if pid <= 0 {
+        return "an unknown sender".to_string();
+    }
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    let comm = fs::read_to_string(proc_dir.join("comm")).unwrap_or_default();
+    let parent = fs::read_to_string(proc_dir.join("status"))
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("PPid:").map(|p| p.trim().to_string()))
+        })
+        .unwrap_or_else(|| "?".to_string());
+    let cmdline: String = fs::read(proc_dir.join("cmdline"))
+        .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " "))
+        .unwrap_or_default()
+        .chars()
+        .take(300)
+        .collect();
+    format!(
+        "pid {pid} ({}, parent {parent}): {}",
+        comm.trim(),
+        cmdline.trim()
+    )
 }
 
 /// How long a daemon that has left its accept loop gives the runtime to wind
@@ -2262,8 +2453,53 @@ mod tests {
             Mode::Client {
                 socket: PathBuf::from("/tmp/x.sock"),
                 idle: Some(Duration::from_secs(7)),
+                follow_key: false,
             }
         );
+    }
+
+    /// Only a derived socket follows the key: one named by `--socket` stays
+    /// where it was put whatever the binary does.
+    #[test]
+    fn only_a_derived_socket_follows_the_binary() {
+        assert!(matches!(
+            mode_of(&["--client"]),
+            Mode::Client {
+                follow_key: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            mode_of(&["--client", "--socket", "/tmp/x.sock"]),
+            Mode::Client {
+                follow_key: false,
+                ..
+            }
+        ));
+    }
+
+    /// The daemon's half of a rebuild: a different file at the launch path is a
+    /// replacement, the same one is not, and a missing one is not either —
+    /// `mv old .prev; mv new old` passes through "missing".
+    ///
+    /// Mutation that must fail it: compare the path with itself instead of
+    /// with the running image, and the rewritten file goes unnoticed.
+    #[test]
+    fn a_rewritten_launch_path_is_a_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe = dir.path().join("rust-code-mcp");
+        std::fs::write(&exe, b"old build").expect("old binary");
+        let launch = Launch {
+            exe: exe.clone(),
+            running: BinaryIdentity::at(&exe),
+        };
+        assert_eq!(launch.replacement(), None, "the running binary itself");
+
+        std::fs::remove_file(&exe).expect("mid-swap");
+        assert_eq!(launch.replacement(), None, "a missing binary is not a new one");
+
+        std::fs::write(&exe, b"the new build").expect("new binary");
+        assert_eq!(launch.replacement(), BinaryIdentity::at(&exe));
     }
 
     /// And must NOT invent one when the command line was silent: the spawned
@@ -2277,6 +2513,7 @@ mod tests {
             Mode::Client {
                 socket: PathBuf::from("/tmp/x.sock"),
                 idle: None,
+                follow_key: false,
             }
         );
     }

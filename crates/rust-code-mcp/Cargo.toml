@@ -17,6 +17,10 @@ fs2 = { workspace = true }
 libc = { workspace = true }
 # Socket key (index root + env + binary version).
 sha2 = { workspace = true }
+# The client relay reads JSON-RPC lines to replay a session on a new daemon.
+serde_json = { workspace = true }
+# Who sent SIGTERM: the `siginfo_t` of a handler chained beside tokio's.
+signal-hook-registry = "1.4"
 # Global allocator behind the `mimalloc` feature; see its comment below.
 mimalloc = { version = "0.1", optional = true }
 

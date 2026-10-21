@@ -79,6 +79,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // background sync task — it is a pipe between stdio and the socket.
     #[cfg(unix)]
     let mode = {
+        // Before anything can rename the binary under us: the launch path and
+        // the running image are what a daemon compares to notice a rebuild.
+        if let Err(e) = daemon::launch() {
+            tracing::warn!("cannot resolve this binary's path: {e}");
+        }
         let args: Vec<String> = std::env::args().skip(1).collect();
         match daemon::resolve_mode(&args) {
             Ok(mode) => mode,
@@ -128,10 +133,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(unix)]
     match &mode {
-        daemon::Mode::Client { socket, idle } => {
+        daemon::Mode::Client {
+            socket,
+            idle,
+            follow_key,
+        } => {
             // An unreachable daemon never leaves the session without a server:
             // fall through to the previous in-process behaviour.
-            match daemon::run_client(socket, *idle).await {
+            match daemon::run_client(socket, *idle, *follow_key).await {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
                     tracing::info!("shared daemon unavailable; serving this session in-process")

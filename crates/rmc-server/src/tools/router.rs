@@ -70,6 +70,17 @@ impl SearchToolRouter {
             runtime,
         }
     }
+
+    /// Names of every tool this server offers — what `tools/list` answers,
+    /// without a client. The daemon's client checks its list of state-changing
+    /// tools against it.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect()
+    }
 }
 
 #[tool_router]
