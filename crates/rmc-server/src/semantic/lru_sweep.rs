@@ -232,11 +232,11 @@ fn query_bytes(rows: &[IngredientMemory], query: &str) -> (usize, usize) {
         .map_or((0, 0), |row| (row.count, row.heap_bytes.unwrap_or(0)))
 }
 
-fn rows_of(service: &SemanticService, canonical: &Path) -> Vec<IngredientMemory> {
+fn rows_of(service: &mut SemanticService, canonical: &Path) -> Vec<IngredientMemory> {
     ingredient_rows(
-        &service
+        &mut service
             .projects
-            .get(canonical)
+            .get_mut(canonical)
             .expect("the probe must have cached a context for this path")
             .host,
     )
@@ -299,7 +299,7 @@ pub(super) fn apply_capacity(
 }
 
 /// Live parse-tree bytes and memo slots, the pair every assertion here is about.
-pub(super) fn parse_bytes(service: &SemanticService, canonical: &Path) -> (usize, usize) {
+pub(super) fn parse_bytes(service: &mut SemanticService, canonical: &Path) -> (usize, usize) {
     query_bytes(&rows_of(service, canonical), PARSE_QUERY)
 }
 
@@ -567,14 +567,14 @@ path = "src/lib.rs"
         super::apply_capacity(&mut service, &canonical, Some(0));
         // Restore a capacity that evicts — but still ask nothing.
         super::apply_capacity(&mut service, &canonical, Some(1));
-        let (memos, heap_before) = super::parse_bytes(&service, &canonical);
+        let (memos, heap_before) = super::parse_bytes(&mut service, &canonical);
         assert!(
             memos > 1,
             "the fixture holds {memos} parse memo slot(s); with nothing above the capacity this \
              proves nothing either way"
         );
         service.collect_garbage();
-        let (_, heap_after) = super::parse_bytes(&service, &canonical);
+        let (_, heap_after) = super::parse_bytes(&mut service, &canonical);
         assert_eq!(
             heap_after, heap_before,
             "a capacity of one evicted {} bytes from a use set that a preceding zero had cleared; \
@@ -660,10 +660,10 @@ path = "src/lib.rs"
         // The positive control: a change *is* paid for. Without this, a
         // measurement that reported the same number forever would satisfy the
         // equality above and read as "repeats are free".
-        let (_, before_edit) = super::parse_bytes(&service, &canonical);
+        let (_, before_edit) = super::parse_bytes(&mut service, &canonical);
         edit_a_file(&root);
         let after_edit_answers = probe.run(&mut service, &root);
-        let (_, after_edit) = super::parse_bytes(&service, &canonical);
+        let (_, after_edit) = super::parse_bytes(&mut service, &canonical);
         assert!(
             after_edit > before_edit,
             "an edited file did not bring a single parse byte back ({before_edit} both before and \
