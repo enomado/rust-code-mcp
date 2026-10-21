@@ -18,6 +18,7 @@ mod fn_body_audit;
 mod hir_trim;
 pub mod ids;
 mod impls;
+mod incremental;
 mod labels;
 mod loader;
 mod math;
@@ -73,7 +74,7 @@ pub use skeleton::{
     render_crate_skeletons,
 };
 pub use snapshot::{
-    BuildOptions, GraphSnapshotCleanupEntry, GraphSnapshotCleanupOptions,
+    BuildKind, BuildOptions, GraphSnapshotCleanupEntry, GraphSnapshotCleanupOptions,
     GraphSnapshotCleanupReport, OpenedSnapshot, build_and_persist,
     clear_all_workspace_snapshots, clear_workspace_snapshots, open_current,
     open_current_for_workspace,

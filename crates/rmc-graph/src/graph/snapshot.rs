@@ -1,21 +1,23 @@
 //! Snapshot lifecycle: staging → write → publish.
 //!
-//! `build_and_persist` is the high-level entry point: it loads, computes a
-//! fingerprint, opens a new heed env in a staging dir, extracts and writes
-//! crate by crate (one transaction per crate, memory given back between
-//! them), writes manifest.json, then atomically swaps
+//! `build_and_persist` is the high-level entry point: it hashes the tree by
+//! package, loads, decides between a full and an incremental build
+//! (`incremental.rs`), stages a new heed env — empty, or a compacted copy of
+//! the published snapshot with the dirty crates' rows deleted — extracts and
+//! writes crate by crate (one transaction per crate, memory given back
+//! between them), writes manifest.json, then atomically swaps
 //! the workspace's `CURRENT` pointer and removes the snapshots it superseded.
 //! Staging, publish and prune run under the workspace's `BUILD.lock`
 //! ([`lock_workspace_builds`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use heed::{Env, RoTxn, RwTxn, WithoutTls};
+use heed::{CompactionOption, Env, RoTxn, RwTxn, WithoutTls};
 type GraphRoTxn<'e> = RoTxn<'e, WithoutTls>;
 type GraphRwTxn<'e> = RwTxn<'e>;
 
@@ -29,16 +31,19 @@ struct CachedGraphEnv {
 
 use super::extract;
 use super::ids::{BindingId, NodeId, UsageId};
+use super::incremental::{self, BuildPlan};
 use super::loader::{self, LoadedWorkspace};
 #[cfg(test)]
 use super::model::ExtractionModel;
 use super::model::{Binding, Namespace, NodeKind, Usage};
 use super::ownership;
 use super::storage::{
-    CURRENT_POINTER_FILENAME, GraphDatabases, GraphEnvOptions, GraphManifest, GraphPaths,
-    SCHEMA_VERSION, compute_fingerprint, default_data_dir, graph_id_for, read_manifest,
-    read_manifest_compatible, write_manifest,
+    BuildInputs, CURRENT_POINTER_FILENAME, GraphDatabases, GraphEnvOptions, GraphManifest,
+    GraphPaths, SCHEMA_VERSION, compute_build_inputs, default_data_dir, graph_id_for,
+    read_manifest, read_manifest_compatible, write_manifest,
 };
+#[cfg(test)]
+use super::storage::compute_fingerprint;
 use super::usages::UsagesPass;
 
 #[derive(Debug, Clone)]
@@ -75,7 +80,23 @@ pub struct BuildResult {
     pub binding_count: u64,
     pub usage_count: u64,
     pub reused: bool,
+    pub kind: BuildKind,
     pub snapshot_path: PathBuf,
+}
+
+/// What a build did ([`incremental`](super::incremental) decides).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BuildKind {
+    /// A snapshot of today's tree already existed.
+    Reused,
+    /// Every crate built into an empty snapshot.
+    Full { reason: String },
+    /// The published snapshot copied, these crates deleted and rebuilt.
+    Incremental {
+        changed_packages: Vec<String>,
+        rebuilt_crates: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -212,30 +233,23 @@ fn snapshot_identity(
     }
 }
 
-fn compute_snapshot_identity(
-    workspace_root: PathBuf,
-    paths: GraphPaths,
-) -> Result<SnapshotIdentity> {
-    let fingerprint = compute_fingerprint(&workspace_root)?;
-    Ok(snapshot_identity(workspace_root, paths, fingerprint))
-}
-
+/// The identity of today's tree, and the per-package inputs it hashes.
 fn compute_snapshot_identity_timed(
     workspace_root: PathBuf,
     paths: GraphPaths,
     timing: bool,
-) -> Result<SnapshotIdentity> {
-    if !timing {
-        return compute_snapshot_identity(workspace_root, paths);
-    }
-
+) -> Result<(SnapshotIdentity, BuildInputs)> {
     let t = std::time::Instant::now();
-    let fingerprint = compute_fingerprint(&workspace_root)?;
-    eprintln!(
-        "build:   compute_fingerprint          {:>9.2?}",
-        t.elapsed()
-    );
-    Ok(snapshot_identity(workspace_root, paths, fingerprint))
+    let inputs = compute_build_inputs(&workspace_root)?;
+    if timing {
+        eprintln!(
+            "build:   compute_fingerprint          {:>9.2?}  ({} packages)",
+            t.elapsed(),
+            inputs.packages.len()
+        );
+    }
+    let identity = snapshot_identity(workspace_root, paths, inputs.fingerprint());
+    Ok((identity, inputs))
 }
 
 fn try_reuse_existing_snapshot(identity: &SnapshotIdentity) -> Result<Option<BuildResult>> {
@@ -256,6 +270,7 @@ fn try_reuse_existing_snapshot(identity: &SnapshotIdentity) -> Result<Option<Bui
         binding_count: manifest.binding_count,
         usage_count: manifest.usage_count,
         reused: true,
+        kind: BuildKind::Reused,
         snapshot_path: identity.snapshot_dir.clone(),
     }))
 }
@@ -264,11 +279,10 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
     let timing = std::env::var_os("EXTRACT_TIMING").is_some();
     let workspace_root = canonical_workspace_root(directory)?;
 
-    let preflight_identity = if options.force_rebuild {
-        None
-    } else {
-        let paths = graph_paths_for_workspace(&workspace_root, &options);
-        let identity = compute_snapshot_identity_timed(workspace_root.clone(), paths, timing)?;
+    let paths = graph_paths_for_workspace(&workspace_root, &options);
+    if !options.force_rebuild {
+        let (identity, _) =
+            compute_snapshot_identity_timed(workspace_root.clone(), paths.clone(), timing)?;
         if let Some(result) = try_reuse_existing_snapshot(&identity)? {
             if timing {
                 eprintln!("build:   reused existing snapshot");
@@ -280,8 +294,7 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
             publish_current_if_changed(&identity.paths, &identity.graph_id)?;
             return Ok(result);
         }
-        Some(identity)
-    };
+    }
 
     let t = std::time::Instant::now();
     // Unprimed: the per-crate build primes the crates it walks itself.
@@ -293,23 +306,84 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
             loaded.local_crates.len()
         );
     }
+    // Hashed (again) after the load, because the load can write to the tree:
+    // `cargo metadata` creates a missing `Cargo.lock`. The snapshot is of the
+    // tree the load read; hashed before it, the next build of an untouched
+    // tree would see a changed lockfile and rebuild in full.
+    let (identity, inputs) = compute_snapshot_identity_timed(workspace_root, paths, timing)?;
 
-    let identity = if let Some(identity) = preflight_identity {
-        identity
-    } else {
-        let paths = graph_paths_for_workspace(&loaded.workspace_root, &options);
-        compute_snapshot_identity_timed(loaded.workspace_root.clone(), paths, timing)?
-    };
     identity.paths.ensure_dirs()?;
     // Taken after `loader::load` (the long part, and it touches nothing on
-    // disk here) and held to the end of the prune.
+    // disk here) and held to the end of the prune — so the base read below
+    // is the snapshot no other builder is replacing meanwhile.
     let _build_lock = lock_workspace_builds(&identity.paths)?;
+
+    let plan = if options.force_rebuild {
+        BuildPlan::Full {
+            reason: "force_rebuild".to_string(),
+        }
+    } else {
+        match open_current(&identity.paths, options.env) {
+            // A base under today's own id is a leftover of an interrupted
+            // build of this very tree (the reuse check above did not accept
+            // it); it is about to be cleared, so it cannot be copied.
+            Ok(Some(base)) if base.manifest.graph_id == identity.graph_id => BuildPlan::Full {
+                reason: "the published snapshot is an unfinished build of this tree".to_string(),
+            },
+            Ok(base) => incremental::plan_build(base, &inputs, &loaded)?,
+            Err(error) => BuildPlan::Full {
+                reason: format!("cannot open the published snapshot: {error:#}"),
+            },
+        }
+    };
 
     if identity.snapshot_dir.exists() {
         fs::remove_dir_all(&identity.snapshot_dir)
             .with_context(|| format!("failed to clear stale {}", identity.snapshot_dir.display()))?;
     }
     fs::create_dir_all(&identity.snapshot_dir)?;
+
+    // What to (re)build, the base's crate → packages entries to keep, and
+    // the report. The base is copied and closed before the new env opens.
+    let t = std::time::Instant::now();
+    let (dirty, mut crate_packages, kind) = match plan {
+        BuildPlan::Full { reason } => {
+            let groups = extract::crate_groups(&loaded, &loaded.local_crates)?;
+            (groups, BTreeMap::new(), BuildKind::Full { reason })
+        }
+        BuildPlan::Incremental {
+            base,
+            dirty,
+            changed_packages,
+        } => {
+            let target = identity.snapshot_dir.join("data.mdb");
+            base.env
+                .copy_to_path(&target, CompactionOption::Enabled)
+                .with_context(|| {
+                    format!(
+                        "copy snapshot {} to {}",
+                        base.snapshot_dir.display(),
+                        target.display()
+                    )
+                })?;
+            let mut crate_packages = base.manifest.crate_packages.clone();
+            for group in &dirty {
+                crate_packages.remove(&group.name);
+            }
+            let kind = BuildKind::Incremental {
+                changed_packages: changed_packages.into_iter().collect(),
+                rebuilt_crates: dirty.iter().map(|g| g.name.clone()).collect(),
+            };
+            (dirty, crate_packages, kind)
+        }
+    };
+    tracing::info!(workspace = %identity.workspace_root.display(), ?kind, "hypergraph build");
+    if timing {
+        eprintln!(
+            "build:   plan + copy                  {:>9.2?}  ({kind:?})",
+            t.elapsed()
+        );
+    }
 
     let env = unsafe {
         options
@@ -320,14 +394,22 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
     };
 
     let t = std::time::Instant::now();
+    let dirty_crates: Vec<_> = dirty.iter().flat_map(|g| g.crates.iter().copied()).collect();
     let (node_count, binding_count, usage_count) = write_by_crate(
         &env,
         &mut loaded,
+        &dirty_crates,
         options.release_free_memory,
         &identity.paths.workspace_hash,
         &identity.fingerprint,
         &identity.graph_id,
     )?;
+    for group in &dirty {
+        crate_packages.insert(
+            group.name.clone(),
+            incremental::crate_packages(&loaded, group, &inputs),
+        );
+    }
     if timing {
         eprintln!(
             "build:   extract + write by crate     {:>9.2?}  ({} nodes, {} bindings, {} usages)",
@@ -348,6 +430,8 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
         node_count,
         binding_count,
         usage_count,
+        inputs: Some(inputs),
+        crate_packages,
     };
     write_manifest(&identity.manifest_path, &manifest)?;
 
@@ -362,6 +446,7 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
         binding_count,
         usage_count,
         reused: false,
+        kind,
         snapshot_path: identity.snapshot_dir,
     })
 }
@@ -407,13 +492,18 @@ fn write_model(
     Ok(counts)
 }
 
-/// Build and write the snapshot one crate group at a time
-/// (`extract::extract_by_crate`): one write transaction per group holding
-/// exactly that group's rows, then the meta rows. Returns the same counts as
-/// [`write_model`] of the whole-workspace model.
+/// Build and write the crates of `dirty` one group at a time
+/// (`extract::extract_by_crate`) into `env` — empty for a full build, a copy
+/// of the base for an incremental one. One write transaction per group
+/// deletes the rows the group owned (none in an empty env) and writes its
+/// new ones; then the meta rows.
+///
+/// Returns the counts of the whole snapshot: distinct nodes, bindings and
+/// usages in their tables.
 fn write_by_crate(
     env: &Env<WithoutTls>,
     loaded: &mut LoadedWorkspace,
+    dirty: &[ra_ap_hir::Crate],
     release_free_memory: Option<fn() -> bool>,
     workspace_hash: &str,
     fingerprint: &str,
@@ -423,15 +513,14 @@ fn write_by_crate(
     let dbs = GraphDatabases::create(env, &mut wtxn)?;
     wtxn.commit().context("commit graph table creation")?;
 
-    let dirty = loaded.local_crates.clone();
-    let (mut binding_count, mut usage_count) = (0u64, 0u64);
     extract::extract_by_crate(
         loaded,
-        &dirty,
+        dirty,
         UsagesPass::from_env(),
         release_free_memory,
         &mut |model, group| {
             let mut wtxn = env.write_txn().context("open write txn")?;
+            ownership::delete_crate_rows(&mut wtxn, &dbs, group.id)?;
             let written = ownership::write_owned_rows(&mut wtxn, &dbs, model, &|c| c == group.id)?;
             // The whole-model write checks that every node was written. Here
             // nodes of other crates are left out on purpose, so the check is
@@ -457,17 +546,19 @@ fn write_by_crate(
             }
             wtxn.commit()
                 .with_context(|| format!("commit rows of crate `{}`", group.name))?;
-            binding_count += written.bindings;
-            usage_count += written.usages;
             Ok(())
         },
     )?;
 
     let mut wtxn = env.write_txn().context("open write txn")?;
-    // Distinct nodes: the workspace node and the stubs are written by every
-    // group that has them.
-    let node_count = dbs.nodes_by_id.len(&wtxn)?;
-    let counts = (node_count, binding_count, usage_count);
+    // Read from the tables, not summed per group: an incremental build
+    // writes only some groups, and the workspace node and the stubs are
+    // written by every group that has them.
+    let counts = (
+        dbs.nodes_by_id.len(&wtxn)?,
+        dbs.bindings_by_id.len(&wtxn)?,
+        dbs.usages_by_id.len(&wtxn)?,
+    );
     write_meta(
         &mut wtxn,
         &dbs,
@@ -526,8 +617,9 @@ pub(crate) fn persist_test_by_crate(
     env_opts: GraphEnvOptions,
 ) -> Result<OpenedSnapshot> {
     let workspace_root = loaded.workspace_root.clone();
+    let all = loaded.local_crates.clone();
     persist_test_with(data_dir, &workspace_root, env_opts, |env, hash, fp, id| {
-        write_by_crate(env, loaded, None, hash, fp, id)
+        write_by_crate(env, loaded, &all, None, hash, fp, id)
     })
 }
 
@@ -572,6 +664,8 @@ fn persist_test_with(
             node_count,
             binding_count,
             usage_count,
+            inputs: None,
+            crate_packages: BTreeMap::new(),
         };
         write_manifest(&identity.manifest_path, &manifest)?;
     }
@@ -1044,6 +1138,8 @@ mod tests {
             node_count: 11,
             binding_count: 7,
             usage_count: 5,
+            inputs: None,
+            crate_packages: BTreeMap::new(),
         };
         write_manifest(&paths.manifest_path(&graph_id), &manifest).unwrap();
         (graph_id, snapshot_dir)

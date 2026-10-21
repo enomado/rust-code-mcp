@@ -200,7 +200,7 @@ fn rss_mib() -> u64 {
 }
 
 /// The groups of `dirty`, dependencies before dependents.
-fn crate_groups(loaded: &LoadedWorkspace, dirty: &[Crate]) -> Result<Vec<CrateGroup>> {
+pub(crate) fn crate_groups(loaded: &LoadedWorkspace, dirty: &[Crate]) -> Result<Vec<CrateGroup>> {
     let db = &loaded.db;
     let hash = workspace_hash(&loaded.workspace_root);
     let dirty_set: HashSet<Crate> = dirty.iter().copied().collect();

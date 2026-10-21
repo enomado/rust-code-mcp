@@ -19,7 +19,7 @@ use crate::tools::params::{
     WhoImportsParams, WhoUsesParams, WhoUsesSummaryParams, WorkspaceStatsParams,
 };
 use rmc_graph::graph::{
-    BuildOptions, CallGraphNode, EnrichedBinding, EnrichedCallSite, EnrichedUsage,
+    BuildKind, BuildOptions, CallGraphNode, EnrichedBinding, EnrichedCallSite, EnrichedUsage,
     ModuleDependency, ModuleDependencySymbol, ModuleTreeNode, NodeKind, RecursiveCallersCount,
     UsageSummaryRow, WorkspaceStats, build_and_persist,
 };
@@ -60,6 +60,7 @@ pub(crate) async fn build_hypergraph(
         binding_count: result.binding_count,
         usage_count: result.usage_count,
         reused: result.reused,
+        build: result.kind,
         snapshot_path: result.snapshot_path.display().to_string(),
     })
 }
@@ -73,6 +74,8 @@ pub(crate) struct BuildHypergraphResponse {
     pub(crate) binding_count: u64,
     pub(crate) usage_count: u64,
     pub(crate) reused: bool,
+    /// Reused, full (with the reason) or incremental (which crates).
+    pub(crate) build: BuildKind,
     pub(crate) snapshot_path: String,
 }
 
