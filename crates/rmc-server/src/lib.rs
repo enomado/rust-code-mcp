@@ -12,6 +12,14 @@
 #![recursion_limit = "512"]
 #![warn(unreachable_pub, dead_code)]
 
+// The test binary of this crate under the `mimalloc` feature. Without it the
+// feature switches only the release call (`mi_collect` instead of
+// `malloc_trim`) while every allocation still goes to glibc, and a memory probe
+// run "under mimalloc" would measure glibc with a no-op release.
+#[cfg(all(test, feature = "mimalloc"))]
+#[global_allocator]
+static TEST_GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub(crate) mod deep_stack;
 pub mod tools;
 pub mod mcp;

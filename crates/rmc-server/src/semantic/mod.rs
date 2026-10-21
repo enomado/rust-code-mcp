@@ -2390,7 +2390,8 @@ pub fn a_local_of_the_same_name() -> u32 {
     ///   cargo test -p rmc-server --features migraphx -- --ignored --nocapture salsa_ingredient
     /// ```
     ///
-    /// `RMC_SALSA_MEMORY_TOP` (default 25) caps how many rows are printed.
+    /// `RMC_SALSA_MEMORY_TOP` (default 25, 0 = all) caps how many rows are
+    /// printed.
     ///
     /// `RMC_SALSA_MEMORY_PROBE` picks what fills the database first:
     /// `symbols` (default, a symbol search — cheap, and what every earlier run
@@ -2417,7 +2418,12 @@ pub fn a_local_of_the_same_name() -> u32 {
             );
         };
         let project = PathBuf::from(project);
-        let top = env_usize("RMC_SALSA_MEMORY_TOP", 25);
+        // 0 means every row, as `top` does on the `analysis_memory` tool;
+        // read literally it printed none.
+        let top = match env_usize("RMC_SALSA_MEMORY_TOP", 25) {
+            0 => usize::MAX,
+            top => top,
+        };
         // Which query fills the database before it is weighed. `symbols` is the
         // default because it is what every earlier run in this track used, and
         // the probe decides every number in the table — two runs are comparable
@@ -2703,6 +2709,186 @@ pub fn a_local_of_the_same_name() -> u32 {
              the capacity is declared but nothing enforces it, which is exactly the defect this \
              whole chain exists to fix"
         );
+    }
+
+    /// Where does memory settle after a release, under the allocator this
+    /// binary was built with — and what do queries cost there?
+    ///
+    /// The fragmentation floor of the live daemon (≈ 4.2 GB of resident arena
+    /// pages holding no live chunk, left after `malloc_trim`) is holes inside
+    /// pages that still hold live objects; no trim returns them. Only the
+    /// allocator decides how many such pages there are, so the comparison is
+    /// one workload under several allocators: glibc as shipped, glibc with
+    /// `MALLOC_ARENA_MAX=<n>` (environment only, no rebuild), and mimalloc
+    /// (`--features mimalloc`, which also switches the test binary's global
+    /// allocator — see `lib.rs`).
+    ///
+    /// The workload is the daemon's, in miniature: a reference search loads the
+    /// project and infers every body mentioning the load symbol; then, until the
+    /// work time is up, rounds of garbage collection (the daemon collects every
+    /// five minutes; here every round, to churn the LRU-capped memos faster),
+    /// one reference search per work symbol and one symbol search. The portrait
+    /// is the shipped one — `memory_breakdown`, as `analysis_memory` serves it —
+    /// taken before and after a release at both ends. The number to compare is
+    /// `held` after a release: that is the floor the daemon's growth trim
+    /// returns to. Latencies are printed per call, because fewer arenas can
+    /// queue parallel threads behind one lock.
+    ///
+    /// Under mimalloc the portrait has no allocator split (no `mallinfo2`), so
+    /// fragmentation is inside `unattributed`; `held` stays comparable because
+    /// the salsa and interner lines are the same workload's.
+    ///
+    /// # Running it
+    ///
+    /// ```text
+    /// RMC_ALLOC_FLOOR_PROJECT=/home/user/project \
+    /// RMC_ALLOC_FLOOR_SYMBOL=OneDeclManyUses RMC_ALLOC_FLOOR_WORK=A,B,C \
+    ///   cargo test --release -p rmc-server --lib [--features mimalloc] \
+    ///   -- --ignored --nocapture allocator_floor
+    /// ```
+    ///
+    /// `RMC_ALLOC_FLOOR_WORK_SECS` (default 300) is the length of the work
+    /// phase. The symbols have no defaults for the reason given on the salsa
+    /// probe above: the name decides what the run costs.
+    #[test]
+    #[ignore = "needs a real workspace in RMC_ALLOC_FLOOR_PROJECT and minutes to run"]
+    fn allocator_floor_after_load_and_work() {
+        use std::time::{Duration, Instant};
+        // Exclusive: it measures the whole process.
+        let _sweep = sweeping_alone();
+        let required = |name: &str| {
+            std::env::var(name).unwrap_or_else(|_| {
+                panic!(
+                    "set {name}; without it this probe would measure nothing and pass, which is \
+                     worse than not running"
+                )
+            })
+        };
+        let project = PathBuf::from(required("RMC_ALLOC_FLOOR_PROJECT"));
+        let symbol = required("RMC_ALLOC_FLOOR_SYMBOL");
+        let work: Vec<String> = required("RMC_ALLOC_FLOOR_WORK")
+            .split(',')
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert!(!work.is_empty(), "RMC_ALLOC_FLOOR_WORK names no symbol");
+        let work_time = Duration::from_secs(env_usize("RMC_ALLOC_FLOOR_WORK_SECS", 300) as u64);
+
+        let allocator = if cfg!(feature = "mimalloc") { "mimalloc" } else { "glibc" };
+        // A run labelled mimalloc that allocates from glibc would compare glibc
+        // with itself; ask mimalloc whether a fresh heap block is its own.
+        #[cfg(feature = "mimalloc")]
+        {
+            // Declared by hand for the reason `mi_collect` is in `mcp::memory`:
+            // `libmimalloc-sys` binds only the allocation calls, the archive it
+            // links has the rest.
+            unsafe extern "C" {
+                fn mi_is_in_heap_region(p: *const std::ffi::c_void) -> bool;
+            }
+            let probe = vec![0u8; 4096];
+            // SAFETY: only compares the address against mimalloc's regions.
+            let owned =
+                unsafe { mi_is_in_heap_region(probe.as_ptr().cast::<std::ffi::c_void>()) };
+            assert!(owned, "the mimalloc build allocates outside mimalloc's heap");
+        }
+        println!(
+            "allocator {allocator}, MALLOC_ARENA_MAX={}",
+            std::env::var("MALLOC_ARENA_MAX").unwrap_or_else(|_| "unset".to_owned())
+        );
+
+        let gib = |bytes: i64| bytes as f64 / (1u64 << 30) as f64;
+        // One line per portrait: `held`, then every line of the shipped cut.
+        let portrait = |service: &mut SemanticService, stage: &str| -> i64 {
+            let report = service
+                .memory_breakdown(&project, 0)
+                .expect("the probe project is loaded");
+            let process = report.process.expect("a portrait on linux");
+            let lines: Vec<String> = process
+                .lines
+                .iter()
+                .map(|line| format!("{} {:.2}", line.owner, gib(line.bytes)))
+                .collect();
+            println!(
+                "{stage:<16} held {:.2} GiB | {}",
+                gib(process.held_bytes),
+                lines.join(" | ")
+            );
+            process.held_bytes
+        };
+
+        let mut service = SemanticService::new();
+        let started = Instant::now();
+        let found = service
+            .find_references_by_name_with_exact(&project, &symbol, true)
+            .expect("reference search on the probe workspace");
+        println!(
+            "load: {} location(s) for `{symbol}` in {:.1} s",
+            found.len(),
+            started.elapsed().as_secs_f64()
+        );
+        assert!(!found.is_empty(), "`{symbol}` has no references: the load inferred nothing");
+        portrait(&mut service, "loaded");
+        crate::mcp::memory::release_and_measure();
+        let loaded_floor = portrait(&mut service, "loaded+release");
+
+        // (operation, milliseconds), in call order.
+        let mut latencies: Vec<(String, u128)> = Vec::new();
+        let mut rounds = 0;
+        let work_started = Instant::now();
+        while work_started.elapsed() < work_time {
+            service.collect_garbage();
+            for name in &work {
+                let started = Instant::now();
+                let found = service
+                    .find_references_by_name_with_exact(&project, name, true)
+                    .expect("reference search on the probe workspace");
+                assert!(!found.is_empty(), "work symbol `{name}` has no references");
+                latencies.push((format!("refs {name}"), started.elapsed().as_millis()));
+            }
+            let started = Instant::now();
+            service
+                .symbol_search(&project, "Point", 16)
+                .expect("symbol search on the probe workspace");
+            latencies.push(("symbols Point".to_owned(), started.elapsed().as_millis()));
+            rounds += 1;
+        }
+        portrait(&mut service, "worked");
+        crate::mcp::memory::release_and_measure();
+        let worked_floor = portrait(&mut service, "worked+release");
+
+        println!("work: {rounds} round(s) in {:.0} s", work_started.elapsed().as_secs_f64());
+        // Per operation: the first call (after the load, cold for that name)
+        // apart from the median of the rest, which ran after a collection.
+        let mut operations: Vec<&str> = latencies.iter().map(|(op, _)| op.as_str()).collect();
+        operations.dedup();
+        operations.sort_unstable();
+        operations.dedup();
+        for op in operations {
+            let mut ms: Vec<u128> =
+                latencies.iter().filter(|(o, _)| o == op).map(|(_, ms)| *ms).collect();
+            let first = ms.remove(0);
+            ms.sort_unstable();
+            let median = ms.get(ms.len() / 2).copied();
+            println!(
+                "latency {op:<28} first {first:>7} ms, median of the rest {:>7} ms over {} call(s)",
+                median.map_or("-".to_owned(), |ms| ms.to_string()),
+                ms.len()
+            );
+        }
+        // The peak is the other end of the trade: an allocator that settles
+        // lower but reserves more on the way up needs that headroom on the
+        // machine all the same.
+        let peak = std::fs::read_to_string("/proc/self/status")
+            .expect("status readable on linux")
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:").map(str::trim).map(str::to_owned))
+            .expect("VmHWM in /proc/self/status");
+        println!(
+            "floor: {:.2} GiB after load, {:.2} GiB after work; peak RSS {peak}",
+            gib(loaded_floor),
+            gib(worked_floor)
+        );
+        assert!(rounds > 0, "the work phase ran no round");
     }
 
     fn env_usize(name: &str, default: usize) -> usize {

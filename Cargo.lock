@@ -7151,6 +7151,7 @@ dependencies = [
  "libc",
  "libmimalloc-sys",
  "load-cargo",
+ "mimalloc",
  "num_cpus",
  "project-model",
  "rmc-config",
