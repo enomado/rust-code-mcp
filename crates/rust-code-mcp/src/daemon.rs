@@ -1617,10 +1617,11 @@ pub const EXIT_BUDGET: Duration = Duration::from_secs(20);
 /// The bound is the point. By the time this runs the socket file is gone, so
 /// the next client already starts a successor; a daemon that lingers here
 /// holds its whole analysis next to that successor's fresh copy. Measured
-/// 2026-10-21: pid 466024 got SIGTERM at 23:54 with rust_app loaded and an
+/// 2026-10-21: a daemon got SIGTERM with a large workspace loaded and an
 /// incremental sync re-embedding hundreds of files; the successor bound the
-/// address at 00:01, and the old process was still indexing at 14 GB RSS
-/// minutes later. `shutdown_gracefully` aborts its task after 10 s, but its
+/// address seven minutes later, the old process was still indexing at 14 GB
+/// RSS beside it, and the successor aborted inside MIGraphX while both
+/// embedded on one GPU. `shutdown_gracefully` aborts its task after 10 s, but its
 /// `clear(All)` takes `lock_all`, which waits for every workspace lock — and
 /// an in-flight sync (`SyncManager`) or a client's tool call holds one for as
 /// long as its work takes.
