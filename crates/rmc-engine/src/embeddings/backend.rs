@@ -218,6 +218,13 @@ impl EmbeddingBackend {
         )
     }
 
+    /// Whether a run of this backend executes on the GPU: the fastembed GPU
+    /// runtimes plus Qwen3 on CUDA. Decides who takes the cross-process GPU
+    /// lock (`gpu_lock`).
+    pub fn runs_on_gpu(&self) -> bool {
+        self.is_fastembed_onnx_gpu() || self.runtime == EmbeddingRuntime::LocalQwen3CandleCuda
+    }
+
     pub fn format_query(&self, text: &str) -> String {
         self.profile.query_policy.format_query(text)
     }
@@ -473,6 +480,23 @@ mod tests {
         );
         assert_eq!(Qwen3Variant::Embedding4B.dim(), 2560);
         assert_eq!(Qwen3Variant::Embedding8B.dim(), 4096);
+    }
+
+    /// Exactly the profiles whose runs execute on a GPU take the cross-process
+    /// GPU lock; a CPU or remote profile waiting behind another daemon's GPU
+    /// batch would be a slowdown with no crash to prevent.
+    #[test]
+    fn only_gpu_profiles_take_the_gpu_lock() {
+        for profile in EmbeddingProfile::built_in_profiles().iter().cloned() {
+            let backend = EmbeddingBackend::from_profile(profile);
+            let gpu = matches!(
+                backend.runtime,
+                EmbeddingRuntime::LocalQwen3CandleCuda
+                    | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+                    | EmbeddingRuntime::LocalFastembedOnnxDirectml
+            );
+            assert_eq!(backend.runs_on_gpu(), gpu, "{:?}", backend.runtime);
+        }
     }
 
     #[test]

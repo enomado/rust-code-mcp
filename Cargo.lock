@@ -7060,6 +7060,7 @@ dependencies = [
  "candle-core 0.10.2",
  "directories",
  "fastembed",
+ "fs2",
  "futures",
  "hf-hub",
  "lancedb",

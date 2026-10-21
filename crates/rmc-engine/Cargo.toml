@@ -14,6 +14,7 @@ embeddings = [
   "dep:tokio",
   "dep:futures",
   "dep:toml",
+  "dep:fs2",
   "fastembed/hf-hub-native-tls",
   # Use ORT at build/link time instead of dlopening libonnxruntime.so at runtime.
   # Plain Cargo builds download the CPU ORT archive; Nix builds override this
@@ -103,6 +104,8 @@ thiserror   = { workspace = true }
 tracing     = { workspace = true }
 tokio       = { workspace = true, optional = true }
 futures     = { workspace = true, optional = true }
+# embeddings/gpu_lock.rs — one process at a time on the GPU (flock).
+fs2         = { workspace = true, optional = true }
 toml        = { workspace = true, optional = true }
 
 # vector_store/ — LanceDB-backed vector storage
