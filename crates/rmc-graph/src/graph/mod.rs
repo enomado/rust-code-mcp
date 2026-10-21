@@ -22,6 +22,7 @@ mod labels;
 mod loader;
 mod math;
 pub mod model;
+mod ownership;
 mod query;
 mod recursion_check;
 mod signatures;
@@ -77,4 +78,4 @@ pub use snapshot::{
     clear_all_workspace_snapshots, clear_workspace_snapshots, open_current,
     open_current_for_workspace,
 };
-pub use storage::{GraphEnvOptions, GraphPaths};
+pub use storage::{DbTag, GraphEnvOptions, GraphPaths};

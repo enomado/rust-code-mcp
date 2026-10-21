@@ -44,11 +44,14 @@ pub(crate) fn shared_snapshot() -> &'static OpenedSnapshot {
 /// Write a two-crate workspace into `root`: `alpha` (a library with a module,
 /// a struct with inherent methods and an associated const, a trait and its
 /// impl, an enum, a `static`) and `beta`, which depends on `alpha` by path and
-/// uses all of it from inside functions.
+/// uses all of it from inside functions. Both import `std`'s `HashMap`, only
+/// `beta` imports `BTreeSet` and `mem::swap`: external stubs with two owning
+/// crates and with one, and a stub that carries a signature.
 ///
 /// Small enough to load in seconds, and shaped so that every snapshot table
 /// gets rows — cross-crate usages, usages inside function bodies, use-bindings,
-/// signatures, static metadata. No registry dependencies, so it loads offline.
+/// signatures, static metadata, stub owners. No registry dependencies, so it
+/// loads offline (`std` comes from the sysroot).
 pub(crate) fn write_two_crate_fixture(root: &Path) {
     const FILES: &[(&str, &str)] = &[
         (
@@ -70,7 +73,17 @@ edition = "2021"
             "alpha/src/lib.rs",
             r#"pub mod shapes;
 
+use std::collections::HashMap;
+
 pub static ORIGIN_NAME: &str = "origin";
+
+pub fn tally(xs: &[i32]) -> HashMap<i32, usize> {
+    let mut out = HashMap::new();
+    for &x in xs {
+        *out.entry(x).or_insert(0) += 1;
+    }
+    out
+}
 
 pub trait Area {
     fn area(&self) -> f64;
@@ -128,6 +141,23 @@ alpha = { path = "../alpha" }
             "beta/src/lib.rs",
             r#"use alpha::shapes::{Kind, Square};
 use alpha::Area;
+use std::collections::{BTreeSet, HashMap};
+use std::mem::swap;
+
+pub fn distinct(xs: &[i32]) -> BTreeSet<i32> {
+    xs.iter().copied().collect()
+}
+
+pub fn ordered(mut a: i32, mut b: i32) -> (i32, i32) {
+    if a > b {
+        swap(&mut a, &mut b);
+    }
+    (a, b)
+}
+
+pub fn tallied(xs: &[i32]) -> HashMap<i32, usize> {
+    alpha::tally(xs)
+}
 
 pub fn total(sides: &[f64]) -> f64 {
     sides.iter().map(|&s| Square::new(s).area()).sum()

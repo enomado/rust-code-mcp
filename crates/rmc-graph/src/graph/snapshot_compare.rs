@@ -32,95 +32,24 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use anyhow::{Context, Result, bail};
-use heed::types::{Bytes, DecodeIgnore, SerdeBincode, Str};
+use heed::types::{DecodeIgnore, SerdeBincode, Str};
 use heed::{BytesDecode, Database, RoTxn, WithoutTls};
 
 use super::ids::{BindingId, NodeId, UsageId};
 use super::model::{Binding, FunctionSignature, Node, StaticMetadata, Usage};
+use super::ownership::OwnedRow;
 use super::snapshot::OpenedSnapshot;
+use super::storage::DbTag;
 
 type RoTx<'e> = RoTxn<'e, WithoutTls>;
 
-/// One compared sub-DB of a graph snapshot.
+/// Sub-DBs that exist in every snapshot but are deliberately not compared
+/// (see the module docs for why each one). Every other sub-DB is a [`DbTag`].
 ///
-/// The declaration order is the order tables are reported in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum DbTag {
-    NodesById,
-    BindingsById,
-    BindingsByFromModule,
-    BindingsByTarget,
-    ChildrenByParent,
-    UsagesById,
-    UsagesByTarget,
-    UsagesByConsumer,
-    UsagesByConsumerFunction,
-    SignaturesByTarget,
-    StaticMetadataByTarget,
-}
-
-impl DbTag {
-    pub const ALL: [DbTag; 11] = [
-        DbTag::NodesById,
-        DbTag::BindingsById,
-        DbTag::BindingsByFromModule,
-        DbTag::BindingsByTarget,
-        DbTag::ChildrenByParent,
-        DbTag::UsagesById,
-        DbTag::UsagesByTarget,
-        DbTag::UsagesByConsumer,
-        DbTag::UsagesByConsumerFunction,
-        DbTag::SignaturesByTarget,
-        DbTag::StaticMetadataByTarget,
-    ];
-
-    /// Sub-DBs that exist in every snapshot but are deliberately not compared
-    /// (see the module docs for why each one).
-    pub const EXCLUDED: [&'static str; 2] = ["meta_by_key", "embeddings_by_target"];
-
-    /// The LMDB name of the sub-DB.
-    pub fn db_name(self) -> &'static str {
-        match self {
-            DbTag::NodesById => "nodes_by_id",
-            DbTag::BindingsById => "bindings_by_id",
-            DbTag::BindingsByFromModule => "bindings_by_from_module",
-            DbTag::BindingsByTarget => "bindings_by_target",
-            DbTag::ChildrenByParent => "children_by_parent",
-            DbTag::UsagesById => "usages_by_id",
-            DbTag::UsagesByTarget => "usages_by_target",
-            DbTag::UsagesByConsumer => "usages_by_consumer",
-            DbTag::UsagesByConsumerFunction => "usages_by_consumer_function",
-            DbTag::SignaturesByTarget => "signatures_by_target",
-            DbTag::StaticMetadataByTarget => "static_metadata_by_target",
-        }
-    }
-
-    /// The table, with its key and value types erased to raw bytes: the
-    /// oracle compares encodings, not decoded values, so a change in how a
-    /// value serializes is a difference too.
-    fn raw(self, snap: &OpenedSnapshot) -> Database<Bytes, Bytes> {
-        let dbs = &snap.dbs;
-        match self {
-            DbTag::NodesById => dbs.nodes_by_id.remap_types(),
-            DbTag::BindingsById => dbs.bindings_by_id.remap_types(),
-            DbTag::BindingsByFromModule => dbs.bindings_by_from_module,
-            DbTag::BindingsByTarget => dbs.bindings_by_target,
-            DbTag::ChildrenByParent => dbs.children_by_parent,
-            DbTag::UsagesById => dbs.usages_by_id.remap_types(),
-            DbTag::UsagesByTarget => dbs.usages_by_target,
-            DbTag::UsagesByConsumer => dbs.usages_by_consumer,
-            DbTag::UsagesByConsumerFunction => dbs.usages_by_consumer_function,
-            DbTag::SignaturesByTarget => dbs.signatures_by_target.remap_types(),
-            DbTag::StaticMetadataByTarget => dbs.static_metadata_by_target.remap_types(),
-        }
-    }
-}
-
-impl fmt::Display for DbTag {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.db_name())
-    }
-}
+/// Tables are read through [`DbTag::raw`], with key and value types erased:
+/// the oracle compares encodings, not decoded values, so a change in how a
+/// value serializes is a difference too.
+pub const EXCLUDED_TABLES: [&str; 2] = ["meta_by_key", "embeddings_by_target"];
 
 /// One row of one compared table: `(table, key bytes, value bytes)`.
 pub type SnapshotRow = (DbTag, Vec<u8>, Vec<u8>);
@@ -134,7 +63,7 @@ pub fn dump_snapshot(snap: &OpenedSnapshot) -> Result<BTreeSet<SnapshotRow>> {
     check_known_tables(snap, &rtxn)?;
     let mut rows = BTreeSet::new();
     for tag in DbTag::ALL {
-        for entry in tag.raw(snap).iter(&rtxn)? {
+        for entry in tag.raw(&snap.dbs).iter(&rtxn)? {
             let (key, value) = entry?;
             rows.insert((tag, key.to_vec(), value.to_vec()));
         }
@@ -223,8 +152,8 @@ pub fn compare_snapshots(
             left_samples: Vec::new(),
             right_samples: Vec::new(),
         };
-        let mut lit = tag.raw(left).iter(&ltxn)?;
-        let mut rit = tag.raw(right).iter(&rtxn)?;
+        let mut lit = tag.raw(&left.dbs).iter(&ltxn)?;
+        let mut rit = tag.raw(&right.dbs).iter(&rtxn)?;
         let mut l = lit.next().transpose()?;
         let mut r = rit.next().transpose()?;
         loop {
@@ -268,11 +197,11 @@ fn check_known_tables(snap: &OpenedSnapshot, rtxn: &RoTx<'_>) -> Result<()> {
     for name in sub_db_names(snap, rtxn)? {
         let name = name.as_str();
         let known =
-            DbTag::ALL.iter().any(|t| t.db_name() == name) || DbTag::EXCLUDED.contains(&name);
+            DbTag::ALL.iter().any(|t| t.db_name() == name) || EXCLUDED_TABLES.contains(&name);
         if !known {
             bail!(
                 "snapshot {} has sub-DB `{name}`, which the snapshot oracle neither compares nor \
-                 excludes; give it a `DbTag` (or list it in `DbTag::EXCLUDED` with the reason)",
+                 excludes; give it a `DbTag` (or list it in `EXCLUDED_TABLES` with the reason)",
                 snap.snapshot_dir.display()
             );
         }
@@ -335,6 +264,37 @@ impl Names<'_, '_> {
             DbTag::StaticMetadataByTarget => {
                 format!("{}: {:?}", self.node(key), decode::<StaticMetadata>(value))
             }
+            DbTag::StubOwners => format!("{} named by {}", self.node(key), self.node(value)),
+            DbTag::OwnedRowsByCrate => match OwnedRow::decode(value) {
+                Ok(row) => format!("{} owns {}", self.node(key), self.owned_row_text(&row)),
+                Err(err) => format!("{} owns <undecodable row: {err}>", self.node(key)),
+            },
+        }
+    }
+
+    /// An owned row by the names of what it points at: the key and value
+    /// of each table are rendered as that table's own rows are.
+    fn owned_row_text(&self, row: &OwnedRow) -> String {
+        let key = &row.key[..];
+        let dup = row.dup.as_ref().map(|d| &d[..]);
+        match (row.tag, dup) {
+            (
+                DbTag::NodesById | DbTag::SignaturesByTarget | DbTag::StaticMetadataByTarget,
+                None,
+            ) => format!("{} {}", row.tag, self.node(key)),
+            (DbTag::BindingsById, None) => format!("{} {}", row.tag, self.binding(key)),
+            (DbTag::UsagesById, None) => format!("{} {}", row.tag, self.usage(key)),
+            (DbTag::BindingsByFromModule | DbTag::BindingsByTarget, Some(dup)) => {
+                format!("{} {} → {}", row.tag, self.node(key), self.binding(dup))
+            }
+            (
+                DbTag::UsagesByTarget | DbTag::UsagesByConsumer | DbTag::UsagesByConsumerFunction,
+                Some(dup),
+            ) => format!("{} {} → {}", row.tag, self.node(key), self.usage(dup)),
+            (DbTag::ChildrenByParent | DbTag::StubOwners, Some(dup)) => {
+                format!("{} {} → {}", row.tag, self.node(key), self.node(dup))
+            }
+            (tag, dup) => format!("{tag} {} → {:?} <not a row shape>", hex(key), dup.map(hex)),
         }
     }
 
@@ -479,7 +439,7 @@ mod tests {
         let mut inventory = sub_db_names(&a, &a.read_txn().unwrap()).unwrap();
         inventory.sort();
         let mut expected: Vec<String> = DbTag::ALL.iter().map(|t| t.db_name().to_owned()).collect();
-        expected.extend(DbTag::EXCLUDED.iter().map(|n| n.to_string()));
+        expected.extend(EXCLUDED_TABLES.iter().map(|n| n.to_string()));
         expected.sort();
         assert_eq!(inventory, expected);
 
@@ -497,8 +457,8 @@ mod tests {
     }
 
     /// One usage struck out of an otherwise identical model shows up in the
-    /// usage table and its three indexes — and nowhere else, with the row
-    /// rendered by name.
+    /// usage table and its three indexes, plus the four ownership records of
+    /// those rows — and nowhere else, with the row rendered by name.
     #[test]
     fn a_dropped_usage_is_caught_in_exactly_the_usage_tables() {
         let workspace = tempfile::tempdir().unwrap();
@@ -536,16 +496,19 @@ mod tests {
                 DbTag::UsagesByTarget,
                 DbTag::UsagesByConsumer,
                 DbTag::UsagesByConsumerFunction,
+                DbTag::OwnedRowsByCrate,
             ],
             "unexpected tables in:\n{diff}"
         );
+        let rendered = format!("uses {target_name} at {}", dropped.file);
         for table in &diff.tables {
-            assert_eq!((table.only_in_left, table.only_in_right), (1, 0), "{diff}");
-            assert!(
-                table.left_samples[0].contains(&format!("uses {target_name} at {}", dropped.file)),
-                "row not rendered by name: {}",
-                table.left_samples[0]
-            );
+            // The usage row and its three index rows each have one ownership
+            // record, all under the consumer's crate.
+            let expected = if table.table == DbTag::OwnedRowsByCrate { 4 } else { 1 };
+            assert_eq!((table.only_in_left, table.only_in_right), (expected, 0), "{diff}");
+            for sample in &table.left_samples {
+                assert!(sample.contains(&rendered), "row not rendered by name: {sample}");
+            }
         }
     }
 

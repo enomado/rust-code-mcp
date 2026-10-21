@@ -130,14 +130,23 @@ use super::model::{Binding, EmbeddingRecord, FunctionSignature, Node, StaticMeta
 // tests, benches, and build scripts unless callers opt them in. Existing v11
 // Node records are missing the appended bincode field, so old snapshots
 // auto-rebuild via the schema-versioned graph id.
-pub(crate) const SCHEMA_VERSION: u32 = 12;
+// v13 (2026-10): every row has one owning crate, so a crate's rows can be
+// deleted and rewritten without touching anyone else's (see `ownership.rs`
+// for the rule). Two new DUP_SORT sub-DBs: `owned_rows_by_crate` (crate
+// NodeId → encoded `(DbTag, key, dup value)` of each row it owns) and
+// `stub_owners` (ExternalSymbol NodeId → crate NodeId, one per crate whose
+// bindings name the stub). No existing table changes; v12 snapshots
+// auto-rebuild because `graph_id_for` hashes `SCHEMA_VERSION`.
+pub(crate) const SCHEMA_VERSION: u32 = 13;
 pub(crate) const CURRENT_POINTER_FILENAME: &str = "CURRENT";
 pub(crate) const BUILD_LOCK_FILENAME: &str = "BUILD.lock";
 pub(crate) const SNAPSHOTS_DIRNAME: &str = "snapshots";
 pub(crate) const MANIFEST_FILENAME: &str = "manifest.json";
 
 const DEFAULT_MAP_SIZE: usize = 1 << 30; // 1 GiB
-const DEFAULT_MAX_DBS: u32 = 16;
+// v13 uses 15 named sub-DBs; the margin keeps the next table from failing
+// with MDB_DBS_FULL on open.
+const DEFAULT_MAX_DBS: u32 = 32;
 const DEFAULT_MAX_READERS: u32 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +332,13 @@ pub struct GraphDatabases {
     /// `build_hypergraph`; `semantic_overlaps` writes entries on first use
     /// and reuses them on subsequent scans of unchanged items.
     pub embeddings_by_target: Database<Bytes, SerdeBincode<EmbeddingRecord>>,
+    /// v13: ExternalSymbol NodeId → crate NodeId, DUP_SORT — every crate
+    /// whose bindings name the stub. The stub node goes when its last owner
+    /// does.
+    pub stub_owners: Database<Bytes, Bytes>,
+    /// v13: crate NodeId → `OwnedRow` encoding, DUP_SORT — the exact list of
+    /// rows to delete when that crate is rebuilt.
+    pub owned_rows_by_crate: Database<Bytes, Bytes>,
 }
 
 impl GraphDatabases {
@@ -381,6 +397,13 @@ impl GraphDatabases {
                 "embeddings_by_target",
                 false,
             )?,
+            stub_owners: open_or_create_bytes_bytes(env, wtxn, "stub_owners", true)?,
+            owned_rows_by_crate: open_or_create_bytes_bytes(
+                env,
+                wtxn,
+                "owned_rows_by_crate",
+                true,
+            )?,
         })
     }
 
@@ -426,7 +449,128 @@ impl GraphDatabases {
             embeddings_by_target: env
                 .open_database(rtxn, Some("embeddings_by_target"))?
                 .context("embeddings_by_target missing")?,
+            stub_owners: env
+                .open_database(rtxn, Some("stub_owners"))?
+                .context("stub_owners missing")?,
+            owned_rows_by_crate: env
+                .open_database(rtxn, Some("owned_rows_by_crate"))?
+                .context("owned_rows_by_crate missing")?,
         }))
+    }
+}
+
+/// One sub-DB of a snapshot that a build writes — every one except
+/// `meta_by_key` (fingerprint, graph id, counts) and `embeddings_by_target`
+/// (a query-time cache).
+///
+/// The declaration order is the order the snapshot oracle reports tables in.
+/// The discriminant is the table's code inside an `owned_rows_by_crate`
+/// value, so it is on disk: never renumber, only append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum DbTag {
+    NodesById = 1,
+    BindingsById = 2,
+    BindingsByFromModule = 3,
+    BindingsByTarget = 4,
+    ChildrenByParent = 5,
+    UsagesById = 6,
+    UsagesByTarget = 7,
+    UsagesByConsumer = 8,
+    UsagesByConsumerFunction = 9,
+    SignaturesByTarget = 10,
+    StaticMetadataByTarget = 11,
+    StubOwners = 12,
+    OwnedRowsByCrate = 13,
+}
+
+impl DbTag {
+    pub const ALL: [DbTag; 13] = [
+        DbTag::NodesById,
+        DbTag::BindingsById,
+        DbTag::BindingsByFromModule,
+        DbTag::BindingsByTarget,
+        DbTag::ChildrenByParent,
+        DbTag::UsagesById,
+        DbTag::UsagesByTarget,
+        DbTag::UsagesByConsumer,
+        DbTag::UsagesByConsumerFunction,
+        DbTag::SignaturesByTarget,
+        DbTag::StaticMetadataByTarget,
+        DbTag::StubOwners,
+        DbTag::OwnedRowsByCrate,
+    ];
+
+    /// The LMDB name of the sub-DB.
+    pub fn db_name(self) -> &'static str {
+        match self {
+            DbTag::NodesById => "nodes_by_id",
+            DbTag::BindingsById => "bindings_by_id",
+            DbTag::BindingsByFromModule => "bindings_by_from_module",
+            DbTag::BindingsByTarget => "bindings_by_target",
+            DbTag::ChildrenByParent => "children_by_parent",
+            DbTag::UsagesById => "usages_by_id",
+            DbTag::UsagesByTarget => "usages_by_target",
+            DbTag::UsagesByConsumer => "usages_by_consumer",
+            DbTag::UsagesByConsumerFunction => "usages_by_consumer_function",
+            DbTag::SignaturesByTarget => "signatures_by_target",
+            DbTag::StaticMetadataByTarget => "static_metadata_by_target",
+            DbTag::StubOwners => "stub_owners",
+            DbTag::OwnedRowsByCrate => "owned_rows_by_crate",
+        }
+    }
+
+    /// Whether one key holds many values (LMDB DUP_SORT). Deleting a row of
+    /// such a table needs the value too, not only the key.
+    pub fn is_dup_sort(self) -> bool {
+        match self {
+            DbTag::NodesById
+            | DbTag::BindingsById
+            | DbTag::UsagesById
+            | DbTag::SignaturesByTarget
+            | DbTag::StaticMetadataByTarget => false,
+            DbTag::BindingsByFromModule
+            | DbTag::BindingsByTarget
+            | DbTag::ChildrenByParent
+            | DbTag::UsagesByTarget
+            | DbTag::UsagesByConsumer
+            | DbTag::UsagesByConsumerFunction
+            | DbTag::StubOwners
+            | DbTag::OwnedRowsByCrate => true,
+        }
+    }
+
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_code(code: u8) -> Option<DbTag> {
+        DbTag::ALL.into_iter().find(|t| t.code() == code)
+    }
+
+    /// The table, with its key and value types erased to raw bytes.
+    pub fn raw(self, dbs: &GraphDatabases) -> Database<Bytes, Bytes> {
+        match self {
+            DbTag::NodesById => dbs.nodes_by_id.remap_types(),
+            DbTag::BindingsById => dbs.bindings_by_id.remap_types(),
+            DbTag::BindingsByFromModule => dbs.bindings_by_from_module,
+            DbTag::BindingsByTarget => dbs.bindings_by_target,
+            DbTag::ChildrenByParent => dbs.children_by_parent,
+            DbTag::UsagesById => dbs.usages_by_id.remap_types(),
+            DbTag::UsagesByTarget => dbs.usages_by_target,
+            DbTag::UsagesByConsumer => dbs.usages_by_consumer,
+            DbTag::UsagesByConsumerFunction => dbs.usages_by_consumer_function,
+            DbTag::SignaturesByTarget => dbs.signatures_by_target.remap_types(),
+            DbTag::StaticMetadataByTarget => dbs.static_metadata_by_target.remap_types(),
+            DbTag::StubOwners => dbs.stub_owners,
+            DbTag::OwnedRowsByCrate => dbs.owned_rows_by_crate,
+        }
+    }
+}
+
+impl std::fmt::Display for DbTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.db_name())
     }
 }
 
