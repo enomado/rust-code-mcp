@@ -854,15 +854,15 @@ mod tests {
         let crate_node = model
             .nodes
             .values()
-            .find(|n| n.kind == NodeKind::Crate && n.qualified_name == "rust_code_mcp")
-            .expect("rust_code_mcp crate node");
+            .find(|n| n.kind == NodeKind::Crate && n.qualified_name == "rmc_graph")
+            .expect("rmc_graph crate node");
 
         let root_module = model
             .nodes
             .values()
             .find(|n| {
                 n.kind == NodeKind::Module
-                    && n.qualified_name == "rust_code_mcp"
+                    && n.qualified_name == "rmc_graph"
                     && n.parent_id == Some(crate_node.id)
             })
             .expect("root module under crate");
