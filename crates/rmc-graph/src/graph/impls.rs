@@ -228,24 +228,14 @@ fn emit_assoc_item(
         format!("{parent_qual}::{name}")
     };
 
-    // NodeId scheme (per Layer 4 spec): mix workspace_hash, kind label, crate,
-    // file path, byte offset, name. The byte offset disambiguates multiple
-    // inherent impls on the same type that re-declare a same-named method.
-    let byte_offset = start.to_string();
-    let kind_label = match item_kind {
-        ItemKind::Method => "method",
-        ItemKind::AssocConst => "assoc_const",
-        ItemKind::AssocType => "assoc_type",
-        _ => unreachable!(),
-    };
-    let node_id = NodeId::from_components(&[
+    let node_id = assoc_item_node_id(
         model.workspace_hash.as_str(),
-        kind_label,
+        item_kind,
         crate_name,
         rel_path.as_str(),
-        byte_offset.as_str(),
+        start,
         name.as_str(),
-    ]);
+    );
 
     // If we somehow already have this id (re-entry during refactors), fold
     // into existing node and just register the def→node mapping.
@@ -271,6 +261,38 @@ fn emit_assoc_item(
     // canonical mapping already exists (e.g. trait fn referenced from outside
     // before trait extraction).
     def_to_node.entry(def_id).or_insert(node_id);
+}
+
+/// NodeId of a method / assoc const / assoc type of an inherent impl or a
+/// trait declaration. Minted here and recomputed by the consumer-side usages
+/// pass (`usages::TargetIds`) — keep the two on this one function.
+///
+/// Scheme (per Layer 4 spec): workspace_hash, kind label, crate, file path,
+/// byte offset of the declaration, name. The byte offset disambiguates
+/// multiple inherent impls on the same type that re-declare a same-named
+/// method.
+pub(super) fn assoc_item_node_id(
+    workspace_hash: &str,
+    item_kind: ItemKind,
+    crate_name: &str,
+    rel_path: &str,
+    start: u32,
+    name: &str,
+) -> NodeId {
+    let kind_label = match item_kind {
+        ItemKind::Method => "method",
+        ItemKind::AssocConst => "assoc_const",
+        ItemKind::AssocType => "assoc_type",
+        _ => unreachable!("assoc_item_node_id is for assoc items, got {item_kind:?}"),
+    };
+    NodeId::from_components(&[
+        workspace_hash,
+        kind_label,
+        crate_name,
+        rel_path,
+        start.to_string().as_str(),
+        name,
+    ])
 }
 
 /// v7: emit an Item node for one enum variant, parented to the host enum's
