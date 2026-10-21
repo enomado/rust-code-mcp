@@ -49,6 +49,196 @@ pub(crate) fn parse_proc_status_rss_kib(status: &str) -> Option<u64> {
     })
 }
 
+/// The process's memory split by what backs it, from `/proc/self/smaps_rollup`.
+///
+/// `rss` alone cannot be decomposed: a page of the binary and a page of salsa
+/// memo count the same in it. The split here is the first cut of any portrait —
+/// file pages belong to no allocator at all, and swapped anonymous pages belong
+/// to the heap while not being resident, so a portrait of a partly swapped
+/// daemon that summed to RSS would be summing to the wrong total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ProcessMappings {
+    pub rss_kib: u64,
+    /// Resident private anonymous memory: heaps, thread stacks, anonymous `mmap`.
+    pub anonymous_kib: u64,
+    /// Anonymous memory that is currently in swap rather than resident.
+    pub swap_kib: u64,
+}
+
+impl ProcessMappings {
+    /// Resident pages that are not anonymous: the binary and its libraries,
+    /// mapped model and index files, shared memory.
+    pub fn file_kib(&self) -> u64 {
+        self.rss_kib.saturating_sub(self.anonymous_kib)
+    }
+
+    /// Everything the process holds, resident or not — the total a portrait
+    /// has to add up to.
+    pub fn held_kib(&self) -> u64 {
+        self.rss_kib + self.swap_kib
+    }
+}
+
+/// `None` off Linux, and `None` rather than zeros when a field is missing.
+pub fn smaps_rollup() -> Option<ProcessMappings> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/smaps_rollup")
+            .ok()
+            .and_then(|text| parse_smaps_rollup(&text))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+pub(crate) fn parse_smaps_rollup(text: &str) -> Option<ProcessMappings> {
+    let field = |name: &str| {
+        text.lines().find_map(|line| {
+            let value = line.strip_prefix(name)?.strip_prefix(':')?;
+            value.split_whitespace().next()?.parse::<u64>().ok()
+        })
+    };
+    Some(ProcessMappings {
+        rss_kib: field("Rss")?,
+        anonymous_kib: field("Anonymous")?,
+        swap_kib: field("Swap")?,
+    })
+}
+
+/// Resident and swapped memory of all mappings sharing one name.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MappingUsage {
+    /// The mapped file's path, or the kernel's bracketed name (`[heap]`,
+    /// `[stack]`); unnamed anonymous mappings are all `[anonymous]`.
+    pub name: String,
+    pub mappings: usize,
+    pub rss_kib: u64,
+    pub swap_kib: u64,
+}
+
+/// The mappings holding the most memory, grouped by name, largest first.
+///
+/// Answers what `ProcessMappings` cannot: *which* file is resident (the ONNX
+/// model, an LMDB environment, a tantivy segment) and how the anonymous part
+/// splits between glibc's main heap and the rest. Empty off Linux.
+pub fn largest_mappings(top: usize) -> Vec<MappingUsage> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/smaps")
+            .map(|text| parse_smaps(&text, top))
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = top;
+        Vec::new()
+    }
+}
+
+pub(crate) fn parse_smaps(text: &str, top: usize) -> Vec<MappingUsage> {
+    let mut by_name: std::collections::HashMap<String, MappingUsage> = Default::default();
+    let mut current: Option<String> = None;
+    for line in text.lines() {
+        let mut tokens = line.split_whitespace();
+        let Some(first) = tokens.next() else { continue };
+        if !first.ends_with(':') {
+            // A mapping header: `start-end perms offset dev inode [name]`.
+            // The name may itself contain spaces, so it is the rest of the line
+            // after the fifth field rather than the sixth token.
+            let name = line
+                .splitn(6, char::is_whitespace)
+                .nth(5)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .unwrap_or("[anonymous]")
+                .to_owned();
+            by_name
+                .entry(name.clone())
+                .or_insert_with(|| MappingUsage {
+                    name: name.clone(),
+                    mappings: 0,
+                    rss_kib: 0,
+                    swap_kib: 0,
+                })
+                .mappings += 1;
+            current = Some(name);
+            continue;
+        }
+        let Some(name) = &current else { continue };
+        let value = || {
+            tokens
+                .clone()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+        };
+        let usage = by_name.get_mut(name).unwrap();
+        match first {
+            "Rss:" => usage.rss_kib += value().unwrap_or(0),
+            "Swap:" => usage.swap_kib += value().unwrap_or(0),
+            _ => {}
+        }
+    }
+    let mut usages: Vec<MappingUsage> = by_name.into_values().collect();
+    usages.sort_by(|a, b| {
+        (b.rss_kib + b.swap_kib)
+            .cmp(&(a.rss_kib + a.swap_kib))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    usages.truncate(top);
+    usages
+}
+
+/// What the allocator says about its heap: how much is handed out and how
+/// much it holds free.
+///
+/// The free part is the number nothing else can give. The heap's live objects
+/// are what the rest of a memory report tries to attribute; the free part is
+/// memory nobody owns any more and the allocator has not returned — glibc
+/// fragmentation, measured instead of inferred from RSS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct AllocatorUsage {
+    pub allocator: &'static str,
+    /// Taken from the system for the arenas (`brk` and arena `mmap`s).
+    pub arena_bytes: u64,
+    /// Chunks large enough to get an `mmap` of their own; always in use.
+    pub mmapped_bytes: u64,
+    /// Allocated and not yet freed, `mmapped_bytes` included. Chunk headers
+    /// are part of it, so it exceeds the sum of the requested sizes.
+    pub in_use_bytes: u64,
+    /// Freed into the arenas and kept there.
+    pub free_bytes: u64,
+}
+
+/// `None` where the linked allocator cannot report this.
+///
+/// With the `mimalloc` feature the heap is mimalloc's and `mallinfo2` would
+/// describe glibc's nearly empty one — a plausible-looking wrong answer, so the
+/// mimalloc build reports nothing instead; mimalloc's in-use total needs its
+/// statistics build, which is not the one linked.
+pub fn allocator_usage() -> Option<AllocatorUsage> {
+    #[cfg(all(not(feature = "mimalloc"), target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: `mallinfo2` takes no arguments and only reads the allocator's
+        // own bookkeeping under its arena locks.
+        let info = unsafe { libc::mallinfo2() };
+        let arena = info.arena as u64;
+        let mmapped = info.hblkhd as u64;
+        Some(AllocatorUsage {
+            allocator: "glibc",
+            arena_bytes: arena,
+            mmapped_bytes: mmapped,
+            in_use_bytes: info.uordblks as u64 + mmapped,
+            free_bytes: info.fordblks as u64,
+        })
+    }
+    #[cfg(not(all(not(feature = "mimalloc"), target_os = "linux", target_env = "gnu")))]
+    {
+        None
+    }
+}
+
 /// Memory the kernel estimates is available for a new workload, in KiB.
 ///
 /// `MemAvailable`, not `MemFree`: page cache and reclaimable slab are free for
@@ -213,6 +403,104 @@ mod tests {
     #[test]
     fn proc_status_parser_reports_absence_rather_than_zero() {
         assert_eq!(parse_proc_status_rss_kib("Name:\ttest\n"), None);
+    }
+
+    #[test]
+    fn smaps_rollup_parser_reads_the_three_fields() {
+        let text = "55d0-7ffd ---p 00000000 00:00 0 [rollup]\n\
+                    Rss:            10300000 kB\n\
+                    Pss_Anon:        9000000 kB\n\
+                    Anonymous:       9100000 kB\n\
+                    Swap:            1200000 kB\n";
+
+        let mappings = parse_smaps_rollup(text).expect("all fields present");
+        assert_eq!(mappings.rss_kib, 10_300_000);
+        assert_eq!(mappings.anonymous_kib, 9_100_000);
+        assert_eq!(mappings.swap_kib, 1_200_000);
+        assert_eq!(mappings.file_kib(), 1_200_000);
+        assert_eq!(mappings.held_kib(), 11_500_000);
+        // `Pss_Anon:` must not be read as `Anonymous:` or vice versa, and a
+        // missing field is absence, not zero.
+        assert_eq!(
+            parse_smaps_rollup("Rss: 1 kB\nPss_Anon: 1 kB\nSwap: 0 kB\n"),
+            None
+        );
+    }
+
+    /// Mappings group by name, names with spaces survive, unnamed ones fold
+    /// into `[anonymous]`, and only `Rss`/`Swap` are summed.
+    #[test]
+    fn smaps_parser_groups_by_name() {
+        let text = "\
+7f00-7f10 r--p 00000000 08:01 42 /models/qwen 3.onnx
+Size:               4096 kB
+Rss:                3000 kB
+Swap:                  0 kB
+7f10-7f20 rw-p 00000000 00:00 0
+Rss:                 500 kB
+Swap:                700 kB
+7f20-7f30 rw-p 00000000 00:00 0
+Rss:                 100 kB
+Swap:                 50 kB
+7f30-7f40 rw-p 00000000 00:00 0 [heap]
+Rss:                  10 kB
+Swap:                  0 kB
+VmFlags: rd wr mr mw me ac
+";
+        let usages = parse_smaps(text, 10);
+
+        assert_eq!(
+            usages,
+            vec![
+                MappingUsage {
+                    name: "/models/qwen 3.onnx".into(),
+                    mappings: 1,
+                    rss_kib: 3000,
+                    swap_kib: 0
+                },
+                MappingUsage {
+                    name: "[anonymous]".into(),
+                    mappings: 2,
+                    rss_kib: 600,
+                    swap_kib: 750
+                },
+                MappingUsage {
+                    name: "[heap]".into(),
+                    mappings: 1,
+                    rss_kib: 10,
+                    swap_kib: 0
+                },
+            ]
+        );
+        assert_eq!(parse_smaps(text, 1).len(), 1);
+    }
+
+    /// On the build that ships (glibc, no mimalloc) the allocator reports, and
+    /// what it reports is consistent with itself.
+    #[cfg(all(not(feature = "mimalloc"), target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn glibc_reports_its_heap() {
+        let held: Vec<Vec<u8>> = (0..64).map(|_| vec![1u8; 4096]).collect();
+        let usage = allocator_usage().expect("glibc build reports mallinfo2");
+
+        assert!(usage.in_use_bytes >= 64 * 4096, "{usage:?}");
+        assert!(
+            usage.in_use_bytes <= usage.arena_bytes + usage.mmapped_bytes,
+            "{usage:?}"
+        );
+        drop(held);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_process_has_a_portrait() {
+        let mappings = smaps_rollup().expect("smaps_rollup readable on linux");
+        assert!(
+            mappings.anonymous_kib > 0 && mappings.file_kib() > 0,
+            "{mappings:?}"
+        );
+        let largest = largest_mappings(5);
+        assert!(!largest.is_empty() && largest.len() <= 5);
     }
 
     #[test]

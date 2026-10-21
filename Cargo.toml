@@ -72,6 +72,9 @@ ra_ap_paths = { path = "../rust-analyzer-bur/crates/paths", package = "paths" }
 ra_ap_hir = { path = "../rust-analyzer-bur/crates/hir", package = "hir" }
 ra_ap_hir_def = { path = "../rust-analyzer-bur/crates/hir-def", package = "hir-def" }
 ra_ap_base_db = { path = "../rust-analyzer-bur/crates/base-db", package = "base-db" }
+# The process-global interners (types of the trait solver, `Symbol`), which salsa's
+# memory report cannot see; `analysis_memory` reads their sizes from here.
+ra_ap_intern = { path = "../rust-analyzer-bur/crates/intern", package = "intern" }
 
 # Persisted hypergraph store
 heed = "0.22.1"

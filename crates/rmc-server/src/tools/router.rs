@@ -287,7 +287,7 @@ impl SearchToolRouter {
 
     /// Report per-query memory of one loaded rust-analyzer analysis
     #[tool(
-        description = "Report what a LOADED rust-analyzer analysis is holding, per salsa ingredient: memo count, stack, metadata, and — for the queries that declare a heap size — the heap behind them, largest first. Reads a live analysis and refuses to load one, because a database built to answer the question measures a cold start instead of the daemon. `heap` is absent where nothing measures it (counted, not weighed) and a lower bound where present, so compare `accounted_bytes` against `rss_kib` rather than treating it as a budget."
+        description = "Report what a LOADED rust-analyzer analysis is holding, per salsa ingredient: memo count, stack, metadata, and — for the queries that declare a heap size — the heap behind them, largest first. Reads a live analysis and refuses to load one, because a database built to answer the question measures a cold start instead of the daemon. `heap` is absent where nothing measures it (counted, not weighed) and a lower bound where present, so compare `accounted_bytes` against `rss_kib` rather than treating it as a budget. `process` covers the whole daemon: `lines` partition rss + swap into file mappings, anonymous memory outside the allocator, allocator free space (fragmentation), salsa of every loaded project, rust-analyzer's global interners, and the unattributed rest; plus the interners and the largest mappings by name. `top` also caps those two lists."
     )]
     async fn analysis_memory(
         &self,

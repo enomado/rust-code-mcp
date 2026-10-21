@@ -194,6 +194,171 @@ pub struct ProjectMemoryReport {
     pub accounted_bytes: usize,
     /// Sorted by known bytes, largest first; truncated to the caller's `top`.
     pub rows: Vec<IngredientMemory>,
+    /// The whole process, not this project: where every byte it holds goes.
+    /// Absent where `/proc` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessPortrait>,
+}
+
+/// The daemon's memory as lines that add up to what it holds (`rss + swap`).
+///
+/// # How the lines are cut
+///
+/// Top-down, each line a part of the one above it that can be *measured*
+/// rather than inferred:
+///
+/// ```text
+/// held = file mappings                       (smaps: Rss − Anonymous)
+///      + anonymous, of which
+///          outside the allocator             (anonymous + swap − arenas − mmapped chunks)
+///          free in the allocator             (mallinfo2: fordblks)
+///          in use, of which
+///              salsa, every loaded project   (ingredient rows, as in `rows`)
+///              rust-analyzer's interners     (`intern::interner_memory`)
+///              unattributed                  (the rest, named as such)
+/// ```
+///
+/// The last line is the finding, not a rounding error: it is heap in use whose
+/// owner nothing measures yet — salsa memos without a `heap_size`, the search
+/// index, the embedder. "Outside the allocator" can be negative: arena space
+/// glibc reserved but never touched is in `arenas` without being resident or
+/// swapped.
+///
+/// Without allocator statistics (the `mimalloc` build) the middle splits
+/// disappear and the unattributed line is everything anonymous that salsa and
+/// the interners do not explain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProcessPortrait {
+    pub mappings: crate::mcp::memory::ProcessMappings,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocator: Option<crate::mcp::memory::AllocatorUsage>,
+    /// Loaded analyses whose salsa ingredients are in the `salsa` line.
+    pub salsa_projects: usize,
+    pub lines: Vec<PortraitLine>,
+    /// `rss + swap` in bytes; `lines` add up to exactly this.
+    pub held_bytes: i64,
+    /// Largest first, truncated to the caller's `top`.
+    pub interners: Vec<InternerRow>,
+    /// Largest first, truncated to the caller's `top`.
+    pub largest_mappings: Vec<crate::mcp::memory::MappingUsage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PortraitLine {
+    pub owner: &'static str,
+    pub bytes: i64,
+    pub what: &'static str,
+}
+
+/// One process-global interner of rust-analyzer; see `intern::InternerMemory`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InternerRow {
+    pub name: &'static str,
+    pub gc: bool,
+    pub count: usize,
+    pub table_bytes: usize,
+    pub value_bytes: usize,
+}
+
+/// Owner names of the portrait lines, shared with the test that reads them.
+const LINE_FILE: &str = "file_mappings";
+const LINE_OUTSIDE: &str = "anonymous_outside_allocator";
+const LINE_FREE: &str = "allocator_free";
+const LINE_SALSA: &str = "salsa";
+const LINE_INTERNERS: &str = "interners";
+const LINE_UNATTRIBUTED: &str = "unattributed";
+
+/// Cut the process's memory into lines; see [`ProcessPortrait`].
+///
+/// `salsa_bytes` is the sum of [`IngredientMemory::bytes`] over every loaded
+/// analysis — the process portrait has to see all of them, not the one the
+/// rows describe.
+fn process_portrait(
+    salsa_projects: usize,
+    salsa_bytes: usize,
+    top: usize,
+) -> Option<ProcessPortrait> {
+    use crate::mcp::memory;
+
+    let mappings = memory::smaps_rollup()?;
+    let allocator = memory::allocator_usage();
+    let interner_rows = ra_ap_intern::interner_memory();
+    let interner_bytes: usize = interner_rows.iter().map(|row| row.bytes()).sum();
+
+    let kib = |kib: u64| (kib * 1024) as i64;
+    let held_anonymous = kib(mappings.anonymous_kib + mappings.swap_kib);
+    let salsa = salsa_bytes as i64;
+    let interners = interner_bytes as i64;
+
+    let mut lines = vec![PortraitLine {
+        owner: LINE_FILE,
+        bytes: kib(mappings.file_kib()),
+        what: "resident file and shared mappings: the binary and its libraries, mapped model \
+               and index files",
+    }];
+    let in_use = match allocator {
+        Some(allocator) => {
+            lines.push(PortraitLine {
+                owner: LINE_OUTSIDE,
+                bytes: held_anonymous - (allocator.arena_bytes + allocator.mmapped_bytes) as i64,
+                what: "anonymous memory (resident or swapped) the allocator did not hand out: \
+                       thread stacks, runtimes mapping their own memory; negative when arenas \
+                       hold reserved pages never touched",
+            });
+            lines.push(PortraitLine {
+                owner: LINE_FREE,
+                bytes: allocator.free_bytes as i64,
+                what: "freed into the allocator's arenas and kept: fragmentation",
+            });
+            allocator.in_use_bytes as i64
+        }
+        None => held_anonymous,
+    };
+    lines.push(PortraitLine {
+        owner: LINE_SALSA,
+        bytes: salsa,
+        what: "salsa ingredients of every loaded analysis: stack, metadata and measured heap",
+    });
+    lines.push(PortraitLine {
+        owner: LINE_INTERNERS,
+        bytes: interners,
+        what: "rust-analyzer's process-global interners: trait-solver types, Symbol, ModPath",
+    });
+    lines.push(PortraitLine {
+        owner: LINE_UNATTRIBUTED,
+        bytes: in_use - salsa - interners,
+        what: if allocator.is_some() {
+            "heap in use whose owner is not measured: salsa memos without heap_size, the \
+             search index, the embedder, the graph"
+        } else {
+            "anonymous memory salsa and the interners do not explain (no allocator statistics \
+             in this build, so fragmentation is in here too)"
+        },
+    });
+
+    let mut interners: Vec<InternerRow> = interner_rows
+        .into_iter()
+        .map(|row| InternerRow {
+            name: row.name,
+            gc: row.gc,
+            count: row.count,
+            table_bytes: row.table_bytes,
+            value_bytes: row.value_bytes,
+        })
+        .collect();
+    if top > 0 {
+        interners.truncate(top);
+    }
+
+    Some(ProcessPortrait {
+        held_bytes: kib(mappings.held_kib()),
+        mappings,
+        allocator,
+        salsa_projects,
+        lines,
+        interners,
+        largest_mappings: memory::largest_mappings(if top > 0 { top } else { usize::MAX }),
+    })
 }
 
 /// Flatten salsa's two families — interned/tracked structs and query memo
@@ -450,6 +615,10 @@ impl SemanticService {
     /// `metadata_bytes` only — enough to say which memos are numerous, never
     /// how many bytes they are worth. `accounted_bytes` against RSS is printed
     /// precisely so the gap cannot be mistaken for a full budget.
+    ///
+    /// `process` is where that gap goes: the whole daemon cut into lines that
+    /// add up to `rss + swap`, salsa of every loaded project being one of them —
+    /// see [`ProcessPortrait`].
     pub(crate) fn memory_breakdown(
         &mut self,
         project: &Path,
@@ -472,9 +641,21 @@ impl SemanticService {
                 if loaded.is_empty() { "nothing".to_owned() } else { loaded.join(", ") }
             );
         }
-        let ctx = self.projects.get_mut(&canonical).unwrap();
+        // Every loaded analysis is weighed, not just the one asked about: the
+        // process portrait below has to see all of them, and the rows of the
+        // requested one fall out of the same pass.
+        let mut salsa_bytes = 0;
+        let mut requested = None;
+        for (path, ctx) in self.projects.iter_mut() {
+            let rows = ingredient_rows(&mut ctx.host);
+            salsa_bytes += rows.iter().map(IngredientMemory::bytes).sum::<usize>();
+            if *path == canonical {
+                requested = Some(rows);
+            }
+        }
+        let mut rows = requested.unwrap();
+        let process = process_portrait(self.projects.len(), salsa_bytes, top);
 
-        let mut rows = ingredient_rows(&mut ctx.host);
         let instances = rows.iter().map(|row| row.count).sum();
         let accounted_bytes = rows.iter().map(IngredientMemory::bytes).sum();
         let ingredients = rows.len();
@@ -491,6 +672,7 @@ impl SemanticService {
             instances,
             accounted_bytes,
             rows,
+            process,
         })
     }
 
@@ -1954,6 +2136,84 @@ pub fn a_local_of_the_same_name() -> u32 {
             call_sites(&before),
             "collecting garbage must not change what the analysis knows, got {after:?}"
         );
+    }
+
+    /// The process portrait adds up to what the process holds, and each line it
+    /// names is really measured.
+    ///
+    /// The sum alone proves nothing — `unattributed` is the remainder by
+    /// construction, so any wrong line is silently absorbed by it. What can
+    /// fail is the other direction: salsa plus the interners must fit inside
+    /// the heap in use (double counting, or a byte count of the wrong thing,
+    /// overshoots it), and every measured line must be non-zero on a database
+    /// that has done real work (a line that stopped measuring reads as zero).
+    #[test]
+    fn the_process_portrait_adds_up_and_names_its_parts() {
+        let _sweep = sweeping_alone();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        one_crate_workspace(root);
+
+        let mut service = SemanticService::new();
+        let found = service
+            .find_references_by_name_with_exact(root, "target", true)
+            .expect("a query that fills the database");
+        assert_eq!(
+            call_sites(&found),
+            1,
+            "positive control: the fixture has one call site"
+        );
+
+        let report = service
+            .memory_breakdown(root, 10)
+            .expect("loaded project reports");
+        let process = report.process.expect("linux has a portrait");
+        let line = |owner: &str| {
+            process
+                .lines
+                .iter()
+                .find(|line| line.owner == owner)
+                .unwrap_or_else(|| panic!("no `{owner}` line in {:?}", process.lines))
+                .bytes
+        };
+
+        assert_eq!(
+            process.lines.iter().map(|line| line.bytes).sum::<i64>(),
+            process.held_bytes,
+            "the lines are a partition of rss + swap"
+        );
+        assert_eq!(process.salsa_projects, 1);
+        assert_eq!(
+            line(LINE_SALSA),
+            report.accounted_bytes as i64,
+            "with one project loaded the salsa line is that project's accounted bytes"
+        );
+        for owner in [LINE_FILE, LINE_SALSA, LINE_INTERNERS, LINE_UNATTRIBUTED] {
+            assert!(
+                line(owner) > 0,
+                "`{owner}` measured nothing: {:?}",
+                process.lines
+            );
+        }
+        assert!(
+            process
+                .interners
+                .iter()
+                .any(|row| row.name.contains("TyInterned") && row.count > 0),
+            "a reference search infers bodies, so the solver's type interner must be populated: \
+             {:?}",
+            process.interners
+        );
+        if let Some(allocator) = process.allocator {
+            assert!(
+                (line(LINE_SALSA) + line(LINE_INTERNERS)) as u64 <= allocator.in_use_bytes,
+                "salsa and the interners claim more than the heap has in use — something is \
+                 counted twice: {:?} vs {allocator:?}",
+                process.lines
+            );
+            assert!(line(LINE_FREE) >= 0);
+        }
+        assert!(!process.largest_mappings.is_empty() && process.largest_mappings.len() <= 10);
     }
 
     /// Does rust-analyzer *leak*, or does the allocator merely keep what it
