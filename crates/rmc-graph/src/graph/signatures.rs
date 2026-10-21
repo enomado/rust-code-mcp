@@ -223,7 +223,7 @@ mod tests {
     fn functions_with_filter_smoke_async() {
         let snap = shared_snapshot();
         let (root_id, root_node) = snap
-            .lookup_by_qualified_name("rust_code_mcp")
+            .lookup_by_qualified_name("rmc_server")
             .unwrap()
             .unwrap();
         let crate_id = match root_node.kind {
@@ -242,7 +242,7 @@ mod tests {
             .expect("functions_with_filter failed");
         assert!(
             !matches.is_empty(),
-            "expected at least one async fn in rust_code_mcp"
+            "expected at least one async fn in rmc_server"
         );
         for m in &matches {
             assert!(
@@ -257,7 +257,7 @@ mod tests {
     fn functions_with_filter_smoke_min_params() {
         let snap = shared_snapshot();
         let (root_id, root_node) = snap
-            .lookup_by_qualified_name("rust_code_mcp")
+            .lookup_by_qualified_name("rmc_server")
             .unwrap()
             .unwrap();
         let crate_id = match root_node.kind {
@@ -282,7 +282,7 @@ mod tests {
     fn functions_with_filter_smoke_self_kind() {
         let snap = shared_snapshot();
         let (root_id, root_node) = snap
-            .lookup_by_qualified_name("rust_code_mcp")
+            .lookup_by_qualified_name("rmc_server")
             .unwrap()
             .unwrap();
         let crate_id = match root_node.kind {
@@ -312,7 +312,7 @@ mod tests {
     fn functions_with_filter_async_total_exceeds_default_limit() {
         let snap = shared_snapshot();
         let (root_id, root_node) = snap
-            .lookup_by_qualified_name("rust_code_mcp")
+            .lookup_by_qualified_name("rmc_server")
             .unwrap()
             .unwrap();
         let crate_id = match root_node.kind {
