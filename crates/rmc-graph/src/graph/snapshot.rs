@@ -30,6 +30,7 @@ use super::extract;
 use super::ids::{BindingId, NodeId, UsageId};
 use super::loader::{self, LoadedWorkspace};
 use super::model::{Binding, ExtractionModel, Namespace, Usage};
+use super::ownership;
 use super::storage::{
     CURRENT_POINTER_FILENAME, GraphDatabases, GraphEnvOptions, GraphManifest, GraphPaths,
     SCHEMA_VERSION, compute_fingerprint, default_data_dir, graph_id_for, read_manifest,
@@ -417,75 +418,20 @@ fn write_model(
     let mut wtxn = env.write_txn().context("open write txn")?;
     let dbs = GraphDatabases::create(env, &mut wtxn)?;
 
-    // 1. Nodes
-    for node in model.nodes.values() {
-        dbs.nodes_by_id
-            .put(&mut wtxn, node.id.as_bytes(), node)
-            .context("put node")?;
+    // 1–4. Every row, each with its owning crate (v13, `ownership.rs`).
+    let written = ownership::write_owned_rows(&mut wtxn, &dbs, model, &|_| true)?;
+    // Only nodes can be skipped by a full write — a stub no binding names
+    // has no owner and is not written. The count is what the manifest has
+    // always reported, so a gap here is a node the snapshot lost.
+    if written.nodes != model.nodes.len() as u64 {
+        bail!(
+            "full write put {} of the model's {} nodes; the rest have no owning crate",
+            written.nodes,
+            model.nodes.len()
+        );
     }
-    let node_count = model.nodes.len() as u64;
-
-    // 2. Bindings + per-target/per-from-module indexes
-    let mut binding_count: u64 = 0;
-    for binding in &model.bindings {
-        let bid = binding_id_for(binding);
-        // primary record
-        dbs.bindings_by_id
-            .put(&mut wtxn, bid.as_bytes(), binding)
-            .context("put binding")?;
-        // index from_module → bid
-        dbs.bindings_by_from_module
-            .put(&mut wtxn, binding.from_module.as_bytes(), bid.as_bytes())?;
-        // index target → bid
-        dbs.bindings_by_target
-            .put(&mut wtxn, binding.target.as_bytes(), bid.as_bytes())?;
-        binding_count += 1;
-    }
-
-    // 3. Contains hierarchy
-    for &(parent, child) in &model.contains {
-        dbs.children_by_parent
-            .put(&mut wtxn, parent.as_bytes(), child.as_bytes())?;
-    }
-
-    // 4. Usages + per-target/per-consumer indexes
-    let mut usage_count: u64 = 0;
-    for usage in &model.usages {
-        let uid = usage_id_for(usage);
-        dbs.usages_by_id
-            .put(&mut wtxn, uid.as_bytes(), usage)
-            .context("put usage")?;
-        dbs.usages_by_target
-            .put(&mut wtxn, usage.target.as_bytes(), uid.as_bytes())?;
-        dbs.usages_by_consumer
-            .put(&mut wtxn, usage.consumer_module.as_bytes(), uid.as_bytes())?;
-        if let Some(consumer_fn) = usage.consumer_function {
-            dbs.usages_by_consumer_function.put(
-                &mut wtxn,
-                consumer_fn.as_bytes(),
-                uid.as_bytes(),
-            )?;
-        }
-        usage_count += 1;
-    }
-
-    // 4b. Signatures (v9): one bincode-encoded FunctionSignature per
-    // local function NodeId. No DUP_SORT — one entry per fn. No new
-    // index tables; lookups are direct via `signatures_by_target.get(node_id)`.
-    for (target, sig) in &model.signatures {
-        dbs.signatures_by_target
-            .put(&mut wtxn, target.as_bytes(), sig)
-            .context("put signature")?;
-    }
-
-    // 4c. Static metadata (v10): one bincode-encoded StaticMetadata per
-    // local `static` NodeId. No DUP_SORT — one entry per static. Lookups
-    // are direct via `static_metadata_by_target.get(node_id)`.
-    for (target, meta) in &model.statics {
-        dbs.static_metadata_by_target
-            .put(&mut wtxn, target.as_bytes(), meta)
-            .context("put static metadata")?;
-    }
+    let (node_count, binding_count, usage_count) =
+        (written.nodes, written.bindings, written.usages);
 
     // 5. Meta
     dbs.meta_by_key
