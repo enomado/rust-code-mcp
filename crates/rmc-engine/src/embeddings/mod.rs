@@ -33,6 +33,8 @@ pub use ep_census::{ProviderCensus, CPU_EP, DIRECTML_EP, MIGRAPHX_EP};
 
 mod kernel_cache;
 
+mod gpu_lock;
+
 mod fastembed_onnx;
 
 /// Census of graph nodes per execution provider, taken from one profiled
@@ -266,11 +268,15 @@ impl EmbeddingGenerator {
         side: EmbedSide,
         texts: Arc<Vec<String>>,
     ) -> Result<Vec<Embedding>, EmbeddingError> {
+        // Taken inside each blocking task, for exactly one run of the model;
+        // see `gpu_lock` for why another process's run must not overlap it.
+        let on_gpu = self.backend.runs_on_gpu();
         match &self.inner {
             #[cfg(feature = "embeddings-cuda")]
             EmbeddingGeneratorInner::Qwen3(inner) => {
                 let inner = inner.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _gpu = on_gpu.then(gpu_lock::GpuLock::acquire).transpose()?;
                     let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
                     match side {
                         EmbedSide::Documents => inner.embed_documents(&refs),
@@ -283,6 +289,7 @@ impl EmbeddingGenerator {
             EmbeddingGeneratorInner::FastembedOnnx(inner) => {
                 let inner = inner.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _gpu = on_gpu.then(gpu_lock::GpuLock::acquire).transpose()?;
                     let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
                     match side {
                         EmbedSide::Documents => inner.embed_documents(&refs),
