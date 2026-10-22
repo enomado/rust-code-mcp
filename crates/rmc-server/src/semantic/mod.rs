@@ -3345,6 +3345,91 @@ pub fn a_local_of_the_same_name() -> u32 {
         );
     }
 
+    /// What the crate def maps of a workspace are made of, field by field
+    /// (`hir_def::heap_size::DefMapCensus`): the `DefMapPair` row of the
+    /// memory report split into the containers that hold it, each with the
+    /// bytes `heap_size` charges against what its elements alone take, plus
+    /// the item-scope names by origin (own, import, glob) and the heaviest
+    /// crates. The question is whether the bytes are a hole of form (spare
+    /// capacity, a container that should not exist) or simply the names.
+    ///
+    /// ```text
+    /// RMC_DEF_MAP_PROJECT=/home/user/project \
+    ///   cargo test --release -p rmc-server --lib -- --ignored --nocapture def_map_composition
+    /// ```
+    #[test]
+    #[ignore = "needs a real workspace in RMC_DEF_MAP_PROJECT and minutes to run"]
+    fn def_map_composition() {
+        use ra_ap_hir_def::heap_size::{DefMapCensus, Weight};
+        use ra_ap_ide_db::base_db::all_crates;
+        let _sweep = sweeping_alone();
+        let project = PathBuf::from(
+            std::env::var("RMC_DEF_MAP_PROJECT")
+                .unwrap_or_else(|_| panic!("set RMC_DEF_MAP_PROJECT: the probe has no default")),
+        );
+
+        let mut service = SemanticService::new();
+        let started = std::time::Instant::now();
+        service.get_or_load_full(&project).expect("load the probe workspace");
+        println!("load: {:.1} s", started.elapsed().as_secs_f64());
+
+        let canonical = project.canonicalize().expect("canonicalize the probe workspace");
+        let db = service.projects[&canonical].host.raw_database();
+        let mut census = DefMapCensus::default();
+        let mut per_crate: Vec<(usize, String, usize)> = Vec::new();
+        for &krate in all_crates(db).iter() {
+            let before = census.bytes();
+            let modules = census.modules;
+            census.add_crate(db, krate);
+            let name = krate
+                .extra_data(db)
+                .display_name
+                .as_ref()
+                .map_or_else(|| format!("{krate:?}"), |name| name.to_string());
+            per_crate.push((census.bytes() - before, name, census.modules - modules));
+        }
+        assert!(
+            census.def_maps > 0 && census.bytes() > 0,
+            "no def map weighed: the census measured nothing"
+        );
+
+        let mib = |bytes: usize| bytes as f64 / (1u64 << 20) as f64;
+        let total = census.bytes();
+        println!(
+            "{} def maps, {} modules, {:.1} MiB charged",
+            census.def_maps,
+            census.modules,
+            mib(total)
+        );
+        let mut rows: Vec<(&str, Weight)> =
+            census.rows.iter().map(|(row, weight)| (*row, *weight)).collect();
+        rows.sort_by_key(|(_, weight)| std::cmp::Reverse(weight.bytes));
+        println!(
+            "{:<42} {:>9} {:>11} {:>10} {:>10} {:>6}",
+            "row", "containers", "entries", "MiB", "filled MiB", "fill"
+        );
+        for (row, weight) in rows {
+            if weight.bytes == 0 {
+                continue;
+            }
+            println!(
+                "{row:<42} {:>9} {:>11} {:>10.1} {:>10.1} {:>5.0}%",
+                weight.containers,
+                weight.entries,
+                mib(weight.bytes),
+                mib(weight.filled_bytes),
+                100.0 * weight.filled_bytes as f64 / weight.bytes as f64
+            );
+        }
+        for (origin, entries) in &census.scope_entries_by_origin {
+            println!("scope entries {origin:<22} {entries:>11}");
+        }
+        per_crate.sort_by_key(|(bytes, ..)| std::cmp::Reverse(*bytes));
+        for (bytes, name, modules) in per_crate.iter().take(25) {
+            println!("crate {name:<40} {modules:>6} module(s) {:>8.1} MiB", mib(*bytes));
+        }
+    }
+
     /// What an LRU capacity on `MacroCallId::macro_arg` buys and costs.
     ///
     /// The argument token trees are the second largest salsa line of the live

@@ -7147,6 +7147,7 @@ dependencies = [
  "anyhow",
  "directories",
  "heed",
+ "hir-def",
  "ide",
  "ide-db",
  "intern",
