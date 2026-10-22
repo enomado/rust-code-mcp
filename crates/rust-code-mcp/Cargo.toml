@@ -106,6 +106,17 @@ directml = ["rmc-server/directml"]
 # `MIMALLOC_PURGE_DELAY=0`, which otherwise works: there it returned 860 MB
 # by itself, without our call.
 #
+# Measured again 2026-10-22 on a ~49 000-file workspace (mimalloc 3.3,
+# `allocator_floor_after_load_and_work`: load, then 5 min of collections and
+# reference searches), GiB, comparable runs:
+#
+#               | peak load | held after load+release | after work+release
+#   glibc+trim  |      7.85 |                    6.16 |  5.55-5.67
+#   mimalloc    |      6.60 |                    6.89 |  6.21-7.16
+#
+# Lower peak, higher floor, and `mi_collect` released nothing (see
+# `release_free_memory`). Latency on par. Still lost.
+#
 # The feature is kept because the verdict is tied to THIS workload and this machine:
 # under a different profile (many workspaces, long lifetime, a different allocation stream)
 # the picture may flip. But the default is the system allocator.
