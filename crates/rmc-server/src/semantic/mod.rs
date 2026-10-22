@@ -3345,6 +3345,150 @@ pub fn a_local_of_the_same_name() -> u32 {
         );
     }
 
+    /// What an LRU capacity on `MacroCallId::macro_arg` buys and costs.
+    ///
+    /// The argument token trees are the second largest salsa line of the live
+    /// daemon on a large workspace (0.42 million memos, 0.27 GB of heap) and,
+    /// upstream, never evicted. The fork caps them; this prices the cap at
+    /// both ends, one capacity per run, set at load with `RMC_LRU_CAPS`
+    /// (`MacroCallId::macro_arg_=0` is upstream's unbounded cache):
+    ///
+    /// * bytes — the `macro_arg` heap after a collection, and the portrait;
+    /// * reads — reference searches after a collection, the daemon's steady
+    ///   state: an evicted argument is rebuilt only if its expansion was
+    ///   evicted too and something asks for it again;
+    /// * edits — the part the cap really charges. An evicted argument cannot
+    ///   backdate (salsa compares against the old value, and there is none),
+    ///   so an edit to a calling file re-expands its calls where the unbounded
+    ///   cache stops at the argument. Each file in `RMC_MACRO_ARG_EDIT` gets a
+    ///   trailing comment, then the first work search is timed against the
+    ///   same search after a plain collection.
+    ///
+    /// The project is MUTATED (each edit is undone after its query), so point
+    /// it at a scratch copy.
+    ///
+    /// ```text
+    /// RMC_LRU_CAPS=MacroCallId::macro_arg_=0 \
+    /// RMC_MACRO_ARG_PROJECT=/scratch/copy RMC_MACRO_ARG_SYMBOL=OneDeclManyUses \
+    /// RMC_MACRO_ARG_WORK=A,B RMC_MACRO_ARG_EDIT=src/a.rs,src/b.rs \
+    ///   cargo test --release -p rmc-server --lib -- --ignored --nocapture macro_arg_capacity
+    /// ```
+    #[test]
+    #[ignore = "mutates the workspace in RMC_MACRO_ARG_PROJECT and takes minutes"]
+    fn macro_arg_capacity_prices_reads_and_edits() {
+        use std::time::Instant;
+        let _sweep = sweeping_alone();
+        let required = |name: &str| {
+            std::env::var(name).unwrap_or_else(|_| panic!("set {name}: the probe has no default"))
+        };
+        let list = |name: &str| -> Vec<String> {
+            required(name)
+                .split(',')
+                .map(|it| it.trim().to_owned())
+                .filter(|it| !it.is_empty())
+                .collect()
+        };
+        let project = PathBuf::from(required("RMC_MACRO_ARG_PROJECT"));
+        let symbol = required("RMC_MACRO_ARG_SYMBOL");
+        let work = list("RMC_MACRO_ARG_WORK");
+        let edits = list("RMC_MACRO_ARG_EDIT");
+        assert!(!work.is_empty() && !edits.is_empty(), "name work symbols and files to edit");
+        let rounds = env_usize("RMC_MACRO_ARG_ROUNDS", 5);
+        println!(
+            "{}={}",
+            loader::QUERY_LRU_CAPS_ENV,
+            std::env::var(loader::QUERY_LRU_CAPS_ENV).unwrap_or_else(|_| "unset".to_owned())
+        );
+
+        const WEIGHED: [&str; 3] = [
+            "MacroCallId::macro_arg_",
+            "MacroCallId::parse_macro_expansion_",
+            "EditionedFileId::parse_",
+        ];
+        let weigh = |service: &mut SemanticService, stage: &str| {
+            let report = service.memory_breakdown(&project, 0).expect("the probe project is loaded");
+            let cells: Vec<String> = WEIGHED
+                .iter()
+                .map(|query| {
+                    let row = report
+                        .rows
+                        .iter()
+                        .find(|row| row.name == *query)
+                        .unwrap_or_else(|| panic!("no `{query}` row: the probe loaded nothing"));
+                    let heap = row.heap_bytes.unwrap_or_else(|| panic!("`{query}` reports no heap"));
+                    format!("{query} {} memos {:.1} MiB", row.count, heap as f64 / (1u64 << 20) as f64)
+                })
+                .collect();
+            println!("{stage:<14} {}", cells.join(" | "));
+        };
+        let refs = |service: &mut SemanticService, name: &str| {
+            let started = Instant::now();
+            let found = service
+                .find_references_by_name_with_exact(&project, name, true)
+                .expect("reference search on the probe workspace");
+            assert!(!found.is_empty(), "`{name}` has no references");
+            (found, started.elapsed().as_millis())
+        };
+        let median = |mut ms: Vec<u128>| {
+            ms.sort_unstable();
+            ms[ms.len() / 2]
+        };
+
+        let mut service = SemanticService::new();
+        let (found, load_ms) = refs(&mut service, &symbol);
+        println!("load + refs {symbol}: {:.1} s, peak RSS {}", load_ms as f64 / 1000.0, vm_hwm());
+        print_answer(&format!("refs {symbol}"), &found);
+        weigh(&mut service, "loaded");
+        service.collect_garbage();
+        weigh(&mut service, "collected");
+        crate::mcp::memory::release_and_measure();
+        print_portrait(&mut service, &project, "collected+rel");
+
+        let mut reads: Vec<Vec<u128>> = vec![Vec::new(); work.len()];
+        for round in 0..rounds {
+            for (name, ms) in work.iter().zip(reads.iter_mut()) {
+                service.collect_garbage();
+                let (found, took) = refs(&mut service, name);
+                ms.push(took);
+                if round == 0 {
+                    print_answer(&format!("refs {name}"), &found);
+                }
+            }
+        }
+        for (name, ms) in work.iter().zip(&reads) {
+            println!("read  refs {name:<24} median {:>6} ms over {} call(s)", median(ms.clone()), ms.len());
+        }
+        weigh(&mut service, "after reads");
+
+        let mut edited_ms = Vec::new();
+        for file in &edits {
+            let path = project.join(file);
+            let original = std::fs::read_to_string(&path).expect("read the file to edit");
+            service.collect_garbage();
+            std::fs::write(&path, format!("{original}\n// macro_arg capacity probe\n"))
+                .expect("edit the file");
+            let (found, took) = refs(&mut service, &work[0]);
+            edited_ms.push(took);
+            println!("edit  {file:<40} then refs {}: {took:>6} ms", work[0]);
+            print_answer(&format!("refs {} after edit", work[0]), &found);
+            std::fs::write(&path, original).expect("undo the edit");
+            // Settle the undo before the next file, so its query does not pay
+            // for two edits.
+            refs(&mut service, &work[0]);
+        }
+        println!(
+            "edit  median {:>6} ms against read median {:>6} ms for refs {}",
+            median(edited_ms),
+            median(reads[0].clone()),
+            work[0]
+        );
+        weigh(&mut service, "after edits");
+        service.collect_garbage();
+        crate::mcp::memory::release_and_measure();
+        print_portrait(&mut service, &project, "end+rel");
+        println!("peak RSS {}", vm_hwm());
+    }
+
     fn env_usize(name: &str, default: usize) -> usize {
         std::env::var(name)
             .ok()
