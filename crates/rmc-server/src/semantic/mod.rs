@@ -3367,6 +3367,11 @@ pub fn a_local_of_the_same_name() -> u32 {
     /// The project is MUTATED (each edit is undone after its query), so point
     /// it at a scratch copy.
     ///
+    /// Any other capped query is priced the same way: name it in `RMC_LRU_CAPS`
+    /// and list the rows to weigh in `RMC_LRU_PROBE_WEIGH` (comma-separated
+    /// salsa names; default the three above). The edit appends a comment at the
+    /// end of the file, so it shifts no item — the usual keystroke.
+    ///
     /// ```text
     /// RMC_LRU_CAPS=MacroCallId::macro_arg_=0 \
     /// RMC_MACRO_ARG_PROJECT=/scratch/copy RMC_MACRO_ARG_SYMBOL=OneDeclManyUses \
@@ -3400,14 +3405,22 @@ pub fn a_local_of_the_same_name() -> u32 {
             std::env::var(loader::QUERY_LRU_CAPS_ENV).unwrap_or_else(|_| "unset".to_owned())
         );
 
-        const WEIGHED: [&str; 3] = [
-            "MacroCallId::macro_arg_",
-            "MacroCallId::parse_macro_expansion_",
-            "EditionedFileId::parse_",
-        ];
+        // The rows to weigh at each stage: the macro trio by default, any other
+        // capped query (and its `of`) through `RMC_LRU_PROBE_WEIGH`, so the same
+        // probe prices the next cap without a copy of itself.
+        let weighed: Vec<String> = match std::env::var("RMC_LRU_PROBE_WEIGH") {
+            Ok(_) => list("RMC_LRU_PROBE_WEIGH"),
+            Err(_) => [
+                "MacroCallId::macro_arg_",
+                "MacroCallId::parse_macro_expansion_",
+                "EditionedFileId::parse_",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+        };
         let weigh = |service: &mut SemanticService, stage: &str| {
             let report = service.memory_breakdown(&project, 0).expect("the probe project is loaded");
-            let cells: Vec<String> = WEIGHED
+            let cells: Vec<String> = weighed
                 .iter()
                 .map(|query| {
                     let row = report
