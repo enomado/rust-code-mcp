@@ -2862,8 +2862,10 @@ pub fn a_local_of_the_same_name() -> u32 {
             assert!(owned, "the mimalloc build allocates outside mimalloc's heap");
         }
         println!(
-            "allocator {allocator}, MALLOC_ARENA_MAX={}",
-            std::env::var("MALLOC_ARENA_MAX").unwrap_or_else(|_| "unset".to_owned())
+            "allocator {allocator}, MALLOC_ARENA_MAX={}, {}={}",
+            std::env::var("MALLOC_ARENA_MAX").unwrap_or_else(|_| "unset".to_owned()),
+            loader::PRIME_BATCH_FILES_ENV,
+            std::env::var(loader::PRIME_BATCH_FILES_ENV).unwrap_or_else(|_| "unset".to_owned())
         );
 
         let portrait =
@@ -2880,6 +2882,10 @@ pub fn a_local_of_the_same_name() -> u32 {
             started.elapsed().as_secs_f64()
         );
         assert!(!found.is_empty(), "`{symbol}` has no references: the load inferred nothing");
+        print_answer(&format!("refs {symbol}"), &found);
+        // The load's own peak, apart from the whole run's printed at the end:
+        // the priming mode changes this one.
+        println!("peak RSS after load {}", vm_hwm());
         portrait(&mut service, "loaded");
         crate::mcp::memory::release_and_measure();
         let loaded_floor = portrait(&mut service, "loaded+release");
@@ -2897,12 +2903,18 @@ pub fn a_local_of_the_same_name() -> u32 {
                     .expect("reference search on the probe workspace");
                 assert!(!found.is_empty(), "work symbol `{name}` has no references");
                 latencies.push((format!("refs {name}"), started.elapsed().as_millis()));
+                if rounds == 0 {
+                    print_answer(&format!("refs {name}"), &found);
+                }
             }
             let started = Instant::now();
-            service
+            let found = service
                 .symbol_search(&project, "Point", 16)
                 .expect("symbol search on the probe workspace");
             latencies.push(("symbols Point".to_owned(), started.elapsed().as_millis()));
+            if rounds == 0 {
+                print_answer("symbols Point", &found);
+            }
             rounds += 1;
         }
         portrait(&mut service, "worked");
@@ -2931,17 +2943,45 @@ pub fn a_local_of_the_same_name() -> u32 {
         // The peak is the other end of the trade: an allocator that settles
         // lower but reserves more on the way up needs that headroom on the
         // machine all the same.
-        let peak = std::fs::read_to_string("/proc/self/status")
+        println!(
+            "floor: {:.2} GiB after load, {:.2} GiB after work; peak RSS {}",
+            gib(loaded_floor),
+            gib(worked_floor),
+            vm_hwm()
+        );
+        assert!(rounds > 0, "the work phase ran no round");
+    }
+
+    /// The process's peak RSS so far, as `/proc/self/status` prints it.
+    fn vm_hwm() -> String {
+        std::fs::read_to_string("/proc/self/status")
             .expect("status readable on linux")
             .lines()
             .find_map(|line| line.strip_prefix("VmHWM:").map(str::trim).map(str::to_owned))
-            .expect("VmHWM in /proc/self/status");
-        println!(
-            "floor: {:.2} GiB after load, {:.2} GiB after work; peak RSS {peak}",
-            gib(loaded_floor),
-            gib(worked_floor)
-        );
-        assert!(rounds > 0, "the work phase ran no round");
+            .expect("VmHWM in /proc/self/status")
+    }
+
+    /// One answer as a count and a fingerprint of its sorted locations, so two
+    /// runs of a probe (two allocators, two priming modes) can be checked to
+    /// have answered the same, not only to have cost differently.
+    fn print_answer(operation: &str, found: &[Location]) {
+        use std::hash::{Hash, Hasher};
+        let mut keys: Vec<String> = found
+            .iter()
+            .map(|l| format!("{}:{}:{}:{}", l.file_path.display(), l.line, l.column, l.name))
+            .collect();
+        keys.sort_unstable();
+        // `RMC_ANSWER_DUMP_DIR=<dir>`: the sorted locations themselves, one
+        // file per operation, for diffing two runs whose fingerprints differ.
+        if let Ok(dir) = std::env::var("RMC_ANSWER_DUMP_DIR") {
+            let file = PathBuf::from(dir).join(operation.replace(' ', "_"));
+            std::fs::write(&file, keys.join("\n")).expect("write the answer dump");
+        }
+        // `DefaultHasher::new()` has fixed keys: the same binary prints the
+        // same fingerprint for the same answer in every run.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        keys.hash(&mut hasher);
+        println!("answer {operation:<28} {:>6} location(s), fingerprint {:016x}", keys.len(), hasher.finish());
     }
 
     fn gib(bytes: i64) -> f64 {
