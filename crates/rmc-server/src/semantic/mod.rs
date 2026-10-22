@@ -608,6 +608,55 @@ impl SemanticService {
         count
     }
 
+    /// Unload every context whose database read a dependency's source back
+    /// from disk and found it changed since the load (see
+    /// `loader::file_text_store`); returns `"<project>: <what changed>"` for
+    /// each.
+    ///
+    /// Such a context can answer nothing that touches that file — the text its
+    /// syntax and item trees were built from is gone — and nothing inside
+    /// rust-analyzer can repair an input mid-query. Unloading it makes the next
+    /// call load the workspace afresh, against the files as they are now.
+    pub(crate) fn unload_drifted(&mut self) -> Vec<String> {
+        let drifted: Vec<(PathBuf, String)> = self
+            .projects
+            .iter()
+            .filter_map(|(path, ctx)| {
+                let drift = ctx.host.raw_database().file_text_drift()?;
+                Some((path.clone(), drift))
+            })
+            .collect();
+        drifted
+            .into_iter()
+            .map(|(path, drift)| {
+                self.projects.remove(&path);
+                format!("{}: {drift}", path.display())
+            })
+            .collect()
+    }
+
+    /// A context built by hand, for a test that needs a database no workspace
+    /// on disk would produce.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, path: PathBuf, host: AnalysisHost) {
+        self.clock += 1;
+        self.projects.insert(
+            path,
+            ProjectContext {
+                host,
+                vfs: Vfs::default(),
+                load_kind: LoadKind::Full,
+                stamps: HashMap::new(),
+                last_used: self.clock,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_database_for_test(&self, path: &Path) -> &ra_ap_ide_db::RootDatabase {
+        self.projects[path].host.raw_database()
+    }
+
     pub(crate) fn clear_project(&mut self, project_path: &Path) -> usize {
         let canonical =
             std::fs::canonicalize(project_path).unwrap_or_else(|_| project_path.to_path_buf());
