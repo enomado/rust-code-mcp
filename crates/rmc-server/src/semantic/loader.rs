@@ -121,6 +121,10 @@ fn load_unprimed(path: &Path, cargo_config: &CargoConfig) -> Result<(RootDatabas
         .ok()
         .and_then(|it| it.parse::<u16>().ok());
     let mut db = RootDatabase::new(lru_cap);
+    apply_query_lru_capacities(
+        &mut db,
+        &parse_query_lru_capacities(std::env::var(QUERY_LRU_CAPS_ENV).ok().as_deref())?,
+    )?;
     if let Some(store) = file_text_store()? {
         db.set_file_text_store(store);
     }
@@ -128,6 +132,55 @@ fn load_unprimed(path: &Path, cargo_config: &CargoConfig) -> Result<(RootDatabas
         load_workspace_into_db(workspace, &cargo_config.extra_env, &load_config, &mut db)
             .context("Failed to load workspace")?;
     Ok((db, vfs))
+}
+
+/// Per-query LRU capacities applied at load, before any memo exists:
+/// `RMC_LRU_CAPS=MacroCallId::macro_arg_=0,EditionedFileId::parse_=64`. The
+/// names are salsa `debug_name`s exactly as `lru_capacity_names()` gives them
+/// (an associated query carries a trailing `_`); `0` disables eviction. This is
+/// rust-analyzer's `lruQueryCapacities` for the daemon, and the knob a capacity
+/// sweep turns: set at load, because a capacity changed afterwards cannot
+/// bring back what the load already evicted, and a zero set afterwards forgets
+/// the use order (see `lru_sweep`).
+pub(crate) const QUERY_LRU_CAPS_ENV: &str = "RMC_LRU_CAPS";
+
+/// `name=capacity` pairs, comma-separated; unset or empty is no override.
+fn parse_query_lru_capacities(value: Option<&str>) -> Result<Vec<(String, usize)>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            // `rsplit_once`: a self type in a name may hold `=`-free generics
+            // and spaces, but the capacity is always the last field.
+            let (name, capacity) = pair.rsplit_once('=').with_context(|| {
+                format!("{QUERY_LRU_CAPS_ENV}: `{pair}` is not `query_name=capacity`")
+            })?;
+            let capacity = capacity.trim().parse::<usize>().with_context(|| {
+                format!("{QUERY_LRU_CAPS_ENV}: the capacity in `{pair}` is not a whole number")
+            })?;
+            Ok((name.trim().to_owned(), capacity))
+        })
+        .collect()
+}
+
+/// A name that matches no tunable query is an error, not a no-op: a probe run
+/// under a misspelt name would price the default and report it as the override.
+fn apply_query_lru_capacities(db: &mut RootDatabase, capacities: &[(String, usize)]) -> Result<()> {
+    for (name, capacity) in capacities {
+        if salsa::Database::set_lru_capacity_by_name(db, name, *capacity) == 0 {
+            anyhow::bail!(
+                "{QUERY_LRU_CAPS_ENV}: no query named `{name}` has a tunable LRU capacity; \
+                 tunable names are {:?}",
+                salsa::Database::lru_capacity_names(db)
+            );
+        }
+        tracing::info!("LRU capacity of `{name}` set to {capacity} ({QUERY_LRU_CAPS_ENV})");
+    }
+    Ok(())
 }
 
 /// Off-switch for keeping file texts out of the heap: `RMC_FILE_TEXTS=heap`
@@ -430,5 +483,35 @@ mod tests {
                 "{on:?} is not an off-switch and must leave build scripts on"
             );
         }
+    }
+
+    /// A per-query capacity lands on the query it names, and a name that
+    /// matches nothing fails the load instead of pricing the default under the
+    /// override's label.
+    #[test]
+    fn query_lru_capacities_apply_by_name_and_refuse_a_stranger() {
+        use super::{apply_query_lru_capacities, parse_query_lru_capacities};
+
+        assert!(parse_query_lru_capacities(None).expect("unset").is_empty());
+        assert!(parse_query_lru_capacities(Some(" ")).expect("blank").is_empty());
+        assert_eq!(
+            parse_query_lru_capacities(Some("MacroCallId::macro_arg_=0, EditionedFileId::parse_=64"))
+                .expect("two pairs"),
+            vec![
+                ("MacroCallId::macro_arg_".to_owned(), 0),
+                ("EditionedFileId::parse_".to_owned(), 64)
+            ]
+        );
+        assert!(parse_query_lru_capacities(Some("MacroCallId::macro_arg_")).is_err());
+        assert!(parse_query_lru_capacities(Some("MacroCallId::macro_arg_=lots")).is_err());
+
+        let mut db = ra_ap_ide_db::RootDatabase::new(None);
+        // The query this knob was added for has to be tunable at all: without
+        // the fork's `lru` attribute it is not, and the override fails loudly.
+        apply_query_lru_capacities(&mut db, &[("MacroCallId::macro_arg_".to_owned(), 0)])
+            .expect("`macro_arg` carries an LRU in the fork");
+        let error = apply_query_lru_capacities(&mut db, &[("MacroCallId::macro_arg".to_owned(), 1)])
+            .expect_err("the name without salsa's trailing `_` matches nothing");
+        assert!(error.to_string().contains("MacroCallId::macro_arg_"), "{error}");
     }
 }
