@@ -3198,7 +3198,8 @@ pub fn a_local_of_the_same_name() -> u32 {
     /// The stages: `loaded` is right after the workspace load (project model,
     /// VFS, crate graph, salsa inputs and the cache prefill the loader runs),
     /// before any query of ours; `queried` is after one reference search, the
-    /// state the earlier probes weighed. The `unattributed` line of each,
+    /// state the earlier probes weighed; `collected` is after a garbage
+    /// collection on top of that, the daemon's steady state. The `unattributed` line of each,
     /// against the other, says whether the unowned heap comes with the load or
     /// with the queries.
     ///
@@ -3275,6 +3276,12 @@ pub fn a_local_of_the_same_name() -> u32 {
         );
         assert!(!found.is_empty(), "`{symbol}` has no references: the query inferred nothing");
         stage_done(&mut service, "queried");
+
+        // The daemon's steady state: what is left once a collection has
+        // evicted the LRU-capped memos — the heap salsa's own bookkeeping is
+        // weighed against (`salsa-overhead-census`).
+        service.collect_garbage();
+        stage_done(&mut service, "collected");
     }
 
     /// Whose file texts the database holds: library or workspace roots, and
