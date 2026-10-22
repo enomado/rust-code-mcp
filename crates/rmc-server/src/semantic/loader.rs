@@ -26,7 +26,7 @@ pub(crate) fn load_project(path: &Path) -> Result<(AnalysisHost, Vfs)> {
 
 /// Load a Cargo project with full workspace dependency edges for rename.
 pub(super) fn load_project_full(path: &Path) -> Result<(AnalysisHost, Vfs)> {
-    load_project_with_config(path, full_workspace_cargo_config())
+    load_project_with_config(path, full_workspace_cargo_config()?)
 }
 
 fn fast_project_cargo_config() -> CargoConfig {
@@ -37,14 +37,42 @@ fn fast_project_cargo_config() -> CargoConfig {
     }
 }
 
-fn full_workspace_cargo_config() -> CargoConfig {
-    CargoConfig {
+fn full_workspace_cargo_config() -> Result<CargoConfig> {
+    Ok(CargoConfig {
         sysroot: Some(RustLibSource::Discover),
         no_deps: false,
         features: CargoFeatures::All,
         all_targets: true,
         set_test: true,
+        load_weak_only_optional_deps: parse_weak_optional_deps(
+            std::env::var(WEAK_OPTIONAL_DEPS_ENV).ok().as_deref(),
+        )?,
         ..Default::default()
+    })
+}
+
+/// On-switch for loading the optional dependencies cargo never builds:
+/// `RMC_LOAD_WEAK_OPTIONAL_DEPS=1` loads them, as it was before.
+///
+/// # What they are
+///
+/// `cargo metadata` lists an optional dependency that only a weak `dep?/feat`
+/// feature names, though no build compiles it (`cargo tree` leaves it out).
+/// nalgebra 0.34's default `std` names glam 0.14 … 0.32 that way. On a large
+/// workspace that was 74 of 2023 packages — 18 glam versions alone ≈ 90 MiB of
+/// def maps, plus item trees, signatures and trait impls every crate depending
+/// on nalgebra had in scope. rust-analyzer now drops them; see
+/// `project_model::unbuilt_optional_deps`.
+pub(crate) const WEAK_OPTIONAL_DEPS_ENV: &str = "RMC_LOAD_WEAK_OPTIONAL_DEPS";
+
+/// Default is off, like cargo; `1` is the only other setting.
+fn parse_weak_optional_deps(value: Option<&str>) -> Result<bool> {
+    match value.map(str::trim) {
+        None => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => {
+            anyhow::bail!("{WEAK_OPTIONAL_DEPS_ENV}={other:?}: the only setting is `1`")
+        }
     }
 }
 
@@ -408,8 +436,11 @@ mod tests {
         );
         write_file(&root.join("top/src/lib.rs"), "pub use base::Base;\n");
 
-        let (db, _vfs) =
-            load_unprimed(root, &full_workspace_cargo_config()).expect("load the fixture");
+        let (db, _vfs) = load_unprimed(
+            root,
+            &full_workspace_cargo_config().expect("the default config"),
+        )
+        .expect("load the fixture");
         let all = all_crates(&db);
         let budget = 50;
         let batches = prime_batches(&db, &all, budget);
@@ -483,6 +514,85 @@ mod tests {
                 "{on:?} is not an off-switch and must leave build scripts on"
             );
         }
+    }
+
+    /// Unset means "like cargo" — the fix ships on; a misspelt value fails
+    /// the load instead of silently meaning one or the other.
+    #[test]
+    fn weak_optional_deps_stay_out_unless_switched_on() {
+        use super::parse_weak_optional_deps;
+
+        assert!(!parse_weak_optional_deps(None).expect("unset"));
+        assert!(parse_weak_optional_deps(Some("1")).expect("on"));
+        assert!(parse_weak_optional_deps(Some(" 1 ")).expect("on, padded"));
+        for bad in ["0", "yes", "true", ""] {
+            assert!(
+                parse_weak_optional_deps(Some(bad)).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// The switch reaches rust-analyzer: a dependency outside the workspace
+    /// names an optional `weak_only` only as `weak_only?/std`, which cargo
+    /// never builds. Loaded by default it is no crate; with the switch it is,
+    /// as before. The second load is the vacuity check: without it a fixture
+    /// cargo never put into the metadata would pass too.
+    #[test]
+    fn weak_only_optional_deps_are_no_crates_unless_switched_on() {
+        let _analysis = crate::deep_stack::test_holding_an_analysis();
+        let fixture = tempfile::tempdir().expect("create fixture tempdir");
+        let root = fixture.path();
+        let package = |name: &str| {
+            format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+        };
+        write_file(
+            &root.join("ws/Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\nresolver = \"2\"\n",
+        );
+        write_file(
+            &root.join("ws/app/Cargo.toml"),
+            &(package("app") + "\n[dependencies]\nfacade = { path = \"../../facade\" }\n"),
+        );
+        write_file(&root.join("ws/app/src/lib.rs"), "pub use facade::*;\n");
+        write_file(
+            &root.join("facade/Cargo.toml"),
+            &(package("facade")
+                + "\n[dependencies]\nweak_only = { path = \"../weak_only\", optional = true }\n\n\
+                   [features]\ndefault = [\"std\"]\nstd = [\"weak_only?/std\"]\n"),
+        );
+        write_file(&root.join("facade/src/lib.rs"), "pub struct Facade;\n");
+        write_file(
+            &root.join("weak_only/Cargo.toml"),
+            &(package("weak_only") + "\n[features]\nstd = []\n"),
+        );
+        write_file(&root.join("weak_only/src/lib.rs"), "pub struct WeakOnly;\n");
+
+        let crate_names = |load_weak: bool| -> HashSet<String> {
+            let config = ra_ap_project_model::CargoConfig {
+                // The sysroot adds nothing to the question and costs a load.
+                sysroot: None,
+                load_weak_only_optional_deps: load_weak,
+                ..full_workspace_cargo_config().expect("the default config")
+            };
+            let (db, _vfs) = load_unprimed(&root.join("ws"), &config).expect("load the fixture");
+            all_crates(&db)
+                .iter()
+                .filter_map(|krate| {
+                    let name = krate.extra_data(&db).display_name.as_ref()?;
+                    Some(name.to_string())
+                })
+                .collect()
+        };
+
+        let default = crate_names(false);
+        assert!(
+            default.contains("app") && default.contains("facade"),
+            "{default:?}"
+        );
+        assert!(!default.contains("weak_only"), "{default:?}");
+        let switched_on = crate_names(true);
+        assert!(switched_on.contains("weak_only"), "{switched_on:?}");
     }
 
     /// A per-query capacity lands on the query it names, and a name that
