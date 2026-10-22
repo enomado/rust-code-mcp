@@ -3093,6 +3093,67 @@ pub fn a_local_of_the_same_name() -> u32 {
         stage_done(&mut service, "queried");
     }
 
+    /// Whose file texts the database holds: library or workspace roots, and
+    /// whether the file is a module of any crate at all.
+    ///
+    /// `FileText` is a salsa input — no LRU, alive as long as the database —
+    /// and the loader puts every `.rs` file of every package root into it,
+    /// whether a crate's module tree reaches it or not (a dependency's tests,
+    /// benches, examples). This splits the bytes by those two axes, which is
+    /// what decides the lever: texts no module reaches are only read by
+    /// `include!` and friends, library texts never change.
+    ///
+    /// ```text
+    /// RMC_FILE_TEXT_PROJECT=/home/user/project RMC_FILE_TEXT_SYMBOL=OneDeclManyUses \
+    ///   cargo test --release -p rmc-server --lib -- --ignored --nocapture file_text_by_root_kind
+    /// ```
+    #[test]
+    #[ignore = "needs a real workspace in RMC_FILE_TEXT_PROJECT and minutes to run"]
+    fn file_text_by_root_kind() {
+        use ra_ap_ide_db::base_db::SourceDatabase;
+        let _sweep = sweeping_alone();
+        let required = |name: &str| {
+            std::env::var(name).unwrap_or_else(|_| panic!("set {name}: the probe has no default"))
+        };
+        let project = PathBuf::from(required("RMC_FILE_TEXT_PROJECT"));
+        let symbol = required("RMC_FILE_TEXT_SYMBOL");
+
+        let mut service = SemanticService::new();
+        let found = service
+            .find_references_by_name_with_exact(&project, &symbol, true)
+            .expect("reference search on the probe workspace");
+        assert!(!found.is_empty(), "`{symbol}` has no references: the load inferred nothing");
+
+        let canonical = project.canonicalize().expect("canonicalize the probe workspace");
+        let ctx = &service.projects[&canonical];
+        let db = ctx.host.raw_database();
+        let sema = ra_ap_ide::Semantics::new(db);
+        // (library root, module of some crate) -> (files, text bytes)
+        let mut split: std::collections::BTreeMap<(bool, bool), (usize, usize)> =
+            Default::default();
+        for (file, _path) in ctx.vfs.iter() {
+            let root = db.file_source_root(file).source_root_id(db);
+            let library = db.source_root(root).source_root(db).is_library;
+            let bytes = db.file_text(file).text(db).len();
+            let module = sema.file_to_module_defs(file).next().is_some();
+            let entry = split.entry((library, module)).or_default();
+            entry.0 += 1;
+            entry.1 += bytes;
+        }
+        for ((library, module), (files, bytes)) in &split {
+            println!(
+                "{:<9} {:<11} {files:>7} file(s) {:>8.1} MiB",
+                if *library { "library" } else { "workspace" },
+                if *module { "module" } else { "no module" },
+                *bytes as f64 / (1u64 << 20) as f64
+            );
+        }
+        assert!(
+            split.keys().any(|&(_, module)| module),
+            "no file is a module of any crate: the split measured nothing"
+        );
+    }
+
     fn env_usize(name: &str, default: usize) -> usize {
         std::env::var(name)
             .ok()
