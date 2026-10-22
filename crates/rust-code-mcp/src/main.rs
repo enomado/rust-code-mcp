@@ -9,6 +9,10 @@
 #[cfg(unix)]
 mod daemon;
 
+// Every Rust allocation is counted by the heap census, which is how the memory
+// portrait (`analysis_memory`) tells the allocator's own overhead and C/C++
+// allocations apart from the Rust heap; see `rmc_server::mcp::heap_census`.
+//
 // Under the `mimalloc` feature every allocation in the process — including
 // rust-analyzer's salsa database, which is what actually fills the heap — goes
 // through mimalloc instead of the system allocator. The reason is in the
@@ -16,7 +20,18 @@ mod daemon;
 // fragmented arenas and mimalloc gives them back.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
-static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL_ALLOCATOR: rmc_server::mcp::heap_census::CensusAllocator<mimalloc::MiMalloc> =
+    rmc_server::mcp::heap_census::CensusAllocator {
+        inner: mimalloc::MiMalloc,
+        census: &rmc_server::mcp::heap_census::GLOBAL_CENSUS,
+    };
+#[cfg(not(feature = "mimalloc"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: rmc_server::mcp::heap_census::CensusAllocator<std::alloc::System> =
+    rmc_server::mcp::heap_census::CensusAllocator {
+        inner: std::alloc::System,
+        census: &rmc_server::mcp::heap_census::GLOBAL_CENSUS,
+    };
 
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENABLED_VALUES, BACKGROUND_SYNC_ENV, EMBEDDING_PROFILE_ENV, ServerRuntime,
