@@ -422,9 +422,12 @@ const _MIMALLOC_LINK_ANCHOR: unsafe extern "C" fn(usize) -> *mut std::ffi::c_voi
 pub fn release_free_memory() -> bool {
     #[cfg(feature = "mimalloc")]
     {
-        // `true` = force: also return memory from thread-local heaps of threads
-        // that are still alive, which is the whole point here — the rayon pool
-        // that loaded the workspace is still parked, holding its heaps.
+        // `true` = force: free the retired pages and purge the arenas now
+        // instead of after `purge_delay`. It does NOT reach other threads'
+        // heaps: mimalloc v3 collects only the calling thread's (`theap.c`,
+        // `mi_collect`: "cannot really collect process wide"). On a workspace
+        // of ~49 000 files (`allocator_floor_after_load_and_work`, 2026-10-22) this call
+        // returned 0 bytes after the load and after the work, in every run.
         //
         // SAFETY: `mi_collect` takes no pointers and is documented as callable
         // from any thread at any time.

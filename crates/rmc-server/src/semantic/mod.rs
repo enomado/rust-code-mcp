@@ -887,6 +887,23 @@ impl SemanticService {
         // rust-analyzer was reading the workspace must come out stale on the
         // next query, not silently accepted as already analysed.
         let stamps = collect_stamps(canonical);
+        // The context being replaced (a reload after a structural change, or
+        // a Fast → Full upgrade) goes BEFORE the new one is built. Left in
+        // `projects` until `insert`, it kept a whole database alive beside
+        // the one being loaded: on salsa-bur a reload peaked +797 MiB over the
+        // 732 MiB held, on a ~49 000-file workspace ≈ 8 → 11 GiB
+        // (`reload_peak_holds_one_database`).
+        // A failed load then leaves the project unloaded rather than stale;
+        // the next call loads it again, which a stale context needed anyway.
+        //
+        // Dropping alone is half of it: the freed database sits in the arenas
+        // of the threads that built it, and the load allocates from the arenas
+        // of its own priming threads, so glibc does not reuse it (+597 MiB
+        // instead of +797 on salsa-bur). The release hands it back first.
+        if let Some(previous) = self.projects.remove(canonical) {
+            drop(previous);
+            crate::mcp::memory::release_free_memory();
+        }
         let (host, vfs) = match requested {
             LoadKind::Fast => loader::load_project(canonical)?,
             LoadKind::Full => loader::load_project_full(canonical)?,
@@ -3001,6 +3018,107 @@ pub fn a_local_of_the_same_name() -> u32 {
         assert!(rounds > 0, "the work phase ran no round");
     }
 
+    /// How high does RSS go while a project that gained a file is reloaded?
+    ///
+    /// A file added or removed under a loaded project is a structural change:
+    /// `refresh_if_stale` reloads the whole analysis. If the old database is
+    /// still in `projects` while the new one is built, the reload's peak is
+    /// both of them — on a ~49 000-file workspace the allocator probe's work phase went from
+    /// ≈ 8 to ≈ 11 GiB whenever a neighbour's edit added a file mid-run.
+    ///
+    /// The probe loads the project with the kernel's peak counter reset
+    /// (`clear_refs` 5), so the first load's climb is known; then adds a file,
+    /// queries again — which reloads — and compares the reload's peak with
+    /// that climb. One database at a time keeps the reload at the load's own
+    /// peak; two put the whole held database under it.
+    ///
+    /// The project is MUTATED (a file is added and removed again), so point it
+    /// at a scratch copy, never at a tree someone else works in.
+    ///
+    /// ```text
+    /// RMC_RELOAD_PEAK_PROJECT=/scratch/copy-of-salsa RMC_RELOAD_PEAK_SYMBOL=Revision \
+    ///   cargo test --release -p rmc-server --lib -- --ignored --nocapture reload_peak
+    /// ```
+    #[test]
+    #[ignore = "mutates the workspace in RMC_RELOAD_PEAK_PROJECT and takes minutes"]
+    fn reload_peak_holds_one_database() {
+        let _sweep = sweeping_alone();
+        let required = |name: &str| {
+            std::env::var(name).unwrap_or_else(|_| {
+                panic!(
+                    "set {name}; without it this probe would measure nothing and pass, which is \
+                     worse than not running"
+                )
+            })
+        };
+        let project = PathBuf::from(required("RMC_RELOAD_PEAK_PROJECT"));
+        let symbol = required("RMC_RELOAD_PEAK_SYMBOL");
+        let kib = |field: &str| -> i64 {
+            std::fs::read_to_string("/proc/self/status")
+                .expect("status readable on linux")
+                .lines()
+                .find_map(|line| {
+                    let value = line.strip_prefix(field)?.split_whitespace().next()?;
+                    Some(value.parse::<i64>().expect("a KiB count"))
+                })
+                .unwrap_or_else(|| panic!("{field} in /proc/self/status"))
+        };
+        let reset_peak = || std::fs::write("/proc/self/clear_refs", "5").expect("reset VmHWM");
+
+        let mut service = SemanticService::new();
+        reset_peak();
+        let started = kib("VmRSS:");
+        let first = service
+            .find_references_by_name_with_exact(&project, &symbol, true)
+            .expect("reference search on the probe workspace");
+        assert!(!first.is_empty(), "`{symbol}` has no references: the load inferred nothing");
+        // What the first load climbed by from an empty service: the most a
+        // reload holding ONE database may climb by from an empty service too.
+        let first_rise = kib("VmHWM:") - started;
+        crate::mcp::memory::release_and_measure();
+        let held = kib("VmRSS:");
+        reset_peak();
+        let baseline = kib("VmHWM:");
+
+        // A module nobody declares is still a new `.rs` file under the root:
+        // the stamps see it and the next query reloads.
+        let added = project.join("src/reload_peak_probe.rs");
+        std::fs::write(&added, "pub fn reload_peak_probe() {}\n").expect("add a file");
+        let second = service.find_references_by_name_with_exact(&project, &symbol, true);
+        std::fs::remove_file(&added).expect("remove the added file");
+        let second = second.expect("reference search after the reload");
+        let peak = kib("VmHWM:");
+        println!(
+            "first load rose {} MiB from {} MiB; held after load {} MiB; reload peak {} MiB \
+             (+{} MiB over held)",
+            first_rise / 1024,
+            started / 1024,
+            held / 1024,
+            peak / 1024,
+            (peak - baseline) / 1024
+        );
+        assert_eq!(first.len(), second.len(), "the reload changed the answer");
+        // Two databases at once put the whole held one under the new load:
+        // the peak is then `held + first_rise`. One at a time it is the load's
+        // own climb from what the service keeps without a project (`started`),
+        // plus whatever of the old database glibc and the global interners
+        // still keep. The line is drawn halfway: half the held database.
+        // salsa-bur, 2026-10-22: both alive 1529 MiB, drop only 1348, drop
+        // and release 1248, against a line of ≈ 1440.
+        let one_database = started + first_rise + (held - started) / 2;
+        assert!(
+            peak < one_database,
+            "the reload peaked at {} MiB, over the {} MiB one database at a time allows (first \
+             load +{} MiB from {} MiB, {} MiB held): the old database was still alive while \
+             the new one was built",
+            peak / 1024,
+            one_database / 1024,
+            first_rise / 1024,
+            started / 1024,
+            held / 1024
+        );
+    }
+
     /// The process's peak RSS so far, as `/proc/self/status` prints it.
     fn vm_hwm() -> String {
         std::fs::read_to_string("/proc/self/status")
@@ -3050,11 +3168,28 @@ pub fn a_local_of_the_same_name() -> u32 {
             .map(|line| format!("{} {:.2}", line.owner, gib(line.bytes)))
             .collect();
         println!(
-            "{stage:<16} held {:.2} GiB | {}",
+            "{stage:<16} held {:.2} GiB | {} | anon_huge {:.2}",
             gib(process.held_bytes),
-            lines.join(" | ")
+            lines.join(" | "),
+            gib(anon_huge_bytes())
         );
         process.held_bytes
+    }
+
+    /// Anonymous memory the kernel backs with transparent huge pages, from
+    /// `/proc/self/smaps_rollup`. Under THP `always`, khugepaged collapses a
+    /// 2 MiB range into one huge page while up to `max_ptes_none` (511) of its
+    /// 512 small pages are absent, so a heap whose holes were trimmed can be
+    /// resident again in full; this is the number that tells it.
+    fn anon_huge_bytes() -> i64 {
+        std::fs::read_to_string("/proc/self/smaps_rollup")
+            .expect("smaps_rollup readable on linux")
+            .lines()
+            .find_map(|line| {
+                let kib = line.strip_prefix("AnonHugePages:")?.split_whitespace().next()?;
+                Some(kib.parse::<i64>().expect("AnonHugePages in KiB") * 1024)
+            })
+            .expect("AnonHugePages in /proc/self/smaps_rollup")
     }
 
     /// Who owns the heap the portrait calls `unattributed` — split by stage,
