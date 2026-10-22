@@ -213,14 +213,25 @@ pub struct ProjectMemoryReport {
 ///          outside the allocator             (anonymous + swap − arenas held − mmapped chunks)
 ///          free in the allocator             (arenas held − in use in arenas)
 ///          in use, of which
-///              salsa, every loaded project   (ingredient rows, as in `rows`)
-///              rust-analyzer's interners     (`intern::interner_memory`)
-///              unattributed                  (the rest, named as such)
+///              outside the Rust heap         (in use − census chunks: C/C++ allocations)
+///              allocator overhead            (census chunks − census requested)
+///              the Rust heap, requested, of which
+///                  salsa, every loaded project   (ingredient rows, as in `rows`)
+///                  rust-analyzer's interners     (`intern::interner_memory`)
+///                  unattributed                  (the rest, named as such)
 /// ```
 ///
 /// The last line is the finding, not a rounding error: it is heap in use whose
 /// owner nothing measures yet — salsa memos without a `heap_size`, the search
 /// index, the embedder.
+///
+/// The two lines between "in use" and the Rust heap come from the heap census
+/// ([`crate::mcp::heap_census`]): `mallinfo2` counts chunks, every owner below
+/// counts requested bytes, and before the census the difference — glibc's
+/// headers and rounding, ≈ 10 % of a rust-analyzer heap made of millions of
+/// small nodes — sat in "unattributed" as if some owner were unmeasured.
+/// Without a census (a binary that does not install it) those two lines are
+/// absent and the cut is as before.
 ///
 /// "Arenas held" is the kernel's count over the arena mappings
 /// ([`crate::mcp::memory::ArenaResidency`]), not `mallinfo2`'s: glibc keeps
@@ -240,6 +251,10 @@ pub struct ProcessPortrait {
     /// exactly when `allocator` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arenas: Option<crate::mcp::memory::ArenaResidency>,
+    /// The Rust heap as the global allocator counted it; absent in a binary
+    /// that does not install the census.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub census: Option<crate::mcp::heap_census::HeapCensus>,
     /// Loaded analyses whose salsa ingredients are in the `salsa` line.
     pub salsa_projects: usize,
     pub lines: Vec<PortraitLine>,
@@ -272,6 +287,8 @@ pub struct InternerRow {
 const LINE_FILE: &str = "file_mappings";
 const LINE_OUTSIDE: &str = "anonymous_outside_allocator";
 const LINE_FREE: &str = "allocator_free";
+const LINE_FOREIGN: &str = "outside_rust_heap";
+const LINE_OVERHEAD: &str = "allocator_overhead";
 const LINE_SALSA: &str = "salsa";
 const LINE_INTERNERS: &str = "interners";
 const LINE_UNATTRIBUTED: &str = "unattributed";
@@ -290,6 +307,7 @@ fn process_portrait(
 
     let mappings = memory::smaps_rollup()?;
     let allocator = memory::allocator_usage();
+    let census = crate::mcp::heap_census::heap_census();
     let interner_rows = ra_ap_intern::interner_memory();
     let interner_bytes: usize = interner_rows.iter().map(|row| row.bytes()).sum();
 
@@ -332,6 +350,35 @@ fn process_portrait(
         }
         _ => held_anonymous,
     };
+    // What the Rust heap requested, once the allocator's view is cut down to
+    // it; see the census lines in [`ProcessPortrait`].
+    let rust_heap = match (census, census.and_then(|census| census.chunk_bytes)) {
+        (Some(census), Some(chunks)) if allocator.is_some() => {
+            lines.push(PortraitLine {
+                owner: LINE_FOREIGN,
+                bytes: in_use - chunks,
+                what: "heap in use that Rust's allocator did not hand out: C and C++ libraries \
+                       (ONNX Runtime, MIGraphX), plus chunks parked in glibc's per-thread caches",
+            });
+            lines.push(PortraitLine {
+                owner: LINE_OVERHEAD,
+                bytes: chunks - census.requested_bytes,
+                what: "glibc's chunk headers and size rounding over the Rust heap: 8 bytes a \
+                       chunk, rounded to 16, at least 32",
+            });
+            census.requested_bytes
+        }
+        (Some(census), _) if allocator.is_none() => {
+            lines.push(PortraitLine {
+                owner: LINE_FOREIGN,
+                bytes: in_use - census.requested_bytes,
+                what: "anonymous memory beyond what the Rust heap requested: the allocator's \
+                       free pages, metadata and rounding, thread stacks, C and C++ allocations",
+            });
+            census.requested_bytes
+        }
+        _ => in_use,
+    };
     lines.push(PortraitLine {
         owner: LINE_SALSA,
         bytes: salsa,
@@ -344,8 +391,11 @@ fn process_portrait(
     });
     lines.push(PortraitLine {
         owner: LINE_UNATTRIBUTED,
-        bytes: in_use - salsa - interners,
-        what: if allocator.is_some() {
+        bytes: rust_heap - salsa - interners,
+        what: if census.is_some() {
+            "Rust heap whose owner is not measured: salsa memos without heap_size, the search \
+             index, the graph, the project model"
+        } else if allocator.is_some() {
             "heap in use whose owner is not measured: salsa memos without heap_size, the \
              search index, the embedder, the graph"
         } else {
@@ -373,6 +423,7 @@ fn process_portrait(
         mappings,
         allocator,
         arenas,
+        census,
         salsa_projects,
         lines,
         interners,
@@ -2247,6 +2298,25 @@ pub fn a_local_of_the_same_name() -> u32 {
                 "arena recognition found {arenas:?} of {allocator:?}"
             );
             assert!(arenas.held_kib > 0 && arenas.held_kib <= arenas.mapped_kib);
+
+            // The census cut: salsa and the interners count requested bytes,
+            // so they must fit inside what the Rust heap requested — not merely
+            // inside the chunks — and the chunks carry real overhead on top.
+            // (`outside_rust_heap` has no sign to check: the census and
+            // `mallinfo2` are read a moment apart while other tests allocate.)
+            let census = process.census.expect("the test binary installs the census");
+            assert!(
+                (line(LINE_SALSA) + line(LINE_INTERNERS)) <= census.requested_bytes,
+                "salsa and the interners claim more than the Rust heap requested: {:?} vs \
+                 {census:?}",
+                process.lines
+            );
+            assert!(
+                line(LINE_OVERHEAD) > 0,
+                "a heap of rust-analyzer nodes pays glibc's chunk headers: {:?}",
+                process.lines
+            );
+            line(LINE_FOREIGN);
         }
         assert!(!process.largest_mappings.is_empty() && process.largest_mappings.len() <= 10);
     }
@@ -2796,25 +2866,8 @@ pub fn a_local_of_the_same_name() -> u32 {
             std::env::var("MALLOC_ARENA_MAX").unwrap_or_else(|_| "unset".to_owned())
         );
 
-        let gib = |bytes: i64| bytes as f64 / (1u64 << 30) as f64;
-        // One line per portrait: `held`, then every line of the shipped cut.
-        let portrait = |service: &mut SemanticService, stage: &str| -> i64 {
-            let report = service
-                .memory_breakdown(&project, 0)
-                .expect("the probe project is loaded");
-            let process = report.process.expect("a portrait on linux");
-            let lines: Vec<String> = process
-                .lines
-                .iter()
-                .map(|line| format!("{} {:.2}", line.owner, gib(line.bytes)))
-                .collect();
-            println!(
-                "{stage:<16} held {:.2} GiB | {}",
-                gib(process.held_bytes),
-                lines.join(" | ")
-            );
-            process.held_bytes
-        };
+        let portrait =
+            |service: &mut SemanticService, stage: &str| print_portrait(service, &project, stage);
 
         let mut service = SemanticService::new();
         let started = Instant::now();
@@ -2889,6 +2942,115 @@ pub fn a_local_of_the_same_name() -> u32 {
             gib(worked_floor)
         );
         assert!(rounds > 0, "the work phase ran no round");
+    }
+
+    fn gib(bytes: i64) -> f64 {
+        bytes as f64 / (1u64 << 30) as f64
+    }
+
+    /// One line per portrait: `held`, then every line of the shipped cut
+    /// (`memory_breakdown`, as `analysis_memory` serves it). Returns `held`.
+    fn print_portrait(service: &mut SemanticService, project: &Path, stage: &str) -> i64 {
+        let report = service
+            .memory_breakdown(project, 0)
+            .expect("the probe project is loaded");
+        let process = report.process.expect("a portrait on linux");
+        let lines: Vec<String> = process
+            .lines
+            .iter()
+            .map(|line| format!("{} {:.2}", line.owner, gib(line.bytes)))
+            .collect();
+        println!(
+            "{stage:<16} held {:.2} GiB | {}",
+            gib(process.held_bytes),
+            lines.join(" | ")
+        );
+        process.held_bytes
+    }
+
+    /// Who owns the heap the portrait calls `unattributed` — split by stage,
+    /// and, under a heap profiler, by allocating stack.
+    ///
+    /// The stages: `loaded` is right after the workspace load (project model,
+    /// VFS, crate graph, salsa inputs and the cache prefill the loader runs),
+    /// before any query of ours; `queried` is after one reference search, the
+    /// state the earlier probes weighed. The `unattributed` line of each,
+    /// against the other, says whether the unowned heap comes with the load or
+    /// with the queries.
+    ///
+    /// `RMC_UNOWNED_EXIT_AFTER=<stage>` ends the process right after that
+    /// stage's portrait with `process::exit`, freeing nothing: under
+    /// `heaptrack` every live allocation is then reported as leaked, with the
+    /// stack that made it, which is the per-owner split the portrait cannot
+    /// give. A normal return would drop the database first and leave nothing
+    /// to look at.
+    ///
+    /// # Running it
+    ///
+    /// ```text
+    /// RMC_UNOWNED_PROJECT=/home/user/project RMC_UNOWNED_SYMBOL=OneDeclManyUses \
+    /// RMC_UNOWNED_EXIT_AFTER=queried \
+    ///   heaptrack -o /scratch/unowned target/release/deps/rmc_server-<hash> \
+    ///   --ignored --nocapture --exact semantic::tests::unowned_heap_by_load_stage
+    /// ```
+    #[test]
+    #[ignore = "needs a real workspace in RMC_UNOWNED_PROJECT and minutes to run"]
+    fn unowned_heap_by_load_stage() {
+        let _sweep = sweeping_alone();
+        let required = |name: &str| {
+            std::env::var(name).unwrap_or_else(|_| {
+                panic!(
+                    "set {name}; without it this probe would measure nothing and pass, which is \
+                     worse than not running"
+                )
+            })
+        };
+        let project = PathBuf::from(required("RMC_UNOWNED_PROJECT"));
+        let symbol = required("RMC_UNOWNED_SYMBOL");
+        let exit_after = std::env::var("RMC_UNOWNED_EXIT_AFTER").ok();
+        let stage_done = |service: &mut SemanticService, stage: &str| {
+            print_portrait(service, &project, stage);
+            // The rows a heap profile is held against: per ingredient, what it
+            // says it owns. One above a MiB, or reporting heap at all, is printed.
+            let report = service.memory_breakdown(&project, 0).expect("the probe project is loaded");
+            for row in report
+                .rows
+                .iter()
+                .filter(|row| row.heap_bytes.is_some() || row.bytes() > 1 << 20)
+            {
+                println!(
+                    "  {:<8} {:<52} {:>9} stack {:>8} KiB meta {:>8} KiB heap {:>9} KiB",
+                    row.family,
+                    row.name,
+                    row.count,
+                    row.stack_bytes / 1024,
+                    row.metadata_bytes / 1024,
+                    row.heap_bytes.map_or("-".to_owned(), |heap| (heap / 1024).to_string()),
+                );
+            }
+            if exit_after.as_deref() == Some(stage) {
+                println!("exiting after `{stage}` without freeing anything");
+                std::process::exit(0);
+            }
+        };
+
+        let mut service = SemanticService::new();
+        let started = std::time::Instant::now();
+        service.get_or_load_full(&project).expect("load the probe workspace");
+        println!("load: {:.1} s", started.elapsed().as_secs_f64());
+        stage_done(&mut service, "loaded");
+
+        let started = std::time::Instant::now();
+        let found = service
+            .find_references_by_name_with_exact(&project, &symbol, true)
+            .expect("reference search on the probe workspace");
+        println!(
+            "query: {} location(s) for `{symbol}` in {:.1} s",
+            found.len(),
+            started.elapsed().as_secs_f64()
+        );
+        assert!(!found.is_empty(), "`{symbol}` has no references: the query inferred nothing");
+        stage_done(&mut service, "queried");
     }
 
     fn env_usize(name: &str, default: usize) -> usize {
