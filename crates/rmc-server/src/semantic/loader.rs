@@ -3,13 +3,18 @@
 use anyhow::{Context, Result};
 use ra_ap_ide::AnalysisHost;
 use ra_ap_ide_db::RootDatabase;
-use ra_ap_ide_db::base_db::{Crate, SourceDatabase, all_crates, salsa};
+use ra_ap_ide_db::base_db::file_text_store::FileTextStore;
+use ra_ap_ide_db::base_db::{AbsPathBuf, Crate, SourceDatabase, all_crates, salsa};
 use ra_ap_ide_db::prime_caches::parallel_prime_caches;
-use ra_ap_load_cargo::{LoadCargoConfig, ProcMacroServerChoice, load_workspace_at};
+use ra_ap_load_cargo::{
+    LoadCargoConfig, ProcMacroServerChoice, load_workspace_into_db, project_workspace_at,
+};
 use ra_ap_project_model::{CargoConfig, CargoFeatures, RustLibSource};
 use ra_ap_vfs::Vfs;
 use std::collections::HashSet;
 use std::path::Path;
+
+use crate::mcp::project_paths::data_dir;
 
 /// Load a Cargo project for semantic analysis
 ///
@@ -108,9 +113,92 @@ fn load_unprimed(path: &Path, cargo_config: &CargoConfig) -> Result<(RootDatabas
         proc_macro_processes: 1,
     };
 
-    let (db, vfs, _) = load_workspace_at(path, cargo_config, &load_config, &|_| {})
+    // `load_workspace_at`, opened up so the store goes in before any text does.
+    let workspace = project_workspace_at(path, cargo_config, &load_config, &|_| {})
         .context("Failed to load workspace")?;
+    // Read here because `load_workspace` reads it, and `lru_sweep` drives it.
+    let lru_cap = std::env::var("RA_LRU_CAP")
+        .ok()
+        .and_then(|it| it.parse::<u16>().ok());
+    let mut db = RootDatabase::new(lru_cap);
+    if let Some(store) = file_text_store()? {
+        db.set_file_text_store(store);
+    }
+    let (vfs, _) =
+        load_workspace_into_db(workspace, &cargo_config.extra_env, &load_config, &mut db)
+            .context("Failed to load workspace")?;
     Ok((db, vfs))
+}
+
+/// Off-switch for keeping file texts out of the heap: `RMC_FILE_TEXTS=heap`
+/// keeps every text in the heap, as rust-analyzer does.
+pub(crate) const FILE_TEXTS_ENV: &str = "RMC_FILE_TEXTS";
+
+/// Where the loaded workspace keeps its file texts; see
+/// `base_db::file_text_store`.
+///
+/// # Why
+///
+/// The texts are an input, and salsa never evicts an input: on a large
+/// workspace with its dependencies that is ≈ 49 000 files and ≈ 780 MiB of
+/// heap for the life of the context, 85 % of it library sources read once at
+/// load. With the store, library sources under the cargo registry, git
+/// checkouts and toolchains are read back from disk when wanted again (length
+/// and hash checked), every other text — the workspace's own, build-script
+/// output — is a private copy in an unlinked file, mapped, and the heap holds
+/// only the few texts read recently.
+///
+/// # What a changed original costs
+///
+/// A read-back file found changed (cargo's cache GC, a toolchain reinstalled
+/// in place) fails the call that read it, and `with_semantic` unloads the
+/// context so the next call loads it afresh — see
+/// [`super::SemanticService::unload_drifted`].
+fn file_text_store() -> Result<Option<FileTextStore>> {
+    match std::env::var(FILE_TEXTS_ENV) {
+        Ok(value) if value.trim() == "heap" => return Ok(None),
+        Ok(value) => anyhow::bail!("{FILE_TEXTS_ENV}={value:?}: the only setting is `heap`"),
+        Err(_) => {}
+    }
+    let copy_dir = data_dir().join("file-texts");
+    std::fs::create_dir_all(&copy_dir)
+        .with_context(|| format!("creating {}", copy_dir.display()))?;
+    let copy_dir = AbsPathBuf::try_from(copy_dir.to_string_lossy().as_ref())
+        .map_err(|path| anyhow::anyhow!("{path} is not an absolute path"))?;
+    Ok(Some(FileTextStore {
+        read_back_dirs: read_back_dirs(),
+        copy_dir,
+    }))
+}
+
+/// Directories whose files do not change under a loaded workspace: the
+/// registry's unpacked crates (one directory per version), git dependencies
+/// (one checkout per revision) and toolchains (one directory per toolchain).
+/// `CARGO_HOME` and `RUSTUP_HOME` as cargo and rustup resolve them.
+fn read_back_dirs() -> Vec<AbsPathBuf> {
+    let home = std::env::home_dir();
+    let under = |var: &str, default: &str| {
+        std::env::var_os(var)
+            .map(std::path::PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(default)))
+    };
+    let cargo = under("CARGO_HOME", ".cargo");
+    let rustup = under("RUSTUP_HOME", ".rustup");
+    [
+        cargo
+            .as_ref()
+            .map(|cargo| cargo.join("registry").join("src")),
+        cargo
+            .as_ref()
+            .map(|cargo| cargo.join("git").join("checkouts")),
+        rustup.map(|rustup| rustup.join("toolchains")),
+    ]
+    .into_iter()
+    .flatten()
+    // A relative `CARGO_HOME` is cargo's business to resolve, not ours to
+    // guess: such a directory is simply not read back, its files are copied.
+    .filter_map(|dir| AbsPathBuf::try_from(dir.to_str()?).ok())
+    .collect()
 }
 
 /// Size of one priming batch, in files: `RMC_PRIME_BATCH_FILES=<n>`; `0`

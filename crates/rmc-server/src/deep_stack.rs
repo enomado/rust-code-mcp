@@ -263,6 +263,13 @@ where
 /// The closure receives the locked service and reports its own failures, so a
 /// caller keeps its own error wording rather than inheriting one from here. A
 /// poisoned mutex is the only failure this adds.
+///
+/// One panic is caught here rather than left to poison the mutex: a
+/// dependency's source found changed on disk since its project was loaded
+/// (`SemanticService::unload_drifted`). It is a fact about the files, not a
+/// bug, and it has a cure — unload the context, load it again on the next
+/// call — so it comes back as an error saying so, and the service stays
+/// usable. Every other panic unwinds as before.
 pub(crate) async fn with_semantic<T, F>(
     semantic: &Arc<Mutex<SemanticService>>,
     what: &'static str,
@@ -277,9 +284,32 @@ where
         let mut service = semantic.lock().map_err(|error| {
             McpError::internal_error(format!("Failed to acquire lock: {}", error), None)
         })?;
-        work(&mut service)
+        // Caught while the guard is alive, so a drift does not poison it; the
+        // unwind is resumed — and poisons — for any other panic.
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut service))) {
+            Ok(outcome) => outcome,
+            Err(panic) => {
+                let unloaded = service.unload_drifted();
+                if unloaded.is_empty() {
+                    std::panic::resume_unwind(panic);
+                }
+                Err(McpError::internal_error(
+                    drift_refusal(what, &unloaded),
+                    None,
+                ))
+            }
+        }
     })
     .await?
+}
+
+/// What a call that hit a changed dependency source is told.
+fn drift_refusal(what: &str, unloaded: &[String]) -> String {
+    format!(
+        "{what}: a dependency's source changed on disk since the project was loaded ({}); \
+         the project was unloaded and loads afresh on the next call — retry it",
+        unloaded.join("; ")
+    )
 }
 
 #[cfg(test)]
@@ -510,6 +540,71 @@ mod tests {
             error.message.contains("panicked"),
             "unexpected error message: {}",
             error.message
+        );
+    }
+
+    /// A dependency source changed behind a loaded context: the call that
+    /// reads it is told why and to retry, the context is gone (so the retry
+    /// loads afresh), and the service still answers — the mutex is not
+    /// poisoned. Without the catch in `with_semantic` the first call reports a
+    /// bare "panicked" and every later one "Failed to acquire lock".
+    #[tokio::test]
+    async fn a_changed_dependency_source_unloads_its_project_and_keeps_the_service() {
+        use ra_ap_ide::AnalysisHost;
+        use ra_ap_ide_db::RootDatabase;
+        use ra_ap_ide_db::base_db::file_text_store::FileTextStore;
+        use ra_ap_ide_db::base_db::{
+            AbsPathBuf, FileChange, FileId, FileSet, SourceDatabase, SourceRoot, VfsPath,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let abs = |path: &std::path::Path| AbsPathBuf::try_from(path.to_str().unwrap()).unwrap();
+        let registry = dir.path().join("registry");
+        let source = registry.join("dep/src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        let text = "pub fn dep() -> u8 { 1 }\n";
+        std::fs::write(&source, text).unwrap();
+        std::fs::create_dir_all(dir.path().join("copies")).unwrap();
+
+        let mut db = RootDatabase::new(None);
+        db.set_file_text_store(FileTextStore {
+            read_back_dirs: vec![abs(&registry)],
+            copy_dir: abs(&dir.path().join("copies")),
+        });
+        let mut library = FileSet::default();
+        library.insert(FileId::from_raw(0), VfsPath::from(abs(&source)));
+        let mut change = FileChange::default();
+        change.set_roots(vec![SourceRoot::new_library(library)]);
+        change.change_file(FileId::from_raw(0), Some(text.to_owned()));
+        change.apply(&mut db);
+        std::fs::write(&source, text.replace('1', "2")).unwrap();
+
+        let semantic = test_semantic();
+        let project = dir.path().join("project");
+        semantic
+            .lock()
+            .unwrap()
+            .insert_for_test(project.clone(), AnalysisHost::with_database(db));
+
+        let read = with_semantic(&semantic, "read", move |service| {
+            let db = service.raw_database_for_test(&project);
+            Ok(db.file_text(FileId::from_raw(0)).text(db).len())
+        })
+        .await;
+        let error = read.expect_err("a changed source must not be read as the old one");
+        assert!(
+            error.message.contains("changed on disk")
+                && error.message.contains(source.to_str().unwrap())
+                && error.message.contains("retry"),
+            "the refusal says what changed and what to do: {}",
+            error.message
+        );
+
+        let left = with_semantic(&semantic, "count", |service| Ok(service.project_count())).await;
+        assert_eq!(
+            left.expect("the service survives the drift"),
+            0,
+            "the drifted project is unloaded"
         );
     }
 }
