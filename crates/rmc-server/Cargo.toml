@@ -75,4 +75,6 @@ optional = true
 
 [dev-dependencies]
 ra_ap_syntax = { workspace = true }
+# `heap_size::DefMapCensus`, for the def map composition probe.
+ra_ap_hir_def = { workspace = true }
 tempfile = "3"
