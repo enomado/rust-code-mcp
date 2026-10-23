@@ -375,6 +375,8 @@ fn build_attempt(directory: &Path, options: &BuildOptions) -> Result<BuildResult
     // What to (re)build, the base's crate → packages entries to keep, and
     // the report. The base is copied and closed before the new env opens.
     let t = std::time::Instant::now();
+    let mut row_origins = serde_json::Map::new();
+    let mut base_graph_id = None;
     let (dirty, mut crate_packages, kind) = match plan {
         BuildPlan::Full { reason } => {
             let groups = extract::crate_groups(&loaded, &loaded.local_crates)?;
@@ -385,6 +387,13 @@ fn build_attempt(directory: &Path, options: &BuildOptions) -> Result<BuildResult
             dirty,
             changed_packages,
         } => {
+            base_graph_id = Some(base.manifest.graph_id.clone());
+            for key in base.manifest.crate_packages.keys() {
+                let origin = base.manifest.extraction_context.as_ref()
+                    .and_then(|c| c.get("row_origins")).and_then(|c| c.get(key)).cloned()
+                    .unwrap_or_else(|| serde_json::json!({"unknown": true, "base_graph_id": base.manifest.graph_id}));
+                row_origins.insert(key.clone(), origin);
+            }
             let target = identity.snapshot_dir.join("data.mdb");
             base.env
                 .copy_to_path(&target, CompactionOption::Enabled)
@@ -451,7 +460,28 @@ fn build_attempt(directory: &Path, options: &BuildOptions) -> Result<BuildResult
 
     slice.validate(&workspace_root)?;
     let usage_counts = Some(count_usages(&env)?);
+    let targets = loaded.local_crates.iter().map(|krate| {
+        let key = super::identity::target_key(&loaded.db, &loaded.vfs, &loaded.workspace_root, *krate);
+        let target = serde_json::json!({"crate_id": super::identity::crate_node_id(&identity.paths.workspace_hash, &key),
+            "target_key": key, "edition": krate.edition(&loaded.db).to_string(),
+            "cfg_options": format!("{:?}", krate.cfg(&loaded.db))});
+        if dirty_crates.contains(krate) {
+            row_origins.insert(key, serde_json::json!({"graph_id": identity.graph_id,
+                "extractor_revision": env!("RMC_GRAPH_REVISION"), "ra_revision": env!("RMC_RA_REVISION"),
+                "target": target}));
+        }
+        target
+    }).collect::<Vec<_>>();
+    row_origins.retain(|key, _| crate_packages.contains_key(key));
     let manifest = GraphManifest {
+        extraction_context: Some(serde_json::json!({
+            "extractor_revision": env!("RMC_GRAPH_REVISION"),
+            "ra_revision": env!("RMC_RA_REVISION"),
+            "features": "all", "all_targets": false, "set_test": false,
+            "build_script_outputs": false, "proc_macro_server": false,
+            "targets": targets, "row_origins": row_origins, "incremental_base": base_graph_id,
+            "build": kind
+        })),
         graph_id: identity.graph_id.clone(),
         workspace_root: loaded.workspace_root.display().to_string(),
         workspace_hash: identity.paths.workspace_hash.clone(),
@@ -716,6 +746,7 @@ fn persist_test_with(
             &identity.graph_id,
         )?;
         let manifest = GraphManifest {
+            extraction_context: None,
             graph_id: identity.graph_id.clone(),
             workspace_root: workspace_root.display().to_string(),
             workspace_hash: identity.paths.workspace_hash.clone(),
@@ -1252,6 +1283,7 @@ mod tests {
             fs::write(snapshot_dir.join("data.mdb"), b"stub").unwrap();
         }
         let manifest = GraphManifest {
+            extraction_context: None,
             graph_id: graph_id.clone(),
             workspace_root: workspace.display().to_string(),
             workspace_hash: paths.workspace_hash.clone(),

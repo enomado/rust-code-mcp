@@ -14,6 +14,7 @@ mod docs_audit;
 #[cfg(feature = "semantic-embeddings")]
 mod embedding_cache;
 mod extract;
+pub mod export;
 mod fn_body_audit;
 mod hir_trim;
 mod identity;

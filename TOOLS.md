@@ -19,6 +19,7 @@ Complete reference for all MCP tools provided by rust-code-mcp.
 | [`health_check`](#health_check) | Index | Check system status |
 | [`clear_cache`](#clear_cache) | Index | Clear corrupted cache/index files |
 | [`build_hypergraph`](#build_hypergraph) | Graph: Build | Build/reuse persisted workspace hypergraph |
+| [`export_graph`](docs/GRAPH_COMPLETE_EXPORT.md) | Graph: Export | Lossless pinned canonical rows, metadata, typed observations and provenance; cursor pagination |
 | [`get_imports`](#get_imports) | Graph: Imports/Exports | List `use`/extern-crate imports of a module |
 | [`get_exports`](#get_exports) | Graph: Imports/Exports | Items visible to a consumer module |
 | [`get_reexports`](#get_reexports) | Graph: Imports/Exports | `pub use` subset of get_exports |

@@ -330,6 +330,14 @@ impl SearchToolRouter {
         crate::tools::graph::core::build_hypergraph(params).await
     }
 
+    #[tool(description = "Lossless machine-readable export of an immutable HIR graph. Omit table for metadata, provenance, coverage, units and graph_id; then page all listed canonical tables with that graph_id and next_cursor. Includes typed usages, namespace bindings, semantic containment and explicit unresolved calls; preserves physical/expanded sites and Cargo target context. No codemap caps. Changed CURRENT is an error, never mixed pages. For large offline exports use the rmc-graph graph_export example (JSONL).")]
+    async fn export_graph(
+        &self,
+        Parameters(params): Parameters<crate::tools::params::GraphExportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        crate::tools::graph::core::export_graph(params).await
+    }
+
     #[tool(
         description = "List `use`/extern-crate imports in a module from the persisted hypergraph. For complete module-level dependencies including fully-qualified inline references, use module_dependencies."
     )]

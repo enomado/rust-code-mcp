@@ -779,6 +779,10 @@ fn open_or_create_bytes_bytes(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphManifest {
+    /// Captured by the builder, never reconstructed from the exporting process.
+    /// Absent in older v16 JSON manifests; absence means unknown provenance.
+    #[serde(default)]
+    pub extraction_context: Option<serde_json::Value>,
     pub graph_id: String,
     pub workspace_root: String,
     pub workspace_hash: String,

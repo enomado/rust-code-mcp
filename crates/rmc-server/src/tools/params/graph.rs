@@ -7,6 +7,19 @@ use rmc_graph::graph::ForbiddenDependencyRule;
 use super::ListPaginationParams;
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(crate) struct GraphExportParams {
+    pub directory: String,
+    #[schemars(description = "Omit for metadata. Otherwise nodes, bindings, usages, contains, unresolved_calls, signatures, statics or stub_owners.")]
+    pub table: Option<String>,
+    #[schemars(description = "Required for every table page: graph_id returned by metadata. A changed CURRENT is an error; restart export.")]
+    pub graph_id: Option<String>,
+    #[schemars(description = "Opaque JSON string of next_cursor from the preceding page; omit for first page of each table.")]
+    pub cursor: Option<String>,
+    #[schemars(description = "Rows per page, 1..=10000; default 100. No summary or truncation.")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct GraphImportsParams {
     #[schemars(description = "Workspace root (directory containing Cargo.toml)")]
     pub directory: String,

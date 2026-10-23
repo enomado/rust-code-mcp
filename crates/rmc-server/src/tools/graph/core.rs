@@ -26,6 +26,21 @@ use rmc_graph::graph::{
 
 use rmcp::{ErrorData as McpError, model::CallToolResult};
 
+pub(crate) async fn export_graph(params: crate::tools::params::GraphExportParams) -> Result<CallToolResult, McpError> {
+    let snap = open_workspace_snapshot(&params.directory)?;
+    let Some(table) = params.table else {
+        return json_result(&rmc_graph::graph::export::export_metadata(&snap).map_err(internal_error("export metadata"))?);
+    };
+    if params.graph_id.as_deref() != Some(snap.manifest.graph_id.as_str()) {
+        return Err(McpError::invalid_params("graph_id must match export metadata and current snapshot; restart export", None));
+    }
+    let cursor = params.cursor.as_deref().map(serde_json::from_str).transpose()
+        .map_err(|e| McpError::invalid_params(format!("invalid export cursor: {e}"), None))?;
+    let page = rmc_graph::graph::export::export_page(&snap, &table, cursor.as_ref(), params.limit.unwrap_or(100))
+        .map_err(internal_error("export_graph"))?;
+    json_result(&page)
+}
+
 pub(crate) async fn build_hypergraph(
     params: BuildHypergraphParams,
 ) -> Result<CallToolResult, McpError> {
