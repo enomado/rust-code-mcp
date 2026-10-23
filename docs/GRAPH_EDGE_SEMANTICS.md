@@ -41,6 +41,8 @@ bounded projection, and weight=1 is membership of (from, to, kind), not frequenc
 with expression, byte range, lexical owner/module and reason:
 `IndirectCallable`, `TargetOutsideGraph`, or `Unresolved`. `calls_from` returns
 all unresolved sites of its lexical owner separately from resolved-call paging.
+The MCP view uses the response's caller as owner, omits raw ID arrays and
+honors summary navigation-field omission; the stored graph retains the IDs.
 `let f = leaf; f()` retains both the FunctionReference and an indirect call;
 it does not synthesize a direct edge from the assignment. Known external
 functions outside graph coverage also receive explicit records.

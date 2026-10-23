@@ -1003,11 +1003,29 @@ fn call_site_summary_omits_navigation_fields() {
     assert_eq!(summary["caller_qualified_name"], "crate::caller");
     assert_eq!(summary["callee_qualified_name"], "crate::callee");
     assert_eq!(summary["category"], "Read");
+    assert_eq!(summary["relation"], "Call");
 
     let full = serde_json::to_value(&call_site_views(vec![site], false)[0]).unwrap();
     assert_eq!(full["file"], "src/lib.rs");
     assert_eq!(full["start"], 10);
     assert_eq!(full["end"], 20);
+}
+
+#[test]
+fn unresolved_call_summary_omits_navigation_fields() {
+    use rmc_graph::graph::{NodeId, model::{UnresolvedCall, UnresolvedCallReason}};
+    let call = UnresolvedCall {
+        consumer_module: NodeId([1; 32]), consumer_item: Some(NodeId([2; 32])),
+        file: "src/lib.rs".to_owned(), start: 10, end: 13,
+        expression: "f".to_owned(), reason: UnresolvedCallReason::IndirectCallable,
+    };
+    let summary = serde_json::to_value(&unresolved_call_views(vec![call.clone()], true)[0]).unwrap();
+    assert_eq!(summary, serde_json::json!({"expression": "f", "reason": "IndirectCallable"}));
+    let full = serde_json::to_value(&unresolved_call_views(vec![call], false)[0]).unwrap();
+    assert_eq!(full["file"], "src/lib.rs");
+    assert_eq!(full["start"], 10);
+    assert_eq!(full["end"], 13);
+    assert!(full.get("consumer_item").is_none());
 }
 
 // -----------------------------------------------------------------

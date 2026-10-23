@@ -328,7 +328,8 @@ pub(crate) async fn calls_from(params: CallsFromParams) -> Result<CallToolResult
         target: None,
         caller: Some(caller_node.qualified_name),
         krate: None,
-        unresolved_calls: Some(snap.unresolved_calls_from(caller_id).map_err(internal_error("unresolved_calls_from"))?),
+        unresolved_calls: Some(unresolved_call_views(snap.unresolved_calls_from(caller_id)
+            .map_err(internal_error("unresolved_calls_from"))?, page_req.summary)),
         page,
         call_sites,
     })
@@ -442,6 +443,15 @@ pub(crate) fn call_site_views(sites: Vec<EnrichedCallSite>, summary: bool) -> Ve
         .collect()
 }
 
+pub(crate) fn unresolved_call_views(calls: Vec<rmc_graph::graph::model::UnresolvedCall>, summary: bool) -> Vec<UnresolvedCallView> {
+    calls.into_iter().map(|call| UnresolvedCallView {
+        file: if summary { None } else { Some(call.file) },
+        start: if summary { None } else { Some(call.start) },
+        end: if summary { None } else { Some(call.end) },
+        expression: call.expression, reason: call.reason,
+    }).collect()
+}
+
 fn module_dependency_view(dependency: ModuleDependency, summary: bool) -> ModuleDependencyView {
     ModuleDependencyView {
         target_module: dependency.target_module,
@@ -519,7 +529,20 @@ pub(crate) struct CallSitesResponse {
     /// All observed unresolved calls of this caller, independent of the
     /// resolved-call page. Absence of call_sites alone is not completeness.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) unresolved_calls: Option<Vec<rmc_graph::graph::model::UnresolvedCall>>,
+    pub(crate) unresolved_calls: Option<Vec<UnresolvedCallView>>,
+}
+
+/// The owner is the response's caller; raw IDs stay in the stored graph.
+#[derive(Debug, Serialize)]
+pub(crate) struct UnresolvedCallView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) start: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) end: Option<u32>,
+    pub(crate) expression: String,
+    pub(crate) reason: rmc_graph::graph::model::UnresolvedCallReason,
 }
 
 #[derive(Debug, Serialize)]

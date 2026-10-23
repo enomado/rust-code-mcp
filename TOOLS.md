@@ -733,7 +733,7 @@ the contract without claiming a unique runtime implementation.
 {
   "target": "my_crate::module::do_thing",
   "call_sites": [
-    { "caller": "my_crate::other::caller_fn", "file": "src/other.rs", "start": 512, "end": 520, "category": "Read" }
+    { "caller_qualified_name": "my_crate::other::caller_fn", "callee_qualified_name": "my_crate::module::do_thing", "file": "src/other.rs", "start": 512, "end": 520, "category": "Other", "relation": "Call" }
   ]
 }
 ```
@@ -768,7 +768,9 @@ visible through `who_uses`, not a second call.
 independent of resolved-call pagination, with file/byte range, expression and
 reason (`IndirectCallable`, `TargetOutsideGraph`, `Unresolved`). Calls via local
 variables remain indirect even if a fn-item type happens to reveal the assigned
-function. No full points-to analysis, implicit operator/desugaring coverage,
+function. Summary mode omits navigation fields; raw owner IDs remain in the
+stored graph, and the response's `caller` identifies the lexical owner.
+No full points-to analysis, implicit operator/desugaring coverage,
 proc-macro expansion or build-script output is promised.
 
 **Notes:** Calls from closures attribute to the enclosing fn.
