@@ -287,7 +287,11 @@ mod tests {
     fn incremental(changed: &[&str], rebuilt: &[&str]) -> BuildKind {
         BuildKind::Incremental {
             changed_packages: changed.iter().map(|s| s.to_string()).collect(),
-            rebuilt_crates: rebuilt.iter().map(|s| s.to_string()).collect(),
+            rebuilt_crates: rebuilt.iter().map(|s| match *s {
+                "gamma-bin" => "gamma[bin]@gamma/src/main.rs".to_owned(),
+                "tool" => "tool[bin]@gamma/src/bin/tool.rs".to_owned(),
+                name => format!("{name}[lib]@{name}/src/lib.rs"),
+            }).collect(),
         }
     }
 
@@ -312,7 +316,7 @@ mod tests {
             let snap = open(data.path(), &first);
             let packages = &snap.manifest.crate_packages;
             assert_eq!(packages.len(), 3, "{packages:?}");
-            assert!(packages["beta"].iter().eq(["beta"]), "{packages:?}");
+            assert!(packages["beta[lib]@beta/src/lib.rs"].iter().eq(["beta"]), "{packages:?}");
         }
 
         // An embedding cached for an `alpha` item and one for a `gamma` item.
@@ -439,7 +443,7 @@ mod tests {
         )
         .unwrap();
         let kind = assert_incremental_equals_full(ws, data.path(), "bin named like the lib");
-        assert_eq!(kind, incremental(&["gamma"], &["gamma"]));
+        assert_eq!(kind, BuildKind::Full { reason: "the set of crates changed".into() });
 
         fs::create_dir_all(ws.join("gamma/src/bin")).unwrap();
         fs::write(
@@ -457,7 +461,7 @@ mod tests {
 
         edit(ws, "gamma/src/main.rs", "(1, 2)", "(2, 1)");
         let kind = assert_incremental_equals_full(ws, data.path(), "bin body edit");
-        assert_eq!(kind, incremental(&["gamma"], &["gamma", "tool"]));
+        assert_eq!(kind, incremental(&["gamma"], &["gamma", "gamma-bin", "tool"]));
     }
 
     /// Edits listed in `RMC_INCREMENTAL_EDITS` applied one after another to

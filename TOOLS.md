@@ -705,6 +705,14 @@ Aggregation rollup of `who_uses`: every non-import reference grouped by consumer
 
 ---
 
+Schema v16 uses distinct Cargo target identities and stable declaration ids
+across byte-offset shifts. Ambiguous lib/bin paths require `app[lib]::helper`
+or `app[bin]::helper`. Non-summary usage/call sites include macro expansion
+provenance. `build_hypergraph.usage_counts` distinguishes observations, physical
+source sites and expanded observations. See the
+[identity/snapshot contract](docs/GRAPH_IDENTITY_AND_SNAPSHOT.md) for exact units,
+slice consistency, immutable force rebuilds and coverage limits.
+
 ### Call Graph (Layer 10)
 
 #### who_calls

@@ -502,6 +502,7 @@ mod tests {
                 visibility: None,
                 attributes: Vec::new(),
                 crate_target_kind: None,
+                declaration_module: None,
             },
         )
     }

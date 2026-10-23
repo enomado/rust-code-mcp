@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Result, ensure};
 use ra_ap_hir::Crate;
 use ra_ap_hir_def::ModuleId;
-use ra_ap_hir_def::nameres::{DefMap, crate_def_map};
+use ra_ap_hir_def::nameres::crate_def_map;
 use ra_ap_ide::RootDatabase;
 use ra_ap_vfs::Vfs;
 
@@ -18,6 +18,7 @@ use super::audit_util::resolve_workspace_relative;
 use super::attributes::extract_attributes;
 use super::bindings::extract_bindings;
 use super::ids::{NodeId, workspace_hash};
+use super::identity::{crate_node_id, module_node_id, target_key};
 use super::labels::{crate_display_name, module_path_segments};
 use super::impls::extract_impl_items;
 use super::loader::{LoadedWorkspace, prime_for};
@@ -54,11 +55,8 @@ pub(crate) fn extract_with(loaded: &LoadedWorkspace, usages_pass: UsagesPass) ->
     model
 }
 
-/// A write unit of the per-crate build: the local crates sharing one crate
-/// NodeId. Two crates share it when a package's lib and bin have the same
-/// name (`labels::crate_display_name`); their nodes merge in `insert_node`,
-/// so they must be walked and written together or a rewrite of one would
-/// drop rows of the other.
+/// A write unit of the per-crate build, keyed by Cargo target identity.
+/// Same-name lib/bin targets have independent rows and dependency edges.
 #[derive(Debug, Clone)]
 pub(crate) struct CrateGroup {
     pub id: NodeId,
@@ -81,8 +79,8 @@ pub(crate) struct CrateGroup {
 /// and of their order; the dependency order is kept only so that a log reads
 /// bottom-up.
 ///
-/// `dirty` must hold whole groups: a lib without the same-named bin of its
-/// package is refused.
+/// `dirty` must hold whole target groups. A lib and a same-named bin are
+/// independent groups and can each be rebuilt alone.
 ///
 /// # Memory
 ///
@@ -216,7 +214,7 @@ pub(crate) fn crate_groups(loaded: &LoadedWorkspace, dirty: &[Crate]) -> Result<
     let mut groups: Vec<CrateGroup> = Vec::new();
     let mut group_of: HashMap<Crate, usize> = HashMap::new();
     for &krate in &loaded.local_crates {
-        let name = crate_display_name(db, krate);
+        let name = target_key(db, &loaded.vfs, &loaded.workspace_root, krate);
         let id = crate_node_id(&hash, &name);
         let index = match groups.iter().position(|g| g.id == id) {
             Some(index) => index,
@@ -231,6 +229,11 @@ pub(crate) fn crate_groups(loaded: &LoadedWorkspace, dirty: &[Crate]) -> Result<
         };
         groups[index].crates.push(krate);
         group_of.insert(krate, index);
+    }
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    group_of.clear();
+    for (index, group) in groups.iter().enumerate() {
+        for &krate in &group.crates { group_of.insert(krate, index); }
     }
     for group in &groups {
         let inside = group
@@ -360,6 +363,7 @@ fn emit_skeleton(loaded: &LoadedWorkspace, crates: &[Crate], timing: bool) -> Sk
         visibility: None,
         attributes: Vec::new(),
         crate_target_kind: None,
+        declaration_module: None,
     });
 
     let mut crate_node_for: HashMap<Crate, NodeId> = HashMap::new();
@@ -375,8 +379,6 @@ fn emit_skeleton(loaded: &LoadedWorkspace, crates: &[Crate], timing: bool) -> Sk
             &loaded.workspace_root,
             krate,
             workspace_id,
-            &loaded.crate_target_kinds_by_name,
-            &loaded.crate_target_kinds_by_root_file,
             &mut crate_node_for,
             &mut crate_name_for,
             &mut module_node_for,
@@ -515,6 +517,11 @@ fn run_passes(
         module_node_for,
         usages_pass,
     );
+    // Scanning both macro inputs and generated bodies may discover the same
+    // expanded occurrence twice. Normalize the raw model by the persisted
+    // observation identity, retaining distinct expansion paths/token ranges.
+    let mut seen = HashSet::new();
+    model.usages.retain(|u| seen.insert(super::snapshot::usage_id_for(u)));
     if timing {
         eprintln!(
             "extract: extract_usages ({usages_pass:?}) {:>9.2?}  ({} usages)",
@@ -531,8 +538,6 @@ fn emit_crate(
     workspace_root: &Path,
     krate: Crate,
     workspace_id: NodeId,
-    crate_target_kinds_by_name: &HashMap<String, String>,
-    crate_target_kinds_by_root_file: &HashMap<String, String>,
     crate_node_for: &mut HashMap<Crate, NodeId>,
     crate_name_for: &mut HashMap<Crate, String>,
     module_node_for: &mut HashMap<ModuleId, NodeId>,
@@ -540,17 +545,8 @@ fn emit_crate(
     let crate_name = crate_display_name(db, krate);
     let def_map = crate_def_map(db, krate.base());
     let root_module_id = def_map.crate_root(db);
-    let crate_target_kind = crate_target_kind_for(
-        db,
-        vfs,
-        workspace_root,
-        &crate_name,
-        def_map,
-        root_module_id,
-        crate_target_kinds_by_name,
-        crate_target_kinds_by_root_file,
-    );
-    let crate_id = crate_node_id(&model.workspace_hash, &crate_name);
+    let crate_target_kind = Some(super::identity::target_kind(db, krate).to_owned());
+    let crate_id = crate_node_id(&model.workspace_hash, &target_key(db, vfs, workspace_root, krate));
 
     crate_node_for.insert(krate, crate_id);
     crate_name_for.insert(krate, crate_name.clone());
@@ -563,11 +559,12 @@ fn emit_crate(
         crate_id: Some(crate_id),
         parent_id: Some(workspace_id),
         item_kind: None,
-        file: None,
+        file: resolve_workspace_relative(vfs, krate.root_file(db), workspace_root),
         span: None,
         visibility: Some("pub".to_string()),
         attributes: Vec::new(),
         crate_target_kind,
+        declaration_module: None,
     });
     model.insert_contains(workspace_id, crate_id);
 
@@ -584,15 +581,7 @@ fn emit_crate(
             format!("{crate_name}::{}", path.join("::"))
         };
 
-        let mut hash_parts: Vec<&str> = vec![
-            model.workspace_hash.as_str(),
-            "module",
-            crate_name.as_str(),
-        ];
-        for seg in &path {
-            hash_parts.push(seg.as_str());
-        }
-        let module_node_id = NodeId::from_components(&hash_parts);
+        let module_node_id = module_node_id(crate_id, &path);
         module_node_for.insert(module_id, module_node_id);
 
         let parent_id = if module_id == root_module_id {
@@ -601,20 +590,16 @@ fn emit_crate(
             // Compute the parent's NodeId now (we may not have inserted it yet —
             // the iteration order from def_map.modules() is not parent-first).
             let parent_path = module_path_segments(db, def_map, parent_module);
-            let mut parts: Vec<&str> = vec![
-                model.workspace_hash.as_str(),
-                "module",
-                crate_name.as_str(),
-            ];
-            for seg in &parent_path {
-                parts.push(seg.as_str());
-            }
-            Some(NodeId::from_components(&parts))
+            Some(super::identity::module_node_id(crate_id, &parent_path))
         } else {
             Some(crate_id)
         };
 
         let display_name = path.last().cloned().unwrap_or_else(|| crate_name.clone());
+        let source = ra_ap_hir::Module::from(module_id).definition_source(db);
+        let (source_file, source_range) = if let Some(call) = source.file_id.original_call_node(db) {
+            (call.file_id, call.value.text_range())
+        } else { (source.file_id.original_file(db), source.value.node().text_range()) };
 
         model.insert_node(Node {
             id: module_node_id,
@@ -624,42 +609,18 @@ fn emit_crate(
             crate_id: Some(crate_id),
             parent_id,
             item_kind: None,
-            file: None,
-            span: None,
+            file: resolve_workspace_relative(vfs, source_file.file_id(db), workspace_root),
+            span: Some((u32::from(source_range.start()), u32::from(source_range.end()))),
             visibility: None,
             attributes: Vec::new(),
             crate_target_kind: None,
+            declaration_module: Some(module_node_id),
         });
 
         if let Some(parent) = parent_id {
             model.insert_contains(parent, module_node_id);
         }
     }
-}
-
-/// NodeId of the crate named `crate_name` (`labels::crate_display_name`).
-fn crate_node_id(workspace_hash: &str, crate_name: &str) -> NodeId {
-    NodeId::from_components(&[workspace_hash, "crate", crate_name])
-}
-
-fn crate_target_kind_for(
-    db: &RootDatabase,
-    vfs: &Vfs,
-    workspace_root: &Path,
-    crate_name: &str,
-    def_map: &DefMap,
-    root_module_id: ra_ap_hir_def::ModuleId,
-    crate_target_kinds_by_name: &HashMap<String, String>,
-    crate_target_kinds_by_root_file: &HashMap<String, String>,
-) -> Option<String> {
-    let root_file_id = def_map[root_module_id]
-        .definition_source_file_id()
-        .original_file(db)
-        .file_id(db);
-    resolve_workspace_relative(vfs, root_file_id, workspace_root)
-        .and_then(|root_file| crate_target_kinds_by_root_file.get(&root_file).cloned())
-        .or_else(|| crate_target_kinds_by_name.get(crate_name).cloned())
-        .or_else(|| Some("lib".to_string()))
 }
 
 #[cfg(test)]
@@ -687,13 +648,15 @@ mod tests {
         })
     }
 
-    /// The two-crate fixture plus a bin `beta` beside the lib `beta`: one crate
-    /// node for two RA crates, the case [`CrateGroup`] exists for.
+    /// Same-name lib/bin, including one physical module compiled by both.
     fn write_fixture_with_bin(root: &Path) {
         crate::graph::test_support::write_two_crate_fixture(root);
+        let lib = root.join("beta/src/lib.rs");
+        std::fs::write(&lib, format!("pub mod shared;\n{}", std::fs::read_to_string(&lib).unwrap())).unwrap();
+        std::fs::write(root.join("beta/src/shared.rs"), "pub fn helper() -> i32 { alpha::double(1) }\n").unwrap();
         std::fs::write(
             root.join("beta/src/main.rs"),
-            "fn main() {\n    let (a, b) = beta::ordered(2, 1);\n    \
+            "mod shared;\nfn main() { let _ = shared::helper();\n    let (a, b) = beta::ordered(2, 1);\n    \
              println!(\"{}\", alpha::quadruple(a + b));\n}\n",
         )
         .unwrap();
@@ -703,9 +666,15 @@ mod tests {
         crate_groups(loaded, &loaded.local_crates)
             .unwrap()
             .into_iter()
-            .find(|g| g.name == name)
-            .unwrap_or_else(|| panic!("no crate group `{name}`"))
-            .crates
+            .filter(|g| g.name.starts_with(&format!("{name}[")))
+            .flat_map(|g| g.crates)
+            .collect::<Vec<_>>()
+    }
+
+    fn group_names(loaded: &LoadedWorkspace, dirty: &[Crate]) -> Vec<String> {
+        crate_groups(loaded, dirty)
+            .unwrap()
+            .into_iter().map(|g| g.name).collect()
     }
 
     fn assert_same(a: &OpenedSnapshot, b: &OpenedSnapshot, what: &str) {
@@ -876,10 +845,13 @@ mod tests {
             // A fresh load, so the build primes and walks this crate alone.
             let mut loaded = loader::load_unprimed(workspace.path()).unwrap();
             let dirty = group_crates(&loaded, name);
-            let group_id = crate_node_id(&full_model.workspace_hash, name);
+            let expected_names = group_names(&loaded, &dirty);
 
             let mut wtxn = work.write_txn().unwrap();
-            assert!(delete_crate_rows(&mut wtxn, &work.dbs, group_id).unwrap() > 0);
+            for key in &expected_names {
+                let group_id = crate_node_id(&full_model.workspace_hash, key);
+                assert!(delete_crate_rows(&mut wtxn, &work.dbs, group_id).unwrap() > 0);
+            }
             wtxn.commit().unwrap();
 
             let mut groups = Vec::new();
@@ -897,7 +869,7 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(groups, vec![name.to_string()]);
+            assert_eq!(groups, expected_names);
             assert_same(
                 &full,
                 &work,
@@ -907,23 +879,25 @@ mod tests {
     }
 
     #[test]
-    fn a_group_is_rebuilt_whole_or_not_at_all() {
+    fn lib_and_bin_can_be_rebuilt_independently() {
         let workspace = tempfile::tempdir().unwrap();
         write_fixture_with_bin(workspace.path());
         let mut loaded = loader::load_unprimed(workspace.path()).unwrap();
         let half = vec![group_crates(&loaded, "beta")[0]];
-        let error = extract_by_crate(
+        let groups = crate_groups(&loaded, &group_crates(&loaded, "beta")).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_ne!(groups[0].id, groups[1].id);
+        assert!(groups.iter().all(|g| g.crates.len() == 1));
+        let mut written = Vec::new();
+        extract_by_crate(
             &mut loaded,
             &half,
             UsagesPass::from_env(),
             None,
-            &mut |_, _| panic!("nothing may be written for half a group"),
+            &mut |_, group| { written.push(group.id); Ok(()) },
         )
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("rebuild all of them or none"),
-            "{error:#}"
-        );
+        .unwrap();
+        assert_eq!(written.len(), 1);
     }
 
     /// Acceptance on a real workspace, `RMC_SNAPSHOT_COMPARE_WORKSPACE=<path>`:

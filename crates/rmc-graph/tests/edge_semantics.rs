@@ -57,18 +57,42 @@ async fn handwritten_edges_and_call_projections() {
             } else { assert!(hits.is_empty(), "inactive/excluded edge: {site}: {hits:?}"); excluded += 1; }
             continue;
         }
-        // Cargo-target disambiguation is the next task. Still check the edge,
-        // relation and owner name here, without claiming target identity.
-        let target = target.replace("[lib]", "").replace("[bin]", "");
-        let owner = owner.replace("[lib]", "").replace("[bin]", "");
-        assert!(hits.iter().any(|u| name(u.target) == target
-            && u.consumer_item.is_some_and(|id| name(id) == owner)
+        let target_id = snap.lookup_by_qualified_name(target).unwrap().unwrap().0;
+        let owner_id = snap.lookup_by_qualified_name(owner).unwrap().unwrap().0;
+        assert!(hits.iter().any(|u| u.target == target_id
+            && u.consumer_item == Some(owner_id)
             && format!("{:?}", u.relation) == relation), "missing/wrong {site}: expected {owner} -{relation}-> {target}, got {hits:?}");
         checked += 1;
     }
     assert_eq!(checked, 42);
     assert_eq!(excluded, 7);
+    let method = snap.lookup_by_qualified_name("truth_app::model::Device::inherent").unwrap().unwrap().1;
+    assert_eq!(name(method.parent_id.unwrap()), "truth_app::model::Device");
+    assert_eq!(name(method.declaration_module.unwrap()), "truth_app::remote");
+    assert_eq!(method.file.as_deref(), Some("app/src/remote.rs"));
+    assert!(snap.lookup_by_qualified_name("truth_app::helper").unwrap_err().to_string().contains("ambiguous"));
+    let (file, start, end) = marked_site(work.path(), "macro_twice", "leaf");
+    let expanded: Vec<_> = usages.iter().filter(|u| u.file == file && u.start == start && u.end == end).collect();
+    assert_eq!(expanded.len(), 2, "one source token expands into two call observations");
+    assert!(expanded.iter().all(|u| u.expansion.is_some()));
+    assert_ne!(expanded[0].expansion, expanded[1].expansion);
+    assert_eq!(snap.manifest.usage_counts.as_ref().unwrap().observations, usages.len() as u64);
     drop(txn);
+    let lib_root = snap.lookup_by_qualified_name("truth_app[lib]").unwrap().unwrap().0;
+    assert!(snap.module_dependencies(lib_root).unwrap().iter().any(|d| d.target_module == "truth_app::remote"));
+    assert!(snap.module_tree("truth_app", Some(1)).is_err());
+    snap.module_tree("truth_app[bin]", Some(1)).unwrap();
+    let bin_helper = snap.lookup_by_qualified_name("truth_app[bin]::helper").unwrap().unwrap().0;
+    assert_eq!(snap.lookup_by_qualified_name("truth_app[bin]@app/src/main.rs::helper").unwrap().unwrap().0, bin_helper);
+    let register = snap.lookup_by_qualified_name("truth_dep::register").unwrap().unwrap().0;
+    let bin_callers = snap.callers_in_crate(register, "truth_app[bin]").unwrap();
+    assert_eq!(bin_callers.len(), 1);
+    assert_eq!(bin_callers[0].file, "app/src/main.rs");
+    let metrics = snap.crate_dependency_metric().unwrap();
+    assert!(metrics.iter().any(|m| m.crate_name == "truth_app[bin]@app/src/main.rs"));
+    assert!(metrics.iter().any(|m| m.crate_name == "truth_app[lib]@app/src/lib.rs"));
+    assert!(snap.crate_edges().unwrap().iter().any(|e| e.consumer_crate == "truth_app[bin]@app/src/main.rs"
+        && e.producer_crate == "truth_app[lib]@app/src/lib.rs"));
     let caller = snap.lookup_by_qualified_name("truth_app::references_only").unwrap().unwrap().0;
     let calls = snap.calls_from(caller).unwrap();
     assert_eq!(calls.len(), 1);

@@ -54,6 +54,7 @@ impl OpenedSnapshot {
                 end: usage.end,
                 category: usage_category_label(usage.category).to_string(),
                 relation: usage.relation,
+                expansion: usage.expansion,
             });
         }
         Ok(out)
@@ -93,6 +94,7 @@ impl OpenedSnapshot {
                 end: usage.end,
                 category: usage_category_label(usage.category).to_string(),
                 relation: usage.relation,
+                expansion: usage.expansion,
             });
         }
         Ok(out)
@@ -199,6 +201,8 @@ impl OpenedSnapshot {
         target: NodeId,
         crate_qualified: &str,
     ) -> Result<Vec<EnrichedCallSite>> {
+        let Some((_, selected)) = self.lookup_by_qualified_name(crate_qualified)? else { return Ok(Vec::new()); };
+        let selected_crate = selected.crate_id;
         let rtxn = self.env.read_txn()?;
         let callee_qualified_name = self
             .dbs
@@ -220,10 +224,7 @@ impl OpenedSnapshot {
             let Some(crate_id) = caller_node.crate_id else {
                 continue;
             };
-            let Some(crate_node) = self.dbs.nodes_by_id.get(&rtxn, crate_id.as_bytes())? else {
-                continue;
-            };
-            if crate_node.qualified_name != crate_qualified {
+            if Some(crate_id) != selected_crate {
                 continue;
             }
             out.push(EnrichedCallSite {
@@ -234,6 +235,7 @@ impl OpenedSnapshot {
                 end: usage.end,
                 category: usage_category_label(usage.category).to_string(),
                 relation: usage.relation,
+                expansion: usage.expansion,
             });
         }
         Ok(out)

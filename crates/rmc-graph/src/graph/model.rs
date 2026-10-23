@@ -123,6 +123,11 @@ pub struct Node {
     /// older snapshots that predate target-kind extraction.
     #[serde(default)]
     pub crate_target_kind: Option<String>,
+    /// Lexical Rust module of the declaration, independent of semantic
+    /// `parent_id` (e.g. an inherent method belongs to its type). A module
+    /// points to itself. File/span remain physical source coordinates.
+    #[serde(default)]
+    pub declaration_module: Option<NodeId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +208,32 @@ pub struct Usage {
     pub consumer_item: Option<NodeId>,
     #[serde(default)]
     pub relation: UsageRelation,
+    /// Present for an occurrence in expanded syntax. Two expanded tokens may
+    /// map to one physical source site and still be separate observations.
+    #[serde(default)]
+    pub expansion: Option<ExpansionSite>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpansionSite {
+    pub invocation_file: String,
+    /// Outermost invocation range in invocation_file, then nested invocation
+    /// ranges in each parent's expanded syntax. No per-load RA ids are stored.
+    pub call_chain: Vec<(u32, u32)>,
+    /// Referenced token's range in the innermost expanded syntax.
+    pub expanded_span: (u32, u32),
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageCounts {
+    /// Distinct persisted (target, relation, owner, physical/expanded site)
+    /// observations. Equal to usages_by_id length and legacy usage_count.
+    pub observations: u64,
+    /// Distinct (Cargo target, lexical module, physical file/start/end)
+    /// sites. Several targets/relations/expanded tokens may share one site.
+    pub source_sites: u64,
+    /// Observations with macro expansion provenance; a subset of observations.
+    pub expanded_observations: u64,
 }
 
 /// An observed call with no graph target. This is evidence of incomplete

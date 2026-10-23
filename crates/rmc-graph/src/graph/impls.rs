@@ -22,6 +22,7 @@ use ra_ap_vfs::Vfs;
 
 use super::audit_util::resolve_workspace_relative;
 use super::ids::NodeId;
+use super::identity::assoc_item_node_id;
 use super::labels::module_qualified_path;
 use super::model::{ExtractionModel, ItemKind, Node, NodeKind};
 
@@ -156,7 +157,7 @@ fn emit_assoc_item(
     workspace_root: &Path,
     def_to_node: &mut HashMap<ModuleDefId, NodeId>,
     crate_node_id: NodeId,
-    crate_name: &str,
+    _crate_name: &str,
     parent_node_id: NodeId,
     qualified_parent: Option<&str>,
     assoc: AssocItem,
@@ -202,7 +203,7 @@ fn emit_assoc_item(
         }
     };
 
-    // Resolve declaration site for byte-range disambiguation.
+    // Physical navigation is independent of semantic declaration identity.
     let nav = match def.try_to_nav(sema) {
         Some(n) => n.call_site,
         None => return, // macro-only / synthetic; can't disambiguate.
@@ -225,14 +226,9 @@ fn emit_assoc_item(
         format!("{parent_qual}::{name}")
     };
 
-    let node_id = assoc_item_node_id(
-        model.workspace_hash.as_str(),
-        item_kind,
-        crate_name,
-        rel_path.as_str(),
-        start,
-        name.as_str(),
-    );
+    let module = assoc.module(db).nearest_non_block_module(db);
+    let Some(&module_id) = def_to_node.get(&ModuleDefId::ModuleId(module.into())) else { return; };
+    let Some(node_id) = assoc_item_node_id(sema, module_id, assoc, item_kind, &name) else { return; };
 
     // If we somehow already have this id (re-entry during refactors), fold
     // into existing node and just register the def→node mapping.
@@ -250,6 +246,7 @@ fn emit_assoc_item(
             visibility: None,
             attributes: Vec::new(),
             crate_target_kind: None,
+            declaration_module: Some(module_id),
         });
         model.insert_contains(parent_node_id, node_id);
     }
@@ -260,42 +257,9 @@ fn emit_assoc_item(
     def_to_node.entry(def_id).or_insert(node_id);
 }
 
-/// NodeId of a method / assoc const / assoc type of an inherent impl or a
-/// trait declaration. Minted here and recomputed by the consumer-side usages
-/// pass (`usages::TargetIds`) — keep the two on this one function.
-///
-/// Scheme (per Layer 4 spec): workspace_hash, kind label, crate, file path,
-/// byte offset of the declaration, name. The byte offset disambiguates
-/// multiple inherent impls on the same type that re-declare a same-named
-/// method.
-pub(super) fn assoc_item_node_id(
-    workspace_hash: &str,
-    item_kind: ItemKind,
-    crate_name: &str,
-    rel_path: &str,
-    start: u32,
-    name: &str,
-) -> NodeId {
-    let kind_label = match item_kind {
-        ItemKind::Method => "method",
-        ItemKind::AssocConst => "assoc_const",
-        ItemKind::AssocType => "assoc_type",
-        _ => unreachable!("assoc_item_node_id is for assoc items, got {item_kind:?}"),
-    };
-    NodeId::from_components(&[
-        workspace_hash,
-        kind_label,
-        crate_name,
-        rel_path,
-        start.to_string().as_str(),
-        name,
-    ])
-}
-
 /// v7: emit an Item node for one enum variant, parented to the host enum's
-/// Item NodeId. NodeId scheme mirrors `emit_assoc_item`'s
-/// `[workspace_hash, "enum_variant", crate, file, byte_offset, name]` so two
-/// enums in the same module declaring same-named variants don't collide.
+/// Item NodeId. Identity derives from that enum and the variant name, so
+/// equal names in different enums are distinct without byte coordinates.
 /// Visibility is `None` (variants inherit from the parent enum, just like
 /// Method/AssocConst/AssocType).
 #[allow(clippy::too_many_arguments)]
@@ -306,7 +270,7 @@ fn emit_enum_variant(
     workspace_root: &Path,
     def_to_node: &mut HashMap<ModuleDefId, NodeId>,
     crate_node_id: NodeId,
-    crate_name: &str,
+    _crate_name: &str,
     enum_node_id: NodeId,
     variant: EnumVariant,
 ) {
@@ -335,13 +299,9 @@ fn emit_enum_variant(
         format!("{parent_qual}::{name}")
     };
 
-    let byte_offset = start.to_string();
     let node_id = NodeId::from_components(&[
-        model.workspace_hash.as_str(),
+        &enum_node_id.to_hex(),
         "enum_variant",
-        crate_name,
-        rel_path.as_str(),
-        byte_offset.as_str(),
         name.as_str(),
     ]);
 
@@ -359,6 +319,7 @@ fn emit_enum_variant(
             visibility: None,
             attributes: Vec::new(),
             crate_target_kind: None,
+            declaration_module: model.nodes[&enum_node_id].declaration_module,
         });
         model.insert_contains(enum_node_id, node_id);
     }

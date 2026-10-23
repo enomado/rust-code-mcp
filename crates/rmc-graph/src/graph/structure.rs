@@ -61,8 +61,9 @@ pub(super) fn extract_structural_items(
     let hash = model.workspace_hash.clone();
     let mut targets = TargetIds::new(vfs, &root, &hash, modules);
     attach_db(db, || {
-        let sema = Semantics::new(db);
-        for file in local_module_files(db, crates) {
+        for &krate in crates {
+          let sema = Semantics::new_for_crate(db, krate);
+          for file in local_module_files(db, &[krate]) {
             let tree = sema.parse(file).syntax().clone();
             for node in tree.descendants() {
                 let Some(def) = declaration_definition(&sema, &node) else { continue; };
@@ -83,6 +84,7 @@ pub(super) fn extract_structural_items(
                 let Some(name) = def.name(db).map(|n| n.as_str().to_owned()) else { continue; };
                 let kind = match def {
                     Definition::Field(_) => ItemKind::Field,
+                    Definition::EnumVariant(_) => ItemKind::EnumVariant,
                     _ => super::bindings::item_kind_for_def(target_def_id(def).unwrap()).unwrap(),
                 };
                 model.insert_node(Node {
@@ -91,13 +93,16 @@ pub(super) fn extract_structural_items(
                     crate_id: parent_node.crate_id, parent_id: Some(parent_node.id), item_kind: Some(kind),
                     file: Some(file), span: Some((u32::from(nav.full_range.start()), u32::from(nav.full_range.end()))),
                     visibility: None, attributes: Vec::new(), crate_target_kind: None,
+                    declaration_module: def.module(db).and_then(|m| modules.get(&m.nearest_non_block_module(db).into()).copied()),
                 });
                 model.insert_contains(parent_node.id, id);
             }
+          }
         }
         // Macro-written field declarations are not AST descendants of the
         // source file. HIR ADTs still expose them, and their owning node must
         // exist before a consumer can resolve a field target.
+        let sema = Semantics::new(db);
         let fields: Vec<_> = defs.keys().filter_map(|id| match ModuleDef::from(*id) {
             ModuleDef::Adt(adt) if crates.contains(&adt.krate(db)) => Some(match adt {
                 Adt::Struct(s) => s.fields(db),
@@ -121,6 +126,7 @@ pub(super) fn extract_structural_items(
                 crate_id: parent_node.crate_id, parent_id: Some(parent), item_kind: Some(ItemKind::Field),
                 file: Some(file), span: Some((u32::from(nav.full_range.start()), u32::from(nav.full_range.end()))),
                 visibility: None, attributes: Vec::new(), crate_target_kind: None,
+                declaration_module: parent_node.declaration_module,
             });
             model.insert_contains(parent, id);
         }

@@ -67,6 +67,8 @@ pub struct EnrichedUsage {
     pub consumer_function: Option<String>,
     pub consumer_item: Option<String>,
     pub relation: UsageRelation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expansion: Option<super::super::model::ExpansionSite>,
 }
 
 /// Dead public item enriched with display labels and navigable source span.
@@ -409,6 +411,8 @@ pub struct EnrichedCallSite {
     pub end: u32,
     pub category: String, // "Read" | "Write" | "Test" | "Other"
     pub relation: UsageRelation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expansion: Option<super::super::model::ExpansionSite>,
 }
 
 /// Result of `call_graph(root_fn, depth)` — bounded recursive descent through

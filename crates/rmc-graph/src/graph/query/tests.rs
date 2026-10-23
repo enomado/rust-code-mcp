@@ -31,6 +31,7 @@ fn test_node(qualified_name: &str, display_name: &str, item_kind: Option<ItemKin
         visibility: None,
         attributes: Vec::new(),
         crate_target_kind: None,
+        declaration_module: None,
     }
 }
 
@@ -560,6 +561,7 @@ fn dependency_node_for_climbs_item_parents_to_module() {
             visibility: None,
             attributes: Vec::new(),
             crate_target_kind: None,
+            declaration_module: None,
         },
     );
     nodes.insert(
@@ -577,6 +579,7 @@ fn dependency_node_for_climbs_item_parents_to_module() {
             visibility: None,
             attributes: Vec::new(),
             crate_target_kind: None,
+            declaration_module: None,
         },
     );
     nodes.insert(
@@ -594,6 +597,7 @@ fn dependency_node_for_climbs_item_parents_to_module() {
             visibility: None,
             attributes: Vec::new(),
             crate_target_kind: None,
+            declaration_module: None,
         },
     );
     nodes.insert(
@@ -611,6 +615,7 @@ fn dependency_node_for_climbs_item_parents_to_module() {
             visibility: None,
             attributes: Vec::new(),
             crate_target_kind: None,
+            declaration_module: None,
         },
     );
 
@@ -769,10 +774,7 @@ fn who_uses_summary_aggregates_by_consumer() {
 
 #[test]
 fn calls_from_returns_callees() {
-    // Layer 10 — call graph: `build_and_persist` is a known caller of
-    // `loader::load`. `calls_from(build_and_persist)` should include the
-    // `loader::load` ref (plus a long tail of other refs from inside the
-    // body — at minimum the loader::load call must be present).
+    // The retry wrapper calls one build attempt; the attempt owns the load.
     let snap = shared_snapshot();
     let (caller_id, _) = snap
         .lookup_by_qualified_name("rmc_graph::graph::snapshot::build_and_persist")
@@ -781,12 +783,15 @@ fn calls_from_returns_callees() {
     let calls = snap
         .calls_from(caller_id)
         .expect("calls_from failed");
+    assert!(calls.iter().any(|c| c.callee_qualified_name == "rmc_graph::graph::snapshot::build_attempt"));
+    let (attempt_id, _) = snap.lookup_by_qualified_name("rmc_graph::graph::snapshot::build_attempt").unwrap().unwrap();
+    let attempt_calls = snap.calls_from(attempt_id).unwrap();
     assert!(
-        calls
+        attempt_calls
             .iter()
             .any(|c| c.callee_qualified_name.contains("loader::load")),
-        "expected calls_from(build_and_persist) to include loader::load, got {:?}",
-        calls
+        "expected calls_from(build_attempt) to include loader::load, got {:?}",
+        attempt_calls
             .iter()
             .map(|c| &c.callee_qualified_name)
             .collect::<Vec<_>>()

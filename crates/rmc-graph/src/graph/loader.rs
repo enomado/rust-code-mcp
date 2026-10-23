@@ -137,7 +137,7 @@ fn load_with(directory: &Path, prefill_caches: bool) -> Result<LoadedWorkspace> 
         load_workspace_at(&canonical, &cargo_config, &load_config, &|_| {})
             .with_context(|| format!("failed to load workspace at {}", canonical.display()))?;
 
-    let local_crates = filter_local_crates(&db, &vfs, &targets);
+    let local_crates = filter_local_crates(&db, &vfs, &targets, &workspace_root);
 
     Ok(LoadedWorkspace {
         workspace_root,
@@ -149,7 +149,7 @@ fn load_with(directory: &Path, prefill_caches: bool) -> Result<LoadedWorkspace> 
     })
 }
 
-/// Keep only crates that are members of *this* workspace and are backed by
+/// Keep only crates under the requested directory that are backed by
 /// normal library/binary Cargo targets.
 ///
 /// ### Why `CrateOrigin::is_local` is not enough
@@ -177,15 +177,16 @@ fn load_with(directory: &Path, prefill_caches: bool) -> Result<LoadedWorkspace> 
 /// can trigger HIR/body-inference bugs in large workspaces even though the
 /// persisted hypergraph's architectural queries only need production targets.
 ///
-/// No workspace root means `cargo metadata` did not run — keep every local
-/// crate rather than turning a metadata failure into an empty graph.
-fn filter_local_crates(db: &RootDatabase, vfs: &Vfs, targets: &WorkspaceTargets) -> Vec<Crate> {
+/// Cargo membership does not widen a member-directory request to its siblings:
+/// those sources are outside the declared fingerprint slice. No Cargo workspace
+/// root means the target-kind policy falls back to unknown/default handling.
+fn filter_local_crates(db: &RootDatabase, vfs: &Vfs, targets: &WorkspaceTargets, requested_root: &Path) -> Vec<Crate> {
     Crate::all(db)
         .into_iter()
         .filter(|krate| krate.origin(db).is_local())
         .filter(|krate| {
             match crate_root_abs_path(db, vfs, *krate) {
-                Some(root_file) => should_index_crate_root(&root_file, targets),
+                Some(root_file) => root_file.starts_with(requested_root) && should_index_crate_root(&root_file, targets),
                 // No resolvable root file: keep it only when we have no
                 // workspace boundary to judge against anyway.
                 None => targets.workspace_root.is_none(),
@@ -378,12 +379,7 @@ mod tests {
                     .unwrap_or_default()
             })
             .collect();
-        assert!(
-            names
-                .iter()
-                .any(|n| n == "rust-code-mcp" || n == "rust_code_mcp"),
-            "expected rust_code_mcp in local crates, got {names:?}"
-        );
+        assert_eq!(names, ["rmc_graph"], "a member-directory request indexes that declared subtree, not sibling workspace members");
 
         // Negative half of the same load: nothing from outside this workspace.
         //
@@ -392,10 +388,7 @@ mod tests {
         // rust-analyzer tags every path dependency `CrateOrigin::Local`. Before
         // the crate-root membership check those 30+ crates were indexed as if
         // they were ours, which overflowed the extraction walk's stack.
-        let workspace_root = Path::new(manifest_dir)
-            .parent()
-            .and_then(Path::parent)
-            .expect("workspace root is two levels above crates/rmc-graph");
+        let workspace_root = Path::new(manifest_dir);
         let workspace_root = canonical_or_self(workspace_root);
         let strays: Vec<PathBuf> = loaded
             .local_crates

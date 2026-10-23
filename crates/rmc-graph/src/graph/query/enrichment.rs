@@ -56,6 +56,7 @@ impl OpenedSnapshot {
                     consumer_function,
                     consumer_item: usage.consumer_item.map(|id| required_node_by_id(self, &rtxn, id).map(|n| n.qualified_name)).transpose()?,
                     relation: usage.relation,
+                    expansion: if summary { None } else { usage.expansion },
                 })
             })
             .collect()

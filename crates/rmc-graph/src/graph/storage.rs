@@ -150,7 +150,11 @@ use super::model::{Binding, EmbeddingRecord, FunctionSignature, Node, StaticMeta
 // not relabelled as calls from target kinds. Row ownership remains per crate.
 // Adds usages_by_consumer_item and unresolved_calls_by_owner, both recorded
 // in owned_rows_by_crate and covered by snapshot comparison/deletion.
-pub(crate) const SCHEMA_VERSION: u32 = 15;
+// v16: Cargo-target identities, offset-independent associated/variant/local
+// item ids, explicit declaration modules, macro expansion provenance and
+// coherent immutable build instances. v15 snapshots can contain mixed source
+// versions and must never be reused as v16 inputs.
+pub(crate) const SCHEMA_VERSION: u32 = 16;
 pub(crate) const CURRENT_POINTER_FILENAME: &str = "CURRENT";
 pub(crate) const BUILD_LOCK_FILENAME: &str = "BUILD.lock";
 pub(crate) const SNAPSHOTS_DIRNAME: &str = "snapshots";
@@ -334,10 +338,10 @@ pub(crate) fn compute_build_inputs(workspace_root: &Path) -> Result<BuildInputs>
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| !is_source_walk_excluded(e.path()))
-        .filter_map(|e| e.ok())
     {
+        let entry = entry.with_context(|| format!("walk graph inputs at {}", workspace_root.display()))?;
         let path = entry.path();
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_file() && !(entry.file_type().is_symlink() && fs::metadata(path)?.is_file()) {
             continue;
         }
         let rel = path
@@ -414,7 +418,7 @@ pub(crate) fn compute_build_inputs(workspace_root: &Path) -> Result<BuildInputs>
 
 /// Whether a workspace-relative path is one of the files
 /// [`compute_build_inputs`] hashes.
-fn is_fingerprinted(rel: &str) -> bool {
+pub(super) fn is_fingerprinted(rel: &str) -> bool {
     let file_name = rel.rsplit('/').next().unwrap_or(rel);
     rel.ends_with(".rs")
         || matches!(file_name, "Cargo.toml" | "Cargo.lock")
@@ -785,6 +789,8 @@ pub struct GraphManifest {
     pub binding_count: u64,
     #[serde(default)]
     pub usage_count: u64,
+    #[serde(default)]
+    pub usage_counts: Option<super::model::UsageCounts>,
     /// What the snapshot was built from, by package — the base an
     /// incremental build diffs today's tree against. `None` in manifests
     /// written before incremental builds: the next build is a full one.

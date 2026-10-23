@@ -32,14 +32,15 @@ struct CachedGraphEnv {
 use super::extract;
 use super::ids::{BindingId, NodeId, UsageId};
 use super::incremental::{self, BuildPlan};
+use super::input_slice::{InputChanged, InputSlice};
 use super::loader::{self, LoadedWorkspace};
 #[cfg(test)]
 use super::model::ExtractionModel;
 use super::model::{Binding, Namespace, NodeKind, Usage};
 use super::ownership;
 use super::storage::{
-    BuildInputs, CURRENT_POINTER_FILENAME, GraphDatabases, GraphEnvOptions, GraphManifest,
-    GraphPaths, SCHEMA_VERSION, compute_build_inputs, default_data_dir, graph_id_for,
+    CURRENT_POINTER_FILENAME, GraphDatabases, GraphEnvOptions, GraphManifest,
+    GraphPaths, SCHEMA_VERSION, default_data_dir, graph_id_for,
     read_manifest, read_manifest_compatible, write_manifest,
 };
 #[cfg(test)]
@@ -79,6 +80,7 @@ pub struct BuildResult {
     pub node_count: u64,
     pub binding_count: u64,
     pub usage_count: u64,
+    pub usage_counts: Option<super::model::UsageCounts>,
     pub reused: bool,
     pub kind: BuildKind,
     pub snapshot_path: PathBuf,
@@ -233,25 +235,6 @@ fn snapshot_identity(
     }
 }
 
-/// The identity of today's tree, and the per-package inputs it hashes.
-fn compute_snapshot_identity_timed(
-    workspace_root: PathBuf,
-    paths: GraphPaths,
-    timing: bool,
-) -> Result<(SnapshotIdentity, BuildInputs)> {
-    let t = std::time::Instant::now();
-    let inputs = compute_build_inputs(&workspace_root)?;
-    if timing {
-        eprintln!(
-            "build:   compute_fingerprint          {:>9.2?}  ({} packages)",
-            t.elapsed(),
-            inputs.packages.len()
-        );
-    }
-    let identity = snapshot_identity(workspace_root, paths, inputs.fingerprint());
-    Ok((identity, inputs))
-}
-
 fn try_reuse_existing_snapshot(identity: &SnapshotIdentity) -> Result<Option<BuildResult>> {
     if !identity.manifest_path.exists() {
         return Ok(None);
@@ -269,21 +252,63 @@ fn try_reuse_existing_snapshot(identity: &SnapshotIdentity) -> Result<Option<Bui
         node_count: manifest.node_count,
         binding_count: manifest.binding_count,
         usage_count: manifest.usage_count,
+        usage_counts: manifest.usage_counts,
         reused: true,
         kind: BuildKind::Reused,
         snapshot_path: identity.snapshot_dir.clone(),
     }))
 }
 
+fn reuse_identity(identity: &SnapshotIdentity) -> Result<SnapshotIdentity> {
+    // A forced rebuild of the same contents is a new immutable instance.
+    // Prefer CURRENT to the deterministic content-addressed fallback, which
+    // may still be retained by an older reader after that forced rebuild.
+    if let Ok(id) = fs::read_to_string(&identity.paths.current_pointer_path) {
+        let id = id.trim();
+        let manifest_path = identity.paths.manifest_path(id);
+        if manifest_path.exists() {
+            if read_manifest_compatible(&manifest_path)?.is_some_and(|manifest| manifest.fingerprint == identity.fingerprint) {
+                let mut current = identity.clone();
+                current.graph_id = id.to_owned();
+                current.snapshot_dir = identity.paths.snapshot_dir(id);
+                current.manifest_path = manifest_path;
+                return Ok(current);
+            }
+        }
+    }
+    Ok(identity.clone())
+}
+
 pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<BuildResult> {
+    // Cargo may create Cargo.lock on the first load. Any changed input means
+    // discarding RA as well as the staged graph; rehashing an old RA database
+    // under the new tree's identity would publish a mixture of two versions.
+    for attempt in 0..3 {
+        match build_attempt(directory, &options) {
+            Err(error) if error.is::<InputChanged>() && attempt < 2 => {
+                tracing::info!(%error, "retry graph build with a fresh input slice");
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the final attempt returns its result")
+}
+
+fn build_attempt(directory: &Path, options: &BuildOptions) -> Result<BuildResult> {
     let timing = std::env::var_os("EXTRACT_TIMING").is_some();
     let workspace_root = canonical_workspace_root(directory)?;
 
     let paths = graph_paths_for_workspace(&workspace_root, &options);
+    paths.ensure_dirs()?;
+    // Serialize reuse, staging and publication alike. A reuse must not point
+    // CURRENT at a snapshot another builder is still replacing or pruning.
+    let _build_lock = lock_workspace_builds(&paths)?;
+    let slice = InputSlice::for_build(&workspace_root, Some(paths.root_dir.clone()))?;
+    let inputs = slice.inputs.clone();
+    let mut identity = snapshot_identity(workspace_root.clone(), paths, inputs.fingerprint());
     if !options.force_rebuild {
-        let (identity, _) =
-            compute_snapshot_identity_timed(workspace_root.clone(), paths.clone(), timing)?;
-        if let Some(result) = try_reuse_existing_snapshot(&identity)? {
+        let reusable = reuse_identity(&identity)?;
+        if let Some(result) = try_reuse_existing_snapshot(&reusable)? {
             if timing {
                 eprintln!("build:   reused existing snapshot");
             }
@@ -291,7 +316,8 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
             // names: build at X, edit and build Y, revert to X — X is still on
             // disk if a reader held it open when Y pruned. Returning "reused X"
             // while CURRENT stays at Y would make every query answer from Y.
-            publish_current_if_changed(&identity.paths, &identity.graph_id)?;
+            slice.validate(&workspace_root)?;
+            publish_current_if_changed(&reusable.paths, &reusable.graph_id)?;
             return Ok(result);
         }
     }
@@ -306,17 +332,21 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
             loaded.local_crates.len()
         );
     }
-    // Hashed (again) after the load, because the load can write to the tree:
-    // `cargo metadata` creates a missing `Cargo.lock`. The snapshot is of the
-    // tree the load read; hashed before it, the next build of an untouched
-    // tree would see a changed lockfile and rebuild in full.
-    let (identity, inputs) = compute_snapshot_identity_timed(workspace_root, paths, timing)?;
+    slice.validate(&workspace_root)?;
 
-    identity.paths.ensure_dirs()?;
-    // Taken after `loader::load` (the long part, and it touches nothing on
-    // disk here) and held to the end of the prune — so the base read below
-    // is the snapshot no other builder is replacing meanwhile.
-    let _build_lock = lock_workspace_builds(&identity.paths)?;
+    // Never unlink/rewrite an existing instance, especially CURRENT or an env
+    // held by a reader. Fingerprint names contents; graph_id names an immutable
+    // build instance. On a collision a fresh opaque id preserves both.
+    if identity.snapshot_dir.exists() {
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        identity.graph_id = NodeId::from_components(&[
+            &identity.graph_id, &std::process::id().to_string(), &nonce.to_string(), &serial.to_string(),
+        ]).to_hex();
+        identity.snapshot_dir = identity.paths.snapshot_dir(&identity.graph_id);
+        identity.manifest_path = identity.paths.manifest_path(&identity.graph_id);
+    }
 
     let plan = if options.force_rebuild {
         BuildPlan::Full {
@@ -337,11 +367,10 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
         }
     };
 
-    if identity.snapshot_dir.exists() {
-        fs::remove_dir_all(&identity.snapshot_dir)
-            .with_context(|| format!("failed to clear stale {}", identity.snapshot_dir.display()))?;
-    }
-    fs::create_dir_all(&identity.snapshot_dir)?;
+    fs::create_dir(&identity.snapshot_dir)?;
+    // Declared before the env, so the env is closed before failed staging is
+    // removed. A rejected attempt must never become a reusable snapshot.
+    let mut staged = StagedSnapshot(Some(identity.snapshot_dir.clone()));
 
     // What to (re)build, the base's crate → packages entries to keep, and
     // the report. The base is copied and closed before the new env opens.
@@ -420,6 +449,8 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
         );
     }
 
+    slice.validate(&workspace_root)?;
+    let usage_counts = Some(count_usages(&env)?);
     let manifest = GraphManifest {
         graph_id: identity.graph_id.clone(),
         workspace_root: loaded.workspace_root.display().to_string(),
@@ -430,12 +461,14 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
         node_count,
         binding_count,
         usage_count,
+        usage_counts: usage_counts.clone(),
         inputs: Some(inputs),
         crate_packages,
     };
     write_manifest(&identity.manifest_path, &manifest)?;
 
     publish_current(&identity.paths, &identity.graph_id)?;
+    staged.0 = None;
     prune_superseded_snapshots(&identity.paths, &identity.graph_id);
 
     Ok(BuildResult {
@@ -445,10 +478,38 @@ pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<Buil
         node_count,
         binding_count,
         usage_count,
+        usage_counts,
         reused: false,
         kind,
         snapshot_path: identity.snapshot_dir,
     })
+}
+
+struct StagedSnapshot(Option<PathBuf>);
+
+fn count_usages(env: &Env<WithoutTls>) -> Result<super::model::UsageCounts> {
+    let txn = env.read_txn()?;
+    let dbs = GraphDatabases::open(env, &txn)?.context("graph tables after write")?;
+    let mut counts = super::model::UsageCounts::default();
+    let mut sites = std::collections::HashSet::new();
+    for entry in dbs.usages_by_id.iter(&txn)? {
+        let (_, usage) = entry?;
+        counts.observations += 1;
+        counts.expanded_observations += u64::from(usage.expansion.is_some());
+        sites.insert((usage.consumer_module, usage.file, usage.start, usage.end));
+    }
+    counts.source_sites = sites.len() as u64;
+    Ok(counts)
+}
+
+impl Drop for StagedSnapshot {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            if let Err(error) = fs::remove_dir_all(path) {
+                tracing::warn!(path = %path.display(), %error, "remove rejected graph staging");
+            }
+        }
+    }
 }
 
 /// The whole-workspace model written in one transaction — the reference the
@@ -664,6 +725,7 @@ fn persist_test_with(
             node_count,
             binding_count,
             usage_count,
+            usage_counts: Some(count_usages(&env)?),
             inputs: None,
             crate_packages: BTreeMap::new(),
         };
@@ -703,6 +765,7 @@ pub(crate) fn usage_id_for(u: &Usage) -> UsageId {
         cat,
         format!("{:?}", u.relation).as_str(),
         u.consumer_item.map(|id| id.to_hex()).unwrap_or_default().as_str(),
+        serde_json::to_string(&u.expansion).expect("serializable expansion provenance").as_str(),
     ])
 }
 
@@ -1046,6 +1109,64 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    thread_local! {
+        static EDIT_DURING_BUILD: std::cell::RefCell<Option<(PathBuf, usize, usize)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    fn edit_loaded_source() -> bool {
+        EDIT_DURING_BUILD.with_borrow_mut(|edit| {
+            if let Some((path, remaining, serial)) = edit {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    *serial += 1;
+                    fs::write(path, format!("pub fn changed_{serial}() {{}}\n")).unwrap();
+                }
+            }
+        });
+        false
+    }
+
+    #[test]
+    fn changed_slice_reloads_and_failed_force_preserves_the_published_instance() {
+        let work = tempfile::tempdir().unwrap();
+        crate::graph::test_support::write_two_crate_fixture(work.path());
+        let data = tempfile::tempdir().unwrap();
+        let mut options = BuildOptions { data_dir_override: Some(data.path().to_owned()), ..Default::default() };
+        // The fixture has no Cargo.lock: creating it must cause a reload,
+        // then the very next build reuses the resulting immutable instance.
+        let first = build_and_persist(work.path(), options.clone()).unwrap();
+        assert!(work.path().join("Cargo.lock").exists());
+        assert_eq!(build_and_persist(work.path(), options.clone()).unwrap().graph_id, first.graph_id);
+        let paths = GraphPaths::for_workspace_in(data.path(), work.path());
+        let old_reader = open_current(&paths, options.env).unwrap().unwrap();
+        let source = work.path().join("beta/src/lib.rs");
+        EDIT_DURING_BUILD.with_borrow_mut(|edit| *edit = Some((source.clone(), 1, 0)));
+        options.force_rebuild = true;
+        options.release_free_memory = Some(edit_loaded_source);
+        let changed = build_and_persist(work.path(), options.clone()).unwrap();
+        assert_ne!(changed.graph_id, first.graph_id);
+        let changed_reader = open_current(&paths, options.env).unwrap().unwrap();
+        assert!(changed_reader.lookup_by_qualified_name("beta::changed_1").unwrap().is_some());
+        assert!(old_reader.lookup_by_qualified_name("beta::twice").unwrap().is_some());
+        // Force the same contents while a reader holds the old instance.
+        let forced = build_and_persist(work.path(), options.clone()).unwrap();
+        assert_ne!(forced.graph_id, changed.graph_id);
+        let reused = build_and_persist(work.path(), BuildOptions { force_rebuild: false, release_free_memory: None, ..options.clone() }).unwrap();
+        assert!(reused.reused);
+        assert_eq!(reused.graph_id, forced.graph_id);
+        let before = snapshot_names(&paths);
+        // Continuous writes exhaust retries; neither CURRENT nor any old
+        // reader is damaged, and all rejected staging directories are gone.
+        EDIT_DURING_BUILD.with_borrow_mut(|edit| *edit = Some((source, 100, 1)));
+        assert!(build_and_persist(work.path(), options.clone()).unwrap_err().is::<InputChanged>());
+        EDIT_DURING_BUILD.with_borrow_mut(|edit| *edit = None);
+        assert_eq!(fs::read_to_string(&paths.current_pointer_path).unwrap().trim(), forced.graph_id);
+        assert_eq!(snapshot_names(&paths), before);
+        assert!(changed_reader.lookup_by_qualified_name("beta::changed_1").unwrap().is_some());
+        let repaired = build_and_persist(work.path(), BuildOptions { release_free_memory: None, ..options }).unwrap();
+        assert_ne!(repaired.graph_id, forced.graph_id);
+    }
+
     #[test]
     fn clear_workspace_snapshots_dry_run_reports_without_removing() {
         let td = tempfile::tempdir().unwrap();
@@ -1140,6 +1261,7 @@ mod tests {
             node_count: 11,
             binding_count: 7,
             usage_count: 5,
+            usage_counts: None,
             inputs: None,
             crate_packages: BTreeMap::new(),
         };

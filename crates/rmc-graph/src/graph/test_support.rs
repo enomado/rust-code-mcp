@@ -30,8 +30,12 @@ pub(crate) fn shared_snapshot() -> &'static OpenedSnapshot {
                 data_dir_override: Some(td.path().to_path_buf()),
                 ..Default::default()
             };
-            let result =
-                build_and_persist(Path::new(env!("CARGO_MANIFEST_DIR")), opts).unwrap();
+            // These cross-crate query/signature fixtures intentionally use
+            // rmc-server and rmc-engine too. Declare the workspace root rather
+            // than relying on a member request silently including siblings.
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().and_then(Path::parent)
+                .expect("rmc-graph is under crates/ in the workspace");
+            let result = build_and_persist(root, opts).unwrap();
             let paths = GraphPaths::for_workspace_in(td.path(), &result.workspace_root);
             let snap = open_current(&paths, GraphEnvOptions::default())
                 .unwrap()

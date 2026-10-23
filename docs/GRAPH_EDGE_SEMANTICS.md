@@ -29,8 +29,8 @@ signature types do not become body references. Closures belong to their parent
 function; nested functions and trait implementation methods own their bodies.
 Trait implementation qualified names include `<Self as trait-path>` and differ
 from the declaration. Inherent methods keep their existing semantic parent.
-Physical file/module versus semantic owner and Cargo-target identity remain
-separate follow-up work; these fields do not solve those identity questions.
+Schema v16 adds independent declaration modules, Cargo-target identities and
+expansion provenance; see [identity and snapshot contract](GRAPH_IDENTITY_AND_SNAPSHOT.md).
 
 `calls_from`, `who_calls`, recursive call queries and recursion checking consume
 only Call/TraitDispatch. `who_uses` retains every resolved relation.
@@ -112,7 +112,7 @@ The generated-function correction scans HIR function sources; it is not a
 general scan of every macro-produced declaration.
 
 Same-name lib/bin collisions, byte-offset-sensitive associated item IDs,
-macro source-versus-expansion multiplicity, and the independently reproduced
-load/fingerprint race remain the next identity/snapshot task. The strict whole
-assessor must keep reporting remaining Cargo-target gaps; they are not accepted
-as expected semantics merely to make this task green.
+macro source-versus-expansion multiplicity and the reproduced load/fingerprint
+race are corrected by [schema v16](GRAPH_IDENTITY_AND_SNAPSHOT.md). The strict
+assessor checks target contexts, physical/semantic ownership and macro
+multiplicity against the unchanged handwritten expectations.

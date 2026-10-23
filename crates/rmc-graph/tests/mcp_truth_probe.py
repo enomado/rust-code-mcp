@@ -79,6 +79,7 @@ def main():
     parser.add_argument("workspace", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--race", action="store_true")
+    parser.add_argument("--identity", action="store_true", help="assert v16 target, expansion and reuse contracts")
     parser.add_argument("--race-read", type=int, default=2,
                         help="mutate after this source close-read event (Linux)")
     args = parser.parse_args()
@@ -136,6 +137,26 @@ def main():
             result["build"] = client.tool("build_hypergraph", {"directory": str(root)})
             for caller in ["direct", "helper", "data", "closures"]:
                 result[caller] = client.tool("calls_from", {"directory": str(root), "caller": "truth_app::" + caller})
+            if args.identity:
+                def body(response):
+                    assert "error" not in response, response
+                    assert not response["result"].get("isError"), response
+                    return json.loads(response["result"]["content"][0]["text"])
+                result["identity_calls"] = {
+                    caller: client.tool("calls_from", {"directory": str(root), "caller": caller})
+                    for caller in ["truth_app[lib]::helper", "truth_app[bin]::helper", "truth_app::macros"]}
+                lib, binary, macros = [body(response) for response in result["identity_calls"].values()]
+                assert lib["total_match_count"] == 1 and lib["call_sites"][0]["callee_qualified_name"] == "truth_dep::leaf"
+                assert binary["total_match_count"] == 1 and binary["call_sites"][0]["callee_qualified_name"] == "truth_dep::register"
+                assert macros["total_match_count"] == 2
+                assert len({json.dumps(site["expansion"], sort_keys=True) for site in macros["call_sites"]}) == 2
+                assert "error" in result["helper"] or result["helper"]["result"].get("isError"), result["helper"]
+                result["reuse"] = client.tool("build_hypergraph", {"directory": str(root)})
+                built, reused = body(result["build"]), body(result["reuse"])
+                assert reused["reused"] and reused["graph_id"] == built["graph_id"]
+                assert built["usage_counts"]["observations"] == built["usage_count"]
+                assert 0 < built["usage_counts"]["expanded_observations"] < built["usage_count"]
+                result["identity_assertions"] = 8
         result["stderr"] = client.log
         args.output.write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps({"output": str(args.output), "race_edit": changed}))

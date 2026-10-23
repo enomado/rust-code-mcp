@@ -53,9 +53,8 @@ use super::bindings::{
     item_kind_for_def, local_item_node_id, module_def_owner_module, name_for_def,
 };
 use super::ids::NodeId;
-use super::impls::assoc_item_node_id;
-use super::labels::{crate_display_name, module_qualified_path};
-use super::model::{ExtractionModel, ItemKind, NodeKind, Usage, UsageCategory, UsageRelation};
+use super::identity::assoc_item_node_id;
+use super::model::{ExpansionSite, ExtractionModel, ItemKind, NodeKind, Usage, UsageCategory, UsageRelation};
 use super::structure::{declaration_definition, is_active};
 use super::relations::{concrete_function, relation};
 
@@ -74,7 +73,12 @@ pub(crate) fn extract_usages(
         UsagesPass::FromTargets => {
             usages_from_targets(model, db, vfs, &files, def_to_node, module_node_for)
         }
-        UsagesPass::FromConsumers => usages_from_consumers(model, db, vfs, &files, def_to_node, module_node_for),
+        UsagesPass::FromConsumers => {
+            for &krate in local_crates {
+                let files = local_module_files(db, &[krate]);
+                usages_from_consumers(model, db, vfs, krate, &files, def_to_node, module_node_for);
+            }
+        }
     }
 }
 
@@ -303,6 +307,7 @@ fn push_usage(
         consumer_function,
         consumer_item: consumer_function,
         relation: found.relation,
+        expansion: None,
     });
 }
 
@@ -387,6 +392,7 @@ fn usages_from_consumers(
     model: &mut ExtractionModel,
     db: &RootDatabase,
     vfs: &Vfs,
+    krate: Crate,
     files: &[EditionedFileId],
     def_to_node: &HashMap<ModuleDefId, NodeId>,
     module_node_for: &HashMap<ModuleId, NodeId>,
@@ -396,7 +402,7 @@ fn usages_from_consumers(
     let mut targets = TargetIds::new(vfs, &workspace_root, &workspace_hash, module_node_for);
 
     attach_db(db, || {
-        let sema = Semantics::new(db);
+        let sema = Semantics::new_for_crate(db, krate);
         let mut found = Vec::new();
         for &file in files {
             scan_file(&sema, &mut targets, file, &mut found);
@@ -408,6 +414,7 @@ fn usages_from_consumers(
         for def_id in def_to_node.keys() {
             let ModuleDefId::FunctionId(id) = *def_id else { continue; };
             let func: ra_ap_hir::Function = id.into();
+            if func.module(db).krate(db) != krate { continue; }
             let Some(src) = sema.source(func) else { continue; };
             if src.file_id.macro_file().is_none() { continue; }
             let origin = sema.original_range(src.value.syntax());
@@ -433,9 +440,25 @@ fn usages_from_consumers(
                     target: f.target, consumer_module, file: path,
                     start: u32::from(f.range.start()), end: u32::from(f.range.end()),
                     category: f.category, relation: f.relation, consumer_function, consumer_item,
+                    expansion: expansion_site(&sema, vfs, &workspace_root, node),
                 });
         }
     });
+}
+
+fn expansion_site(sema: &Semantics<'_, RootDatabase>, vfs: &Vfs, root: &Path, node: &SyntaxNode) -> Option<ExpansionSite> {
+    let mut file = sema.hir_file_for(node);
+    if file.macro_file().is_none() { return None; }
+    let mut call_chain = Vec::new();
+    while let Some(call) = file.call_node(sema.db) {
+        let range = call.value.text_range();
+        call_chain.push((u32::from(range.start()), u32::from(range.end())));
+        file = call.file_id;
+    }
+    call_chain.reverse();
+    let invocation_file = resolve_workspace_relative(vfs, file.file_id()?.file_id(sema.db), root)?;
+    let range = node.text_range();
+    Some(ExpansionSite { invocation_file, call_chain, expanded_span: (u32::from(range.start()), u32::from(range.end())) })
 }
 
 fn scan_file(
@@ -662,19 +685,17 @@ fn convert_to_def_in_trait<'db>(db: &RootDatabase, def: Definition<'db>) -> Defi
 
 /// NodeId of a usage target, computed from RA alone with the functions the
 /// producer passes mint it with (`bindings::local_item_node_id`,
-/// `impls::assoc_item_node_id`) — no producer rows needed. `None` exactly for
+/// `identity::assoc_item_node_id`) — no producer rows needed. `None` exactly for
 /// the defs the producer passes do not turn into Item nodes reachable through
 /// `def_to_node`:
 /// * module-level and block-local items: a local non-block ancestor module;
 /// * trait-declaration items: the trait's module likewise;
 /// * impl items: only impls `Impl::all_in_crate` lists (it misses impls
 ///   inside fn bodies, reported as unresolved targets when called);
-/// * assoc items need a declaration site inside the workspace (the byte
-///   offset is part of the id).
+/// * assoc items need a represented declaration module and container header.
 pub(super) struct TargetIds<'a> {
     vfs: &'a Vfs,
     workspace_root: &'a Path,
-    workspace_hash: &'a str,
     local_modules: &'a HashMap<ModuleId, NodeId>,
     by_def: HashMap<ModuleDefId, Option<NodeId>>,
     listed_impls: HashMap<Crate, HashSet<Impl>>,
@@ -691,13 +712,12 @@ impl<'a> TargetIds<'a> {
     pub(super) fn new(
         vfs: &'a Vfs,
         workspace_root: &'a Path,
-        workspace_hash: &'a str,
+        _workspace_hash: &'a str,
         local_modules: &'a HashMap<ModuleId, NodeId>,
     ) -> Self {
         Self {
             vfs,
             workspace_root,
-            workspace_hash,
             local_modules,
             by_def: HashMap::new(),
             listed_impls: HashMap::new(),
@@ -730,13 +750,9 @@ impl<'a> TargetIds<'a> {
     ) -> Option<NodeId> {
         let db = sema.db;
         if let Definition::EnumVariant(variant) = def {
-            let nav = def.try_to_nav(sema)?.call_site;
-            let path = resolve_workspace_relative(self.vfs, nav.file_id, self.workspace_root)?;
-            let owner: ModuleId = variant.module(db).into();
-            if !self.local_modules.contains_key(&owner) { return None; }
+            let parent = self.of_definition(sema, Definition::Adt(ra_ap_hir::Adt::Enum(variant.parent_enum(db))))?;
             return Some(NodeId::from_components(&[
-                self.workspace_hash, "enum_variant", &crate_display_name(db, variant.krate(db)),
-                &path, &u32::from(nav.full_range.start()).to_string(), variant.name(db).as_str(),
+                &parent.to_hex(), "enum_variant", variant.name(db).as_str(),
             ]));
         }
         let Some(assoc) = def.as_assoc_item(db) else {
@@ -745,30 +761,40 @@ impl<'a> TargetIds<'a> {
                 let module = ra_ap_hir::Module::from(owner).nearest_non_block_module(db);
                 if !self.local_modules.contains_key(&module.into()) { return None; }
                 let nav = def.try_to_nav(sema)?.call_site;
-                let path = resolve_workspace_relative(self.vfs, nav.file_id, self.workspace_root)?;
+                let tree = sema.parse(EditionedFileId::new(db, nav.file_id, module.krate(db).edition(db)));
+                let declaration = tree.syntax().descendants().find(|node| node.text_range() == nav.full_range
+                    && declaration_definition(sema, node) == Some(def))?;
+                let parent_node = declaration.ancestors().skip(1)
+                    .find(|node| declaration_definition(sema, node).is_some())?;
+                let parent_def = declaration_definition(sema, &parent_node)?;
+                let parent = self.of_definition(sema, parent_def)?;
+                // A lexical block ordinal distinguishes same-named local
+                // declarations in sibling scopes, without byte coordinates.
+                // Inserting a new block before it changes that lexical key;
+                // inserting comments, whitespace or non-block statements does not.
+                let block = declaration.ancestors().find(|n| ast::BlockExpr::can_cast(n.kind()));
+                let ordinal = block.and_then(|block| parent_node.descendants()
+                    .filter(|n| ast::BlockExpr::can_cast(n.kind())).position(|n| n == block))?;
                 return Some(NodeId::from_components(&[
-                    self.workspace_hash, "block_item", &crate_display_name(db, module.krate(db)),
-                    &path, &u32::from(nav.full_range.start()).to_string(), &name_for_def(db, def_id)?,
+                    &parent.to_hex(), "block_item", &ordinal.to_string(),
+                    super::labels::item_kind_id_label(item_kind_for_def(def_id)?), &name_for_def(db, def_id)?,
                 ]));
             }
             if !self.local_modules.contains_key(&owner) {
                 return None;
             }
             return Some(local_item_node_id(
-                self.workspace_hash,
-                &crate_display_name(db, owner.krate(db).into()),
-                &module_qualified_path(db, owner),
+                *self.local_modules.get(&owner)?,
                 item_kind_for_def(def_id)?,
                 &name_for_def(db, def_id)?,
             ));
         };
-        let krate = match assoc.container(db) {
+        match assoc.container(db) {
             AssocItemContainer::Trait(trait_) => {
                 let owner = module_def_owner_module(db, ModuleDefId::TraitId(trait_.into()))?;
                 if !self.local_modules.contains_key(&owner) {
                     return None;
                 }
-                trait_.krate(db)
             }
             AssocItemContainer::Impl(impl_) => {
                 let owner = impl_.module(db).nearest_non_block_module(db);
@@ -781,7 +807,6 @@ impl<'a> TargetIds<'a> {
                 if !listed.contains(&impl_) {
                     return None;
                 }
-                krate
             }
         };
         let (item_kind, name) = match assoc {
@@ -789,16 +814,8 @@ impl<'a> TargetIds<'a> {
             AssocItem::Const(c) => (ItemKind::AssocConst, c.name(db)?),
             AssocItem::TypeAlias(t) => (ItemKind::AssocType, t.name(db)),
         };
-        let nav = def.try_to_nav(sema)?.call_site;
-        let rel_path = resolve_workspace_relative(self.vfs, nav.file_id, self.workspace_root)?;
-        Some(assoc_item_node_id(
-            self.workspace_hash,
-            item_kind,
-            &crate_display_name(db, krate),
-            &rel_path,
-            u32::from(nav.full_range.start()),
-            name.as_str(),
-        ))
+        let module = assoc.module(db).nearest_non_block_module(db);
+        assoc_item_node_id(sema, *self.local_modules.get(&module.into())?, assoc, item_kind, name.as_str())
     }
 }
 
@@ -1426,7 +1443,13 @@ pub mod inner {
             for usage in &mut model.usages {
                 usage.relation = crate::graph::model::UsageRelation::Unknown;
                 usage.consumer_item = usage.consumer_function;
+                // Legacy parity has source-site units: FindUsages collapses
+                // macro multiplicity and stores no expansion provenance.
+                // Exact expanded occurrences have an independent oracle.
+                usage.expansion = None;
             }
+            let mut sites = std::collections::HashSet::new();
+            model.usages.retain(|usage| sites.insert(crate::graph::snapshot::usage_id_for(usage)));
             model.unresolved_calls.clear();
         }
 

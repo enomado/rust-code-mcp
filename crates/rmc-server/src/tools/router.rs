@@ -321,7 +321,7 @@ impl SearchToolRouter {
     // ----- Hypergraph tools (Layer 7) -----
 
     #[tool(
-        description = "Build or reuse a persisted workspace hypergraph snapshot (HIR-driven, no_deps=false)"
+        description = "Build or reuse an immutable HIR workspace graph for a coherent source slice (all features, lib/bin targets; no proc-macro/build outputs/test cfg). Distinct Cargo target identities; usage_count counts static reference observations, usage_counts also reports physical source sites and macro-expanded observations. Concurrent source edits reload from a fresh slice, or fail without replacing CURRENT after three changed attempts. force_rebuild creates a fresh instance; fingerprint identifies contents. Ambiguous paths require target selectors such as app[lib]::helper / app[bin]::helper."
     )]
     async fn build_hypergraph(
         &self,

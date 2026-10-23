@@ -973,6 +973,7 @@ fn usage_summary_omits_navigation_fields() {
         consumer_function: Some("crate::module::caller".to_string()),
         consumer_item: Some("crate::module::caller".to_string()),
         relation: rmc_graph::graph::model::UsageRelation::Read,
+        expansion: None,
     };
 
     let body = serde_json::to_value(&usage).unwrap();
@@ -994,6 +995,7 @@ fn call_site_summary_omits_navigation_fields() {
         end: 20,
         category: "Read".to_string(),
         relation: rmc_graph::graph::model::UsageRelation::Call,
+        expansion: None,
     };
 
     let summary = serde_json::to_value(&call_site_views(vec![site.clone()], true)[0]).unwrap();

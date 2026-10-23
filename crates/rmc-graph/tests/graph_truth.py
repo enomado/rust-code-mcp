@@ -14,6 +14,8 @@ def assess(root, evidence):
         return nodes.get(tuple(node_id)) if node_id is not None else None
 
     nodes = {tuple(n["id"]): n for n in evidence["nodes"]}
+    def target_kind(item):
+        return (node(item.get("crate_id")) or {}).get("crate_target_kind") if item else None
     sources = {str(p.relative_to(root)): p.read_text() for p in root.rglob("*.rs")
                if "target" not in p.relative_to(root).parts}
     structure_file = root / "expected-structure.json"
@@ -44,6 +46,7 @@ def assess(root, evidence):
                              "caller": caller["qualified_name"] if caller else None,
                              "caller_file": caller.get("file") if caller else None,
                              "owner": owner["qualified_name"] if owner else None,
+                             "target_kind": target_kind(target), "owner_kind": target_kind(owner),
                              "relation": u.get("relation"),
                              "module": module["qualified_name"], "category": u["category"],
                              "range": [u["start"], u["end"]]})
@@ -77,7 +80,6 @@ def assess(root, evidence):
             if expected_target not in targets:
                 issues.append("wrong_target" if targets else "missing_edge")
                 status = "wrong_target" if targets else "missing_edge"
-            # Oracle target identities are deliberately richer than current graph IDs.
             expected_owner = row["owner"].replace("[lib]", "").replace("[bin]", "")
             matching = [o for o in observed if o["target"] == expected_target]
             if hits and not any(o["owner"] == expected_owner for o in observed):
@@ -89,21 +91,48 @@ def assess(root, evidence):
             if row["target"].startswith("truth_app[bin]") and hits:
                 if not any(o["target_file"] == "app/src/main.rs" for o in observed):
                     issues.append("target_identity_collision")
-            if "[lib]" in row["owner"] or "[bin]" in row["owner"]:
-                issues.append("cargo_target_context_unrepresented")
+            for role in ("owner", "target"):
+                for kind in ("lib", "bin"):
+                    if f"[{kind}]" in row[role] and not any(o[role + "_kind"] == kind for o in matching):
+                        issues.append("cargo_target_context_unrepresented")
             if matching and not all(o["relation"] == row["relation"] for o in matching):
                 issues.append("relation_unrepresented:" + row["relation"])
         expected_module = structure.get("modules_by_site", {}).get(row["site"])
         if hits and expected_module and not all(o["module"] == expected_module for o in observed):
             issues.append("wrong_consumer_module")
+        if row["site"] in structure.get("source_sites", {}):
+            expected = structure["source_sites"][row["site"]]
+            if len({(u["file"], u["start"], u["end"]) for u in hits}) != expected:
+                issues.append("wrong_source_multiplicity")
+        if row["site"] in structure.get("expanded_sites", {}):
+            expected = structure["expanded_sites"][row["site"]]
+            expansions = {json.dumps(u.get("expansion"), sort_keys=True) for u in hits if u.get("expansion")}
+            if len(expansions) != expected:
+                issues.append("wrong_expanded_multiplicity")
         results.append({**row, "file": file, "start": start, "end": end,
                         "status": status, "issues": issues, "observed": observed})
     counts = collections.Counter(issue for row in results for issue in row["issues"])
+    structural_issues = []
+    if "method_location" in structure:
+        expected = structure["method_location"]
+        method = next((n for n in nodes.values() if n["qualified_name"] == expected["qualified_name"]), {})
+        for field, actual in (("semantic_owner", node(method.get("parent_id"))),
+                              ("physical_module", node(method.get("declaration_module")))):
+            if (actual or {}).get("qualified_name") != expected[field]:
+                structural_issues.append("wrong_" + field)
+        if method.get("file") != expected["physical_file"]:
+            structural_issues.append("wrong_physical_file")
+    for expected in structure.get("distinct_targets", []):
+        if not any(n.get("kind") == "Crate" and n["qualified_name"] == expected["name"]
+                   and n.get("crate_target_kind") == expected["kind"] and n.get("file") == expected["root"]
+                   for n in nodes.values()):
+            structural_issues.append("missing_target:" + expected["kind"])
+    counts.update(structural_issues)
     return {"oracle": "handwritten expected.tsv; selected identifier sites, not exhaustive",
             "counts": {"sites": len(results), "included": sum(r["coverage"] == "included" for r in results),
                        "issues": dict(counts), "statuses": dict(collections.Counter(r["status"] for r in results))},
             "raw_counts": {key: len(evidence[key]) for key in ("nodes", "usages", "bindings")},
-            "sites": results}
+            "sites": results, "structural_issues": structural_issues}
 
 
 def main():

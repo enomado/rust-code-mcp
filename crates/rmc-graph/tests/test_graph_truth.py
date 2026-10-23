@@ -1,5 +1,6 @@
 """Guard the assessor against silently accepting missing or misattributed edges."""
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +11,32 @@ SPEC.loader.exec_module(TRUTH)
 
 
 class TruthAssessment(unittest.TestCase):
+    def test_target_context_and_expansion_multiplicity_require_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = "fn caller() { /*@call*/leaf(); }"
+            (root / "lib.rs").write_text(source)
+            (root / "expected.tsv").write_text(
+                "site\ttoken\trelation\ttarget\towner\tcoverage\n"
+                "call\tleaf\tCall\tdep::leaf\tapp[bin]::caller\tincluded\n")
+            (root / "expected-structure.json").write_text(json.dumps({
+                "source_sites": {"call": 1}, "expanded_sites": {"call": 2}}))
+            nodes = [{"id": [1], "qualified_name": "dep::leaf"},
+                     {"id": [2], "qualified_name": "app::caller", "crate_id": [3], "file": "app/src/main.rs"},
+                     {"id": [3], "qualified_name": "app", "crate_target_kind": "lib"}]
+            start = source.index("leaf")
+            usage = {"target": [1], "consumer_item": [2], "consumer_function": [2], "consumer_module": [3],
+                     "file": "lib.rs", "start": start, "end": start + 4, "category": "Other", "relation": "Call"}
+            raw = {"nodes": nodes, "bindings": [], "usages": [usage]}
+            issues = TRUTH.assess(root, raw)["counts"]["issues"]
+            self.assertIn("cargo_target_context_unrepresented", issues)
+            self.assertIn("wrong_expanded_multiplicity", issues)
+            nodes[2]["crate_target_kind"] = "bin"
+            raw["usages"] = [{**usage, "expansion": {"expanded_span": [i, i+1]}} for i in (1, 2)]
+            self.assertFalse(TRUTH.assess(root, raw)["counts"]["issues"])
+            raw["usages"][1]["expansion"] = raw["usages"][0]["expansion"]
+            self.assertIn("wrong_expanded_multiplicity", TRUTH.assess(root, raw)["counts"]["issues"])
+
     def test_missing_target_owner_and_kind_are_independent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

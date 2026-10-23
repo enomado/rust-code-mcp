@@ -59,6 +59,7 @@ pub(crate) async fn build_hypergraph(
         node_count: result.node_count,
         binding_count: result.binding_count,
         usage_count: result.usage_count,
+        usage_counts: result.usage_counts,
         reused: result.reused,
         build: result.kind,
         snapshot_path: result.snapshot_path.display().to_string(),
@@ -73,6 +74,7 @@ pub(crate) struct BuildHypergraphResponse {
     pub(crate) node_count: u64,
     pub(crate) binding_count: u64,
     pub(crate) usage_count: u64,
+    pub(crate) usage_counts: Option<rmc_graph::graph::model::UsageCounts>,
     pub(crate) reused: bool,
     /// Reused, full (with the reason) or incremental (which crates).
     pub(crate) build: BuildKind,
@@ -439,6 +441,7 @@ pub(crate) fn call_site_views(sites: Vec<EnrichedCallSite>, summary: bool) -> Ve
             end: if summary { None } else { Some(site.end) },
             category: site.category,
             relation: site.relation,
+            expansion: if summary { None } else { site.expansion },
         })
         .collect()
 }
@@ -558,6 +561,8 @@ pub(crate) struct CallSiteView {
     pub(crate) end: Option<u32>,
     pub(crate) category: String,
     pub(crate) relation: rmc_graph::graph::model::UsageRelation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) expansion: Option<rmc_graph::graph::model::ExpansionSite>,
 }
 
 #[derive(Debug, Serialize)]

@@ -242,6 +242,7 @@ fn resolve_or_create_target(
                 visibility: None,
                 attributes: Vec::new(),
                 crate_target_kind: None,
+                declaration_module: None,
             });
         }
         def_to_node.insert(def_id, node_id);
@@ -269,9 +270,7 @@ fn create_local_item_node(
     let qualified = format!("{module_qual}::{name}");
 
     let node_id = local_item_node_id(
-        model.workspace_hash.as_str(),
-        from_crate_name,
-        module_qual.as_str(),
+        module_node_id,
         item_kind,
         name.as_str(),
     );
@@ -291,6 +290,7 @@ fn create_local_item_node(
         visibility: None,
         attributes: Vec::new(),
         crate_target_kind: None,
+        declaration_module: Some(module_node_id),
     });
 
     Some(node_id)
@@ -301,17 +301,13 @@ fn create_local_item_node(
 /// pass (`usages::TargetIds`) recomputes it for a reference without needing
 /// the producer crate's extracted rows.
 pub(super) fn local_item_node_id(
-    workspace_hash: &str,
-    crate_name: &str,
-    module_qual: &str,
+    module: NodeId,
     item_kind: ItemKind,
     name: &str,
 ) -> NodeId {
     NodeId::from_components(&[
-        workspace_hash,
+        &module.to_hex(),
         "item",
-        crate_name,
-        module_qual,
         item_kind_label(item_kind),
         name,
     ])
@@ -420,15 +416,11 @@ fn encode_visibility(
     match vis {
         HirVisibility::Public => BindingVisibility::Public,
         HirVisibility::PubCrate(crate_id) => {
-            let crate_name = ra_ap_hir::Crate::from(crate_id)
-                .display_name(db)
-                .map(|n| n.canonical_name().as_str().to_string())
-                .unwrap_or_default();
-            let crate_node_id = NodeId::from_components(&[
-                model.workspace_hash.as_str(),
-                "crate",
-                crate_name.as_str(),
-            ]);
+            let root_module = ra_ap_hir::Crate::from(crate_id).root_module(db);
+            let Some(crate_node_id) = module_node_for.get(&root_module.into())
+                .and_then(|id| model.nodes.get(id)).and_then(|n| n.crate_id) else {
+                    return BindingVisibility::Private;
+                };
             if model.nodes.contains_key(&crate_node_id) {
                 BindingVisibility::Crate(crate_node_id)
             } else if from_crate == crate_node_id {
