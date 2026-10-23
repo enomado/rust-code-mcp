@@ -153,14 +153,21 @@ pub(crate) fn extract_by_crate(
     for group in &groups {
         let t = std::time::Instant::now();
         let mut model = skeleton.model.clone();
-        run_passes(
+        let passes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_passes(
             &mut model,
             loaded,
             &group.crates,
             &skeleton.maps,
             usages_pass,
-            false,
-        );
+            timing,
+        )));
+        if let Err(payload) = passes {
+            match payload.downcast::<ra_ap_ide_db::base_db::salsa::Cancelled>() {
+                Ok(cancelled) => return Err(anyhow::Error::new(*cancelled).context(format!(
+                    "extracting crate `{}`; source drift: {:?}", group.name, loaded.db.file_text_drift()))),
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
         write(&model, group)?;
         drop(model);
         give_back(loaded);

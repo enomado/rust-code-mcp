@@ -4,7 +4,15 @@ use anyhow::{Result, Context, bail};
 use rmc_graph::graph::{self, export, GraphPaths, GraphEnvOptions};
 
 fn main() -> Result<()> {
-    std::thread::Builder::new().stack_size(64 * 1024 * 1024).spawn(run)?.join().expect("graph export thread panicked")
+    match std::thread::Builder::new().name("graph-export".into()).stack_size(64 * 1024 * 1024).spawn(run)?.join() {
+        Ok(result) => result,
+        Err(payload) => {
+            if let Some(cancelled) = payload.downcast_ref::<ra_ap_ide_db::base_db::salsa::Cancelled>() {
+                bail!("graph extraction {cancelled}");
+            }
+            std::panic::resume_unwind(payload)
+        }
+    }
 }
 
 fn run() -> Result<()> {

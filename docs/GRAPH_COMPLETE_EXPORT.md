@@ -54,7 +54,7 @@ schema migration is necessary. Existing v16 manifests remain readable and
 report absent extraction provenance as null. Exporter versions are separate
 from builder versions and never substitute for them.
 
-The builder captures MCP/RA Git revisions (with `+dirty` when applicable),
+The builder captures MCP/RA/Salsa Git revisions (with `+dirty` when applicable),
 all-features/lib-bin/test/build-output/proc-macro policies, per-target edition
 and sorted actual `CfgOptions` debug strings. Those strings include enabled
 features and target cfg atoms; they are diagnostics, not Rust expressions.
@@ -75,6 +75,14 @@ The resulting provenance inventory and dirty patch sit beside the copy.
 Ignored inputs remain an explicit limitation. The snapshot builder additionally
 checks its source slice before loading and publication. Git moves/edits after a
 successful freeze cannot change the copied graph input.
+
+Usage extraction never skips tokens/items after an RA panic. A failed query
+rejects the entire staged snapshot. A propagated parallel-query cancellation
+can be transient: the builder retries with a fresh RA database (at most three
+attempts, shared with source-change retries); local cancellation and arbitrary
+panics are not retried. Exhaustion returns the error and preserves CURRENT.
+The CLI reports cancellation and the consumer scanner reports the failing site.
+This prevents a partially recovered RA database from becoming a "complete" graph.
 
 ## Aggregation contract
 

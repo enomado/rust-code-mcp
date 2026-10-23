@@ -280,13 +280,32 @@ fn reuse_identity(identity: &SnapshotIdentity) -> Result<SnapshotIdentity> {
 }
 
 pub fn build_and_persist(directory: &Path, options: BuildOptions) -> Result<BuildResult> {
+    retry_build(|| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_attempt(directory, &options))) {
+        Ok(result) => result,
+        Err(payload) => match payload.downcast::<ra_ap_ide_db::base_db::salsa::Cancelled>() {
+            Ok(cancelled) => Err(anyhow::Error::new(*cancelled).context("rust-analyzer cancelled graph build")),
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+    })
+}
+
+fn retry_build<T>(mut build: impl FnMut() -> Result<T>) -> Result<T> {
     // Cargo may create Cargo.lock on the first load. Any changed input means
     // discarding RA as well as the staged graph; rehashing an old RA database
     // under the new tree's identity would publish a mixture of two versions.
     for attempt in 0..3 {
-        match build_attempt(directory, &options) {
-            Err(error) if error.is::<InputChanged>() && attempt < 2 => {
-                tracing::info!(%error, "retry graph build with a fresh input slice");
+        match build() {
+            Err(error) if attempt < 2 && (error.is::<InputChanged>() || matches!(
+                error.downcast_ref::<ra_ap_ide_db::base_db::salsa::Cancelled>(),
+                Some(ra_ap_ide_db::base_db::salsa::Cancelled::PropagatedPanic)
+            )) => {
+                // A failed parallel query can cancel a dependent query even
+                // for unchanged inputs. Never continue that database or skip
+                // tokens: discard the whole staged graph and reload RA.
+                tracing::warn!(%error, "retry graph build with a fresh input slice and database");
+                if std::env::var_os("EXTRACT_TIMING").is_some() {
+                    eprintln!("build: retry {} after {error:#}", attempt + 1);
+                }
             }
             result => return result,
         }
@@ -468,6 +487,7 @@ fn build_attempt(directory: &Path, options: &BuildOptions) -> Result<BuildResult
         if dirty_crates.contains(krate) {
             row_origins.insert(key, serde_json::json!({"graph_id": identity.graph_id,
                 "extractor_revision": env!("RMC_GRAPH_REVISION"), "ra_revision": env!("RMC_RA_REVISION"),
+                "salsa_revision": env!("RMC_SALSA_REVISION"),
                 "target": target}));
         }
         target
@@ -477,6 +497,7 @@ fn build_attempt(directory: &Path, options: &BuildOptions) -> Result<BuildResult
         extraction_context: Some(serde_json::json!({
             "extractor_revision": env!("RMC_GRAPH_REVISION"),
             "ra_revision": env!("RMC_RA_REVISION"),
+            "salsa_revision": env!("RMC_SALSA_REVISION"),
             "features": "all", "all_targets": false, "set_test": false,
             "build_script_outputs": false, "proc_macro_server": false,
             "targets": targets, "row_origins": row_origins, "incremental_base": base_graph_id,
@@ -1134,6 +1155,32 @@ fn open_cached_env(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn propagated_query_failure_restarts_but_local_cancellation_does_not() {
+        use ra_ap_ide_db::base_db::salsa::Cancelled;
+        let mut attempts = 0;
+        let result = super::retry_build(|| {
+            attempts += 1;
+            if attempts == 1 { Err(anyhow::Error::new(Cancelled::PropagatedPanic).context("a dependent query failed")) }
+            else { Ok(42) }
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(attempts, 2);
+        attempts = 0;
+        let result: anyhow::Result<()> = super::retry_build(|| {
+            attempts += 1;
+            Err(anyhow::Error::new(Cancelled::PropagatedPanic))
+        });
+        assert!(result.unwrap_err().is::<Cancelled>());
+        assert_eq!(attempts, 3);
+        attempts = 0;
+        let result: anyhow::Result<()> = super::retry_build(|| {
+            attempts += 1;
+            Err(anyhow::Error::new(Cancelled::Local))
+        });
+        assert!(result.unwrap_err().is::<Cancelled>());
+        assert_eq!(attempts, 1);
+    }
     use super::*;
     use crate::graph::model::{BindingKind, NodeKind};
     use std::collections::BTreeMap;

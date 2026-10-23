@@ -117,5 +117,6 @@ pub fn export_metadata(snap: &OpenedSnapshot) -> Result<Value> {
             "several modules in one target sharing a physical file may be ambiguous",
             "external dependency contents and environment are not a hermetic fingerprint"],
         "excluded_storage": "secondary indexes, row-ownership bookkeeping, mutable embedding cache",
-        "exporter_revision": env!("RMC_GRAPH_REVISION"), "exporter_ra_revision": env!("RMC_RA_REVISION")}))
+        "exporter_revision": env!("RMC_GRAPH_REVISION"), "exporter_ra_revision": env!("RMC_RA_REVISION"),
+        "exporter_salsa_revision": env!("RMC_SALSA_REVISION")}))
 }

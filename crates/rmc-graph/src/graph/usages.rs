@@ -346,14 +346,14 @@ fn usages_from_targets(
                 def.usages(&sema).in_scope(&usage_scope).all()
             })) {
                 Ok(results) => results,
-                Err(_) => {
+                Err(payload) => {
                     tracing::warn!(
                         target: "rmc_graph::usages",
                         ?target_node_id,
                         qualified_name = %node.qualified_name,
-                        "skipping usage extraction for item after rust-analyzer panic"
+                        "usage extraction failed after rust-analyzer panic"
                     );
-                    continue;
+                    std::panic::resume_unwind(payload);
                 }
             };
             for (&file, refs) in &results.references {
@@ -486,13 +486,15 @@ fn scan_tree(
                 scan_ident(sema, targets, &token, found);
             }
         }));
-        if scanned.is_err() {
+        if let Err(payload) = scanned {
+            eprintln!("usage extraction failed at {:?}:{:?} token {:?}", targets.source_file(sema.db, file), token.text_range(), token.text());
             tracing::warn!(
                 target: "rmc_graph::usages",
                 file = ?file.file_id(sema.db),
                 range = ?token.text_range(),
-                "skipping token after rust-analyzer panic"
+                "usage extraction failed after rust-analyzer panic"
             );
+            std::panic::resume_unwind(payload);
         }
     }
 }

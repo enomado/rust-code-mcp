@@ -18,10 +18,13 @@ fn revision(path: &Path) -> String {
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
     let ra = root.join("../rust-analyzer-bur");
+    let salsa = root.join("../salsa-bur");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", root.join("Cargo.lock").display());
     println!("cargo:rerun-if-changed={}", ra.join("crates").display());
+    println!("cargo:rerun-if-changed={}", salsa.join("src").display());
     println!("cargo:rustc-env=RMC_GRAPH_REVISION={}", revision(root));
     println!("cargo:rustc-env=RMC_RA_REVISION={}", revision(&ra));
+    println!("cargo:rustc-env=RMC_SALSA_REVISION={}", revision(&salsa));
 }
