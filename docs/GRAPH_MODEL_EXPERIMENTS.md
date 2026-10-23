@@ -151,3 +151,41 @@ reaggregation. The raw consumer/module is preserved. New impl headers, import
 rewrites, visibility changes and new contract edges still require a source patch
 and subsequent graph extraction. Thus a preview never presents a synthetic
 shortcut or an unchanged edge count as an observed post-refactoring graph.
+
+## Held-out acceptance and explicit source plans
+
+After saving predictions, `graph_holdout_check.py CORPUS ANSWERS PREDICTIONS
+OUTPUT` compares every held-out `cohere`/`separate` pair across all saved views
+and scales. Missing observations remain `unobserved`, rather than passing the
+constraint. Counts are diagnostic mismatches, not an aggregate architecture
+score: same-role membership need not mean the same file. The checker never fits
+a model, selects a scale or proposes a source operation.
+
+`graph_source_plan.py SOURCE PLAN.json PATCH` renders an explicitly audited text
+plan. It never writes into SOURCE. Inputs are SHA-256-pinned UTF-8 files; regions
+use unique start/end markers (end excluded). An edit removes named regions and
+performs literal replacements with declared counts. A new file combines literal
+text and those unchanged regions. Each region must move exactly once; stale
+files, overlapping removals, ambiguous markers, repeated outputs and escaping
+paths fail. The patch destination must be outside SOURCE and must not exist.
+This is a text renderer, not a Rust parser or an automatic refactoring engine.
+The caller must audit region ownership, module paths, imports and visibility.
+Apply the patch to an isolated source copy with `git apply --check` and `git
+apply`; then run compilation, relevant tests, rustdoc and new graph extraction.
+`git apply --reverse --check` checks reversibility without changing the copy.
+
+The private-workspace acceptance plan is `docs/GRAPH_RESPONSE_SOURCE_PLAN.json` in that
+repository. It moves CSV readers/writer/header parsing into a child module and
+explicitly updates `cfg(test)` callers omitted by graph extraction. Its new
+graph preserves the 197 incident typed pairs predicted by the location preview,
+but also has a new impl-header TypeRef and rewritten namespace bindings. Thus
+successful physical relabeling alone is not source acceptance.
+
+Environment locks for recreation with micromamba must begin with `@EXPLICIT`
+and contain package URLs. A captured `micromamba list --explicit` display may
+instead begin with a human-readable environment title; strip that title and
+blank lines and prepend `@EXPLICIT` before using `create -f`. Preserve the
+original display for provenance. The private-workspace acceptance data contains this
+normalized lock and verifies the full Python suite in the recreated graph-tool
+2.98 environment. Rust builds still require the project's Nix shell; Python
+acceptance tools do not rebuild or deploy Rust binaries.
