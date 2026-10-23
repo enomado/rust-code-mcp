@@ -1,0 +1,50 @@
+"""Guard the assessor against silently accepting missing or misattributed edges."""
+import importlib.util
+from pathlib import Path
+import tempfile
+import unittest
+
+SPEC = importlib.util.spec_from_file_location("graph_truth", Path(__file__).with_name("graph_truth.py"))
+TRUTH = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(TRUTH)
+
+
+class TruthAssessment(unittest.TestCase):
+    def test_missing_target_owner_and_kind_are_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "lib.rs").write_text("fn caller() { /*@call*/leaf(); }")
+            (root / "expected.tsv").write_text(
+                "site\ttoken\trelation\ttarget\towner\tcoverage\n"
+                "call\tleaf\tCall\tdep::leaf\tapp::caller\tincluded\n")
+            nodes = [{"id": [i], "qualified_name": name} for i, name in
+                     [(1, "dep::leaf"), (2, "app::caller"), (3, "app"), (4, "dep::other")]]
+            raw = {"nodes": nodes, "bindings": [], "usages": []}
+            self.assertEqual(TRUTH.assess(root, raw)["sites"][0]["issues"], ["missing_edge"])
+            start = (root / "lib.rs").read_text().index("leaf")
+            usage = {"target": [1], "consumer_function": [2], "consumer_module": [3],
+                     "file": "lib.rs", "start": start, "end": start + 4, "category": "Other"}
+            raw["usages"] = [usage]
+            self.assertEqual(TRUTH.assess(root, raw)["sites"][0]["issues"], ["relation_unrepresented:Call"])
+            usage["relation"] = "Call"
+            self.assertEqual(TRUTH.assess(root, raw)["sites"][0]["issues"], [])
+            usage["target"] = [4]
+            self.assertEqual(TRUTH.assess(root, raw)["sites"][0]["issues"], ["wrong_target"])
+            usage["target"] = [1]
+            usage["consumer_function"] = None
+            self.assertEqual(TRUTH.assess(root, raw)["sites"][0]["issues"], ["missing_or_wrong_owner"])
+
+    def test_unicode_offsets_are_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = "// é\nfn caller() { /*@call*/leaf(); }"
+            (root / "lib.rs").write_text(source)
+            (root / "expected.tsv").write_text(
+                "site\ttoken\trelation\ttarget\towner\tcoverage\n"
+                "call\tleaf\tCall\tdep::leaf\tapp::caller\tincluded\n")
+            result = TRUTH.assess(root, {"nodes": [], "bindings": [], "usages": []})
+            self.assertEqual(result["sites"][0]["start"], source.encode().index(b"leaf"))
+
+
+if __name__ == "__main__":
+    unittest.main()
