@@ -2,10 +2,17 @@ import unittest
 
 import numpy as np
 
-from graph_experiment_report import compare, semantic_rollup, stable_cores
+from graph_experiment_report import compare, layout_key, semantic_rollup, stable_cores
 
 
 class StabilityTests(unittest.TestCase):
+    def test_unknown_locations_do_not_become_a_shared_layout_group(self):
+        a = dict(id='a', cargo_target='lib', file=None, module=None)
+        b = dict(id='b', cargo_target='lib', file=None, module=None)
+        self.assertNotEqual(layout_key(a, 'file'), layout_key(b, 'file'))
+        self.assertNotEqual(layout_key(a, 'module'), layout_key(b, 'module'))
+        self.assertEqual(layout_key(a, 'cargo_target'), layout_key(b, 'cargo_target'))
+
     def test_orchestrator_rollup_keeps_method_physical_file_and_original_anchor(self):
         nodes = [dict(id=str(i), name=name, item_kind=kind, kind='Item',
                       semantic_owner=parent, file=file, module=file, cargo_target='lib', unresolved=0)

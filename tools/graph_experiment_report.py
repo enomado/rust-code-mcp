@@ -33,6 +33,13 @@ def compare(left, right):
                 if count >= 2 else None)
 
 
+def layout_key(node, layout):
+    value = node[layout]
+    if value is None:
+        return ('Unlocated', layout, node['id'])
+    return (node['cargo_target'], value)
+
+
 def stable_cores(vectors, edges, family, retention=0.8):
     """Unanimous membership intersections, with >=80% of every parent block.
 
@@ -229,7 +236,7 @@ def summarize(data, config, directory, destination):
     typed = model_edges(data, config['views']['typed'])
     layouts = []
     for layout in ('file', 'module', 'cargo_target'):
-        values = [(data['nodes'][n]['cargo_target'], data['nodes'][n][layout]) for n in typed['endpoints']]
+        values = [layout_key(data['nodes'][n], layout) for n in typed['endpoints']]
         names = {}
         labels = [names.setdefault(value, len(names)) for value in values]
         layouts.append(dict(layout=layout, **metrics(typed['edges'], typed['weights'], labels)))
