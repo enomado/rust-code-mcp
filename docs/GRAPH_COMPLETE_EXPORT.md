@@ -76,6 +76,16 @@ Ignored inputs remain an explicit limitation. The snapshot builder additionally
 checks its source slice before loading and publication. Git moves/edits after a
 successful freeze cannot change the copied graph input.
 
+`tools/graph_reference_check.py CORPUS.json --source-repo /repo --graph raw.jsonl
+--graph-sources /frozen-repo --output check.json` validates reference-case selectors
+against a complete export and Git source revision. Selectors include exact Cargo
+target, physical file, qualified name and item kind. Literal anchors are checked
+in Git blobs; an existing symbol in a changed file is reported as stale, not a
+usable match. The tool does not open the corpus's holdout-answer file or score any
+architectural expectations. Exit 2 means one or more seeds are unavailable/stale.
+Schema/data errors fail explicitly. Run its standard-library tests with
+`python3 -m unittest discover -s tools -p 'test_graph_reference_check.py'`.
+
 Usage extraction never skips tokens/items after an RA panic. A failed query
 rejects the entire staged snapshot. A propagated parallel-query cancellation
 can be transient: the builder retries with a fresh RA database (at most three
