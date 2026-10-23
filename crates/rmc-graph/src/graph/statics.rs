@@ -178,6 +178,7 @@ mod tests {
                     nodes,
                     bindings: Vec::new(),
                     usages: Vec::new(),
+                    unresolved_calls: Vec::new(),
                     contains: vec![
                         (workspace_id, crate_id),
                         (crate_id, module_id),

@@ -1,8 +1,7 @@
 //! Layer X (Phase 5) — function signature extraction.
 //!
 //! For every Item in `def_to_node` whose ModuleDefId is FunctionId
-//! (free fn, inherent assoc fn, trait declaration fn — NOT trait-impl
-//! body fns; see impls.rs::69 for the symmetric exclusion), extract:
+//! (free/nested fn, inherent assoc fn, trait declaration and impl fn), extract:
 //! - self kind (Owned / Ref / RefMut)
 //! - non-self params (name, stringified type, by_ref, mutability)
 //! - return type (stringified)

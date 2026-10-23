@@ -701,6 +701,8 @@ pub(crate) fn usage_id_for(u: &Usage) -> UsageId {
         u.start.to_string().as_str(),
         u.end.to_string().as_str(),
         cat,
+        format!("{:?}", u.relation).as_str(),
+        u.consumer_item.map(|id| id.to_hex()).unwrap_or_default().as_str(),
     ])
 }
 
@@ -1267,6 +1269,7 @@ mod tests {
             nodes: BTreeMap::new(),
             bindings: Vec::new(),
             usages: Vec::new(),
+            unresolved_calls: Vec::new(),
             contains: Vec::new(),
             signatures: Vec::new(),
             statics: Vec::new(),
@@ -1290,6 +1293,7 @@ mod tests {
             nodes: BTreeMap::new(),
             bindings: Vec::new(),
             usages: Vec::new(),
+            unresolved_calls: Vec::new(),
             contains: Vec::new(),
             signatures: Vec::new(),
             statics: Vec::new(),

@@ -26,8 +26,8 @@ Complete reference for all MCP tools provided by rust-code-mcp.
 | [`who_imports`](#who_imports) | Graph: Reverse Lookup | Every importer of a symbol |
 | [`who_uses`](#who_uses) | Graph: Reverse Lookup | Every non-import reference (file:byte hits) |
 | [`who_uses_summary`](#who_uses_summary) | Graph: Reverse Lookup | who_uses aggregated per consumer module |
-| [`who_calls`](#who_calls) | Graph: Call Graph | Every fn-body reference to a target fn |
-| [`calls_from`](#calls_from) | Graph: Call Graph | Outgoing references from a caller fn body |
+| [`who_calls`](#who_calls) | Graph: Call Graph | Call/TraitDispatch sites to a function |
+| [`calls_from`](#calls_from) | Graph: Call Graph | Outgoing calls and explicit unresolved sites |
 | [`call_graph`](#call_graph) | Graph: Call Graph | Bounded recursive descent of call edges |
 | [`callers_in_crate`](#callers_in_crate) | Graph: Call Graph | who_calls filtered by caller's crate |
 | [`recursive_callers_count`](#recursive_callers_count) | Graph: Call Graph | Reverse BFS counting transitive callers |
@@ -646,7 +646,12 @@ Find every workspace module that imports the given symbol (matched by qualified 
 
 #### who_uses
 
-List every non-import reference to the given symbol (file path + byte range + Read/Write/Test/Other category). Complements `who_imports`, which only enumerates `use` edges.
+List resolved non-import references with file/byte range, Read/Write/Test/Other
+category, semantic `relation`, lexical `consumer_module`, nearest
+`consumer_item` and optional `consumer_function`. Relations are `Call`,
+`TraitDispatch`, `FunctionReference`, `TypeRef`, `Construct`, `Read`, `Write`,
+`Use`, and `Implements`; imports remain separate bindings. `Unknown` is reserved
+for the legacy reference extractor. Schema v15 requires rebuilding v14 snapshots.
 
 **Parameters:**
 | Name | Type | Required | Description |
@@ -704,7 +709,10 @@ Aggregation rollup of `who_uses`: every non-import reference grouped by consumer
 
 #### who_calls
 
-Layer 10 call graph: every non-import reference to the target function whose call site sits inside another function body. References in const initializers, type aliases, and other non-function scopes are excluded — use `who_uses` to see all reference sites.
+Only `Call` and `TraitDispatch` sites from function bodies. Function values,
+types and other uses are excluded; `who_uses` retains all resolved relations.
+Concrete trait calls name the known implementation; generic/dyn calls name
+the contract without claiming a unique runtime implementation.
 
 **Parameters:**
 | Name | Type | Required | Description |
@@ -736,7 +744,9 @@ Layer 10 call graph: every non-import reference to the target function whose cal
 
 #### calls_from
 
-Layer 10 call graph: every non-import reference made from the body of the caller function. References in const initializers, type aliases, and other non-function scopes are excluded.
+Only outgoing `Call` and `TraitDispatch` sites from the caller's body.
+For `register(leaf)`, `register` is a call and `leaf` is a FunctionReference
+visible through `who_uses`, not a second call.
 
 **Parameters:**
 | Name | Type | Required | Description |
@@ -752,7 +762,14 @@ Layer 10 call graph: every non-import reference made from the body of the caller
 }
 ```
 
-**Returns:** `{ caller, call_sites: [{ callee, file, start, end, category }] }`.
+**Returns:** `{ caller, call_sites: [{ callee_qualified_name, file, start, end, category, relation }], unresolved_calls: [...] }`.
+
+`unresolved_calls` holds all observed unresolved sites of this lexical owner,
+independent of resolved-call pagination, with file/byte range, expression and
+reason (`IndirectCallable`, `TargetOutsideGraph`, `Unresolved`). Calls via local
+variables remain indirect even if a fn-item type happens to reveal the assigned
+function. No full points-to analysis, implicit operator/desugaring coverage,
+proc-macro expansion or build-script output is promised.
 
 **Notes:** Calls from closures attribute to the enclosing fn.
 
@@ -917,7 +934,9 @@ All cross-crate consumer→producer edges in the workspace, with the symbols car
 
 **Returns:** `{ edges: [{ consumer_crate, producer_crate, symbols: [...], total_refs }] }`.
 
-**Notes:** Cross-crate method calls and trait method dispatch are NOT captured in usage counts — Layer 4 doesn't extract impl-block items as Item nodes, so `usage_count` reflects only references to module-level items.
+**Notes:** Usage counts include resolved cross-crate methods and trait references;
+they count references of all relations, not calls. Generic/dyn dispatch can retain
+only a contract target. Inspect `calls_from.unresolved_calls` for known resolution gaps.
 
 ---
 

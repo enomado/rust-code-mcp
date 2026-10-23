@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use super::ids::BindingId;
-use super::model::{Binding, EmbeddingRecord, FunctionSignature, Node, StaticMetadata, Usage};
+use super::model::{Binding, EmbeddingRecord, FunctionSignature, Node, StaticMetadata, Usage, UnresolvedCall};
 
 // v2 (2026-05): added usages_by_id / usages_by_target / usages_by_consumer
 // sub-databases and `usage_count` to the manifest.
@@ -145,7 +145,12 @@ use super::model::{Binding, EmbeddingRecord, FunctionSignature, Node, StaticMeta
 // No table changes, but a v13 snapshot's module stubs carry the old ids and an
 // incremental rebuild over it would mix both namings: the bump forces one
 // full rebuild.
-pub(crate) const SCHEMA_VERSION: u32 = 14;
+// v15: usages carry semantic relations and structural owners; impl bodies,
+// fields and block-local items are nodes. Existing v14 data must be rebuilt,
+// not relabelled as calls from target kinds. Row ownership remains per crate.
+// Adds usages_by_consumer_item and unresolved_calls_by_owner, both recorded
+// in owned_rows_by_crate and covered by snapshot comparison/deletion.
+pub(crate) const SCHEMA_VERSION: u32 = 15;
 pub(crate) const CURRENT_POINTER_FILENAME: &str = "CURRENT";
 pub(crate) const BUILD_LOCK_FILENAME: &str = "BUILD.lock";
 pub(crate) const SNAPSHOTS_DIRNAME: &str = "snapshots";
@@ -444,6 +449,8 @@ pub(crate) fn graph_id_for(workspace_hash: &str, fingerprint: &str) -> String {
 
 #[derive(Clone)]
 pub struct GraphDatabases {
+    pub unresolved_calls_by_owner: Database<Bytes, SerdeBincode<Vec<UnresolvedCall>>>,
+    pub usages_by_consumer_item: Database<Bytes, Bytes>,
     pub meta_by_key: Database<Str, Bytes>,
     pub nodes_by_id: Database<Bytes, SerdeBincode<Node>>,
     pub bindings_by_id: Database<Bytes, SerdeBincode<Binding>>,
@@ -477,6 +484,8 @@ pub struct GraphDatabases {
 impl GraphDatabases {
     pub fn create(env: &Env<WithoutTls>, wtxn: &mut RwTxn<'_>) -> Result<Self> {
         Ok(Self {
+            unresolved_calls_by_owner: open_or_create_bytes_bincode(env, wtxn, "unresolved_calls_by_owner", false)?,
+            usages_by_consumer_item: open_or_create_bytes_bytes(env, wtxn, "usages_by_consumer_item", true)?,
             meta_by_key: open_or_create_str_bytes(env, wtxn, "meta_by_key", false)?,
             nodes_by_id: open_or_create_bytes_bincode(env, wtxn, "nodes_by_id", false)?,
             bindings_by_id: open_or_create_bytes_bincode(env, wtxn, "bindings_by_id", false)?,
@@ -545,6 +554,8 @@ impl GraphDatabases {
             return Ok(None);
         };
         Ok(Some(Self {
+            unresolved_calls_by_owner: env.open_database(rtxn, Some("unresolved_calls_by_owner"))?.context("unresolved_calls_by_owner missing")?,
+            usages_by_consumer_item: env.open_database(rtxn, Some("usages_by_consumer_item"))?.context("usages_by_consumer_item missing")?,
             meta_by_key,
             nodes_by_id: env
                 .open_database(rtxn, Some("nodes_by_id"))?
@@ -615,10 +626,12 @@ pub enum DbTag {
     StaticMetadataByTarget = 11,
     StubOwners = 12,
     OwnedRowsByCrate = 13,
+    UnresolvedCallsByOwner = 14,
+    UsagesByConsumerItem = 15,
 }
 
 impl DbTag {
-    pub const ALL: [DbTag; 13] = [
+    pub const ALL: [DbTag; 15] = [
         DbTag::NodesById,
         DbTag::BindingsById,
         DbTag::BindingsByFromModule,
@@ -632,6 +645,8 @@ impl DbTag {
         DbTag::StaticMetadataByTarget,
         DbTag::StubOwners,
         DbTag::OwnedRowsByCrate,
+        DbTag::UnresolvedCallsByOwner,
+        DbTag::UsagesByConsumerItem,
     ];
 
     /// The LMDB name of the sub-DB.
@@ -650,6 +665,8 @@ impl DbTag {
             DbTag::StaticMetadataByTarget => "static_metadata_by_target",
             DbTag::StubOwners => "stub_owners",
             DbTag::OwnedRowsByCrate => "owned_rows_by_crate",
+            DbTag::UnresolvedCallsByOwner => "unresolved_calls_by_owner",
+            DbTag::UsagesByConsumerItem => "usages_by_consumer_item",
         }
     }
 
@@ -661,7 +678,8 @@ impl DbTag {
             | DbTag::BindingsById
             | DbTag::UsagesById
             | DbTag::SignaturesByTarget
-            | DbTag::StaticMetadataByTarget => false,
+            | DbTag::StaticMetadataByTarget
+            | DbTag::UnresolvedCallsByOwner => false,
             DbTag::BindingsByFromModule
             | DbTag::BindingsByTarget
             | DbTag::ChildrenByParent
@@ -669,7 +687,8 @@ impl DbTag {
             | DbTag::UsagesByConsumer
             | DbTag::UsagesByConsumerFunction
             | DbTag::StubOwners
-            | DbTag::OwnedRowsByCrate => true,
+            | DbTag::OwnedRowsByCrate
+            | DbTag::UsagesByConsumerItem => true,
         }
     }
 
@@ -697,6 +716,8 @@ impl DbTag {
             DbTag::StaticMetadataByTarget => dbs.static_metadata_by_target.remap_types(),
             DbTag::StubOwners => dbs.stub_owners,
             DbTag::OwnedRowsByCrate => dbs.owned_rows_by_crate,
+            DbTag::UnresolvedCallsByOwner => dbs.unresolved_calls_by_owner.remap_types(),
+            DbTag::UsagesByConsumerItem => dbs.usages_by_consumer_item,
         }
     }
 }

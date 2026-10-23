@@ -307,6 +307,25 @@ pub(crate) fn write_owned_rows(
             )?;
         }
         counts.usages += 1;
+        if let Some(item) = usage.consumer_item {
+            dbs.usages_by_consumer_item.put(wtxn, item.as_bytes(), uid.as_bytes())?;
+            own(wtxn, owner, OwnedRow { tag: DbTag::UsagesByConsumerItem, key: item.0, dup: Some(uid.0) })?;
+        }
+    }
+
+    let mut unresolved = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for call in &model.unresolved_calls {
+        let owner = owner_of(model, call.consumer_module)?;
+        if !keep(owner) { continue; }
+        let item = call.consumer_item.unwrap_or(call.consumer_module);
+        unresolved.entry(item).or_default().push(call.clone());
+    }
+    for (item, mut calls) in unresolved {
+        calls.sort_by(|a, b| (&a.file, a.start, a.end, &a.expression).cmp(&(&b.file, b.start, b.end, &b.expression)));
+        calls.dedup();
+        let owner = owner_of(model, calls[0].consumer_module)?;
+        dbs.unresolved_calls_by_owner.put(wtxn, item.as_bytes(), &calls)?;
+        own(wtxn, owner, OwnedRow { tag: DbTag::UnresolvedCallsByOwner, key: item.0, dup: None })?;
     }
 
     // 5. Signatures (v9) and static metadata (v10): one record per item,

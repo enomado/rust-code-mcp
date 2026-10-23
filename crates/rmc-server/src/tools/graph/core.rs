@@ -301,6 +301,7 @@ pub(crate) async fn who_calls(params: WhoCallsParams) -> Result<CallToolResult, 
         target: Some(target_node.qualified_name),
         caller: None,
         krate: None,
+        unresolved_calls: None,
         page,
         call_sites,
     })
@@ -327,6 +328,7 @@ pub(crate) async fn calls_from(params: CallsFromParams) -> Result<CallToolResult
         target: None,
         caller: Some(caller_node.qualified_name),
         krate: None,
+        unresolved_calls: Some(snap.unresolved_calls_from(caller_id).map_err(internal_error("unresolved_calls_from"))?),
         page,
         call_sites,
     })
@@ -379,6 +381,7 @@ pub(crate) async fn callers_in_crate(
         target: Some(target_node.qualified_name),
         caller: None,
         krate: Some(params.krate),
+        unresolved_calls: None,
         page,
         call_sites,
     })
@@ -434,6 +437,7 @@ pub(crate) fn call_site_views(sites: Vec<EnrichedCallSite>, summary: bool) -> Ve
             start: if summary { None } else { Some(site.start) },
             end: if summary { None } else { Some(site.end) },
             category: site.category,
+            relation: site.relation,
         })
         .collect()
 }
@@ -512,6 +516,10 @@ pub(crate) struct CallSitesResponse {
     #[serde(flatten)]
     pub(crate) page: ListMeta,
     pub(crate) call_sites: Vec<CallSiteView>,
+    /// All observed unresolved calls of this caller, independent of the
+    /// resolved-call page. Absence of call_sites alone is not completeness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unresolved_calls: Option<Vec<rmc_graph::graph::model::UnresolvedCall>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -526,6 +534,7 @@ pub(crate) struct CallSiteView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) end: Option<u32>,
     pub(crate) category: String,
+    pub(crate) relation: rmc_graph::graph::model::UsageRelation,
 }
 
 #[derive(Debug, Serialize)]

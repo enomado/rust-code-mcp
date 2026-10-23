@@ -5,6 +5,7 @@
 //! builds on. Separated from `queries.rs` in PR 11 review fix-up so the
 //! legacy module can be a true facade.
 
+#[cfg(test)]
 use std::collections::HashSet;
 
 use anyhow::Result;
@@ -226,6 +227,7 @@ impl OpenedSnapshot {
     /// anything `Usage` produces with `consumer_function == Some(caller_fn)`.
     /// The caller (codemap layer) classifies edges by reading each target's
     /// `Node.item_kind`.
+    #[cfg(test)]
     pub(in crate::graph) fn callees_of(&self, caller_fn: NodeId) -> Result<Vec<NodeId>> {
         let rtxn = self.env.read_txn()?;
         let mut seen: HashSet<NodeId> = HashSet::new();
@@ -241,6 +243,7 @@ impl OpenedSnapshot {
     /// Semantics depend on `target`'s `ItemKind`: if `target` is callable
     /// these are callers, if `target` is a type these are consumers —
     /// classification is the caller's concern.
+    #[cfg(test)]
     pub(in crate::graph) fn referrers_of(&self, target: NodeId) -> Result<Vec<NodeId>> {
         let rtxn = self.env.read_txn()?;
         let mut seen: HashSet<NodeId> = HashSet::new();

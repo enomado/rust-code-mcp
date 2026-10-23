@@ -15,7 +15,7 @@ use super::super::snapshot::OpenedSnapshot;
 use super::model::{CallGraphNode, EnrichedCallSite, RecursiveCallersCount};
 
 impl OpenedSnapshot {
-    /// Every non-import reference to `target_fn` whose call site is inside
+    /// Every Call/TraitDispatch reference to `target_fn` whose site is inside
     /// some function body. Returns the caller's qualified name + file:byte
     /// range + category. References from non-fn scopes (const initializers,
     /// trait bounds, enum discriminants) are excluded — see `who_uses` for
@@ -31,7 +31,7 @@ impl OpenedSnapshot {
         let mut usages: Vec<Usage> = Vec::new();
         for entry in self.usages_for_target(&rtxn, target_fn)? {
             let usage = entry?;
-            if usage.consumer_function.is_some() {
+            if usage.relation.is_call() && usage.consumer_function.is_some() {
                 usages.push(usage);
             }
         }
@@ -53,12 +53,13 @@ impl OpenedSnapshot {
                 start: usage.start,
                 end: usage.end,
                 category: usage_category_label(usage.category).to_string(),
+                relation: usage.relation,
             });
         }
         Ok(out)
     }
 
-    /// Every non-import reference made *from* the body of `caller_fn`. Returns
+    /// Every Call/TraitDispatch made *from* the body of `caller_fn`. Returns
     /// the callee's qualified name + file:byte range + category. Closures
     /// inside `caller_fn` attribute to it (RA's default for
     /// `SemanticsScope::containing_function`).
@@ -72,7 +73,8 @@ impl OpenedSnapshot {
 
         let mut usages: Vec<Usage> = Vec::new();
         for entry in self.usages_for_consumer_function(&rtxn, caller_fn)? {
-            usages.push(entry?);
+            let usage = entry?;
+            if usage.relation.is_call() { usages.push(usage); }
         }
 
         let mut out = Vec::with_capacity(usages.len());
@@ -90,12 +92,13 @@ impl OpenedSnapshot {
                 start: usage.start,
                 end: usage.end,
                 category: usage_category_label(usage.category).to_string(),
+                relation: usage.relation,
             });
         }
         Ok(out)
     }
 
-    /// Bounded recursive descent over outgoing fn-body references rooted at
+    /// Bounded recursive descent over outgoing Call/TraitDispatch edges rooted at
     /// `root_fn`. At each node, `calls_from(node)` is computed, distinct callee
     /// NodeIds are recursed into, and `depth` is decremented. A global
     /// `visited: HashSet<NodeId>` prevents re-expanding the same fn twice
@@ -155,7 +158,7 @@ impl OpenedSnapshot {
         let mut seen: HashSet<NodeId> = HashSet::new();
         for entry in self.usages_for_consumer_function(&rtxn2, fn_id)? {
             let usage = entry?;
-            if seen.insert(usage.target) {
+            if usage.relation.is_call() && seen.insert(usage.target) {
                 distinct_callees.push(usage.target);
             }
         }
@@ -207,6 +210,7 @@ impl OpenedSnapshot {
         let mut out: Vec<EnrichedCallSite> = Vec::new();
         for entry in self.usages_for_target(&rtxn, target)? {
             let usage = entry?;
+            if !usage.relation.is_call() { continue; }
             let Some(fn_id) = usage.consumer_function else {
                 continue;
             };
@@ -229,6 +233,7 @@ impl OpenedSnapshot {
                 start: usage.start,
                 end: usage.end,
                 category: usage_category_label(usage.category).to_string(),
+                relation: usage.relation,
             });
         }
         Ok(out)
@@ -271,6 +276,7 @@ impl OpenedSnapshot {
             let rtxn = self.env.read_txn()?;
             for entry in self.usages_for_target(&rtxn, target)? {
                 let usage = entry?;
+                if !usage.relation.is_call() { continue; }
                 if let Some(fn_id) = usage.consumer_function {
                     if visited.insert(fn_id) {
                         frontier.push(fn_id);
@@ -290,6 +296,7 @@ impl OpenedSnapshot {
                 let rtxn = self.env.read_txn()?;
                 for entry in self.usages_for_target(&rtxn, fn_id)? {
                     let usage = entry?;
+                    if !usage.relation.is_call() { continue; }
                     if let Some(caller_id) = usage.consumer_function {
                         if visited.insert(caller_id) {
                             next.push(caller_id);
@@ -312,6 +319,7 @@ impl OpenedSnapshot {
                 let rtxn = self.env.read_txn()?;
                 for entry in self.usages_for_target(&rtxn, *fn_id)? {
                     let usage = entry?;
+                    if !usage.relation.is_call() { continue; }
                     if let Some(caller_id) = usage.consumer_function {
                         if !visited.contains(&caller_id) {
                             truncated_at_depth = true;

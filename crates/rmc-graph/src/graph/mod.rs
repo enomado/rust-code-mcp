@@ -25,6 +25,7 @@ mod math;
 pub mod model;
 mod ownership;
 mod query;
+mod relations;
 mod recursion_check;
 mod signatures;
 mod skeleton;
@@ -32,9 +33,11 @@ pub mod snapshot;
 pub mod snapshot_compare;
 mod statics;
 mod storage;
+mod structure;
 #[cfg(test)]
 pub(crate) mod test_support;
 mod unsafe_audit;
+mod unresolved;
 mod usages;
 
 pub use ids::{BindingId, NodeId};

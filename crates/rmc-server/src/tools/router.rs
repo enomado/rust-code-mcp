@@ -391,7 +391,7 @@ impl SearchToolRouter {
     }
 
     #[tool(
-        description = "List every non-import reference to the given symbol (file path + byte range + read/write/test category). Complements who_imports, which only enumerates `use` edges."
+        description = "List resolved non-import references to a symbol, with file/byte range, semantic relation (Call, TraitDispatch, FunctionReference, TypeRef, Construct, Read, Write, Use, Implements), category and consumer_item/consumer_function. Imports are separate bindings. Includes aliases, fields and trait implementation bodies. This is configured-loader coverage, not a completeness claim."
     )]
     async fn who_uses(
         &self,
@@ -401,7 +401,7 @@ impl SearchToolRouter {
     }
 
     #[tool(
-        description = "Aggregation rollup of who_uses: every non-import reference to the given symbol, grouped by consumer module, with total count + per-category breakdown (Read/Write/Test/Other). Local inherent method calls and local trait-declaration dispatch are captured as Method items; unresolved indirect calls such as external dyn-trait dispatch or generic Fn calls remain blind spots."
+        description = "Aggregation rollup of resolved non-import references, grouped by lexical consumer module with total count and Read/Write/Test/Other category breakdown. Category is independent of semantic relation: these counts are not call counts. Unresolved indirect calls are separate records returned by calls_from."
     )]
     async fn who_uses_summary(
         &self,
@@ -411,7 +411,7 @@ impl SearchToolRouter {
     }
 
     #[tool(
-        description = "Layer 10 call graph: every non-import reference to the target function whose call site sits inside another function body. Returns (caller_qualified_name, file, byte range, category) per call site. References in const initializers, type aliases, and other non-function scopes are excluded — use `who_uses` to see all reference sites including those. Calls from closures attribute to the enclosing fn."
+        description = "Call/TraitDispatch sites to the target from function bodies. Excludes function values, types, imports and other uses. Concrete trait calls retain the known implementation; generic/dyn calls target the trait contract without a runtime implementation claim. Includes relation, category and source site. Closures attribute to the enclosing fn; nested fn and trait impl bodies have their own callers. Use who_uses for all resolved references."
     )]
     async fn who_calls(
         &self,
@@ -421,7 +421,7 @@ impl SearchToolRouter {
     }
 
     #[tool(
-        description = "Layer 10 call graph: every non-import reference made from the body of the caller function. Returns (callee_qualified_name, file, byte range, category) per outgoing reference. References in const initializers, type aliases, and other non-function scopes are excluded — use `who_uses` to see all reference sites including those. Calls from closures attribute to the enclosing fn."
+        description = "Outgoing Call/TraitDispatch sites from a function body, with relation and category. FunctionReference, TypeRef, imports and other uses are excluded. Also returns all observed unresolved_calls of this lexical owner, with source ranges and reason (IndirectCallable, TargetOutsideGraph, Unresolved), independently of resolved-call pagination. No points-to analysis or implicit operator/desugaring completeness is promised. Closures attribute to the enclosing fn; nested fn and trait impl bodies have their own callers."
     )]
     async fn calls_from(
         &self,
@@ -732,13 +732,12 @@ impl SearchToolRouter {
     #[tool(description = "Build a task-conditioned subgraph (codemap) of the indexed workspace.
 
 Returns nodes/edges/hierarchy focused on the prompt. Edges come from the
-HIR-driven hypergraph: direct calls and non-import uses. Local trait
-dispatch (`x.method()` where `method` is declared in a workspace-local
-trait) IS captured — the call resolves back to the trait declaration's
-Item. NOT captured: callers reaching an impl method through `dyn Trait`
-over external traits, generic `F: Fn(..)` indirect calls, and resolution
-to specific impl-method NodeIds via fully-qualified `<T as Trait>::m()`.
-These blind spots are inherent to the underlying Usage extraction.
+HIR-driven hypergraph: Call, TraitDispatch, FunctionReference, TypeRef,
+Constructs, Reads, Writes, Uses and Implements stay distinct. Concrete trait
+calls retain known impl targets; generic/dyn dispatch retains the contract.
+Unknown indirect targets are not guessed; inspect calls_from.unresolved_calls.
+This bounded, deduplicated view is not a complete graph export and its
+weight=1 is set membership, not source/expansion count or execution frequency.
 
 Tunable defaults: max_nodes=80 (cap 500), depth=3 (cap 5),
 max_incoming_per_node=8, embedding_policy='no_rerank', format='json'.

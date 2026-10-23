@@ -251,7 +251,7 @@ impl Names<'_, '_> {
                 Some(usage) => self.usage_text(&usage),
                 None => format!("usage {} = <undecodable>", hex(key)),
             },
-            DbTag::UsagesByTarget | DbTag::UsagesByConsumer | DbTag::UsagesByConsumerFunction => {
+            DbTag::UsagesByTarget | DbTag::UsagesByConsumer | DbTag::UsagesByConsumerFunction | DbTag::UsagesByConsumerItem => {
                 format!("{} → {}", self.node(key), self.usage(value))
             }
             DbTag::SignaturesByTarget => {
@@ -264,6 +264,7 @@ impl Names<'_, '_> {
             DbTag::StaticMetadataByTarget => {
                 format!("{}: {:?}", self.node(key), decode::<StaticMetadata>(value))
             }
+            DbTag::UnresolvedCallsByOwner => format!("{}: {:?}", self.node(key), decode::<Vec<super::model::UnresolvedCall>>(value)),
             DbTag::StubOwners => format!("{} named by {}", self.node(key), self.node(value)),
             DbTag::OwnedRowsByCrate => match OwnedRow::decode(value) {
                 Ok(row) => format!("{} owns {}", self.node(key), self.owned_row_text(&row)),
@@ -279,7 +280,7 @@ impl Names<'_, '_> {
         let dup = row.dup.as_ref().map(|d| &d[..]);
         match (row.tag, dup) {
             (
-                DbTag::NodesById | DbTag::SignaturesByTarget | DbTag::StaticMetadataByTarget,
+                DbTag::NodesById | DbTag::SignaturesByTarget | DbTag::StaticMetadataByTarget | DbTag::UnresolvedCallsByOwner,
                 None,
             ) => format!("{} {}", row.tag, self.node(key)),
             (DbTag::BindingsById, None) => format!("{} {}", row.tag, self.binding(key)),
@@ -288,7 +289,7 @@ impl Names<'_, '_> {
                 format!("{} {} → {}", row.tag, self.node(key), self.binding(dup))
             }
             (
-                DbTag::UsagesByTarget | DbTag::UsagesByConsumer | DbTag::UsagesByConsumerFunction,
+                DbTag::UsagesByTarget | DbTag::UsagesByConsumer | DbTag::UsagesByConsumerFunction | DbTag::UsagesByConsumerItem,
                 Some(dup),
             ) => format!("{} {} → {}", row.tag, self.node(key), self.usage(dup)),
             (DbTag::ChildrenByParent | DbTag::StubOwners, Some(dup)) => {
@@ -497,14 +498,15 @@ mod tests {
                 DbTag::UsagesByConsumer,
                 DbTag::UsagesByConsumerFunction,
                 DbTag::OwnedRowsByCrate,
+                DbTag::UsagesByConsumerItem,
             ],
             "unexpected tables in:\n{diff}"
         );
         let rendered = format!("uses {target_name} at {}", dropped.file);
         for table in &diff.tables {
-            // The usage row and its three index rows each have one ownership
+            // The usage row and its four index rows each have one ownership
             // record, all under the consumer's crate.
-            let expected = if table.table == DbTag::OwnedRowsByCrate { 4 } else { 1 };
+            let expected = if table.table == DbTag::OwnedRowsByCrate { 5 } else { 1 };
             assert_eq!((table.only_in_left, table.only_in_right), (expected, 0), "{diff}");
             for sample in &table.left_samples {
                 assert!(sample.contains(&rendered), "row not rendered by name: {sample}");

@@ -37,11 +37,14 @@ def assess(root, evidence):
         for u in hits:
             target = node(u["target"])
             caller = node(u.get("consumer_function"))
+            owner = node(u.get("consumer_item")) or caller
             module = node(u["consumer_module"])
             observed.append({"target": target["qualified_name"], "target_id": target["id"],
                              "target_file": target.get("file"),
                              "caller": caller["qualified_name"] if caller else None,
                              "caller_file": caller.get("file") if caller else None,
+                             "owner": owner["qualified_name"] if owner else None,
+                             "relation": u.get("relation"),
                              "module": module["qualified_name"], "category": u["category"],
                              "range": [u["start"], u["end"]]})
         issues = []
@@ -58,7 +61,14 @@ def assess(root, evidence):
         elif row["coverage"] != "included":
             status = "declared_exclusion" if not hits else "unexpected_coverage"
             if row["relation"] == "UnresolvedCall":
-                status = "unrepresented_unknown" if not hits else "resolved_indirect"
+                unknowns = [u for u in evidence.get("unresolved_calls", []) if u["file"] == file
+                            and u["start"] <= start and u["end"] >= end
+                            and node(u.get("consumer_item"))["qualified_name"] == row["owner"]]
+                status = "observed_unresolved" if unknowns and not hits else "unrepresented_unknown"
+                if not unknowns:
+                    issues.append("missing_explicit_unknown")
+                if hits:
+                    issues.append("indirect_call_claimed_resolved")
             elif hits and row["coverage"] in {"cfg-not-all", "cfg-test", "test-target", "example-target"}:
                 issues.append("inactive_code_edge")
         else:
@@ -69,7 +79,8 @@ def assess(root, evidence):
                 status = "wrong_target" if targets else "missing_edge"
             # Oracle target identities are deliberately richer than current graph IDs.
             expected_owner = row["owner"].replace("[lib]", "").replace("[bin]", "")
-            if hits and not any(o["caller"] == expected_owner for o in observed):
+            matching = [o for o in observed if o["target"] == expected_target]
+            if hits and not any(o["owner"] == expected_owner for o in observed):
                 structural = row["site"] in {"field_type", "alias_type", "const_init", "static_fn"}
                 issues.append("missing_structural_owner" if structural else "missing_or_wrong_owner")
             if row["owner"].startswith("truth_app[bin]") and hits:
@@ -80,7 +91,7 @@ def assess(root, evidence):
                     issues.append("target_identity_collision")
             if "[lib]" in row["owner"] or "[bin]" in row["owner"]:
                 issues.append("cargo_target_context_unrepresented")
-            if hits and not all(u.get("relation") == row["relation"] for u in hits):
+            if matching and not all(o["relation"] == row["relation"] for o in matching):
                 issues.append("relation_unrepresented:" + row["relation"])
         expected_module = structure.get("modules_by_site", {}).get(row["site"])
         if hits and expected_module and not all(o["module"] == expected_module for o in observed):

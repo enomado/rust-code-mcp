@@ -33,16 +33,17 @@ pub enum ItemKind {
     AssocFunction,
     AssocConst,
     AssocType,
-    /// Layer 4: a fn declared inside an inherent `impl T { ... }` block, OR a
-    /// fn declared in a `trait T { fn m(); }`. Both share this variant — the
-    /// distinction is encoded by `parent_id` pointing at a struct/enum/union
-    /// Item vs a trait Item.
+    /// An associated function in an inherent impl, trait impl or trait
+    /// declaration. Trait impls have distinct qualified names and ids;
+    /// their references to contract items carry the Implements relation.
     Method,
     /// A variant of an enum (`enum E { A, B(u32), C { x: i32 } }` → three
     /// EnumVariant items). `parent_id` points at the enum's Item NodeId, NOT
     /// the enclosing module. Visibility is inherited from the enum (always
     /// `None` here — same shape as `Method`).
     EnumVariant,
+    /// Named or tuple ADT field; parent is the declaring ADT or enum variant.
+    Field,
 }
 
 impl ItemKind {
@@ -153,6 +154,31 @@ pub enum UsageCategory {
     Other,
 }
 
+/// Semantic relation at the reference site, independent of Read/Write/Test.
+/// Unknown is for the legacy target extractor, never evidence of a call.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UsageRelation {
+    #[default]
+    Unknown,
+    Call,
+    /// A call to a trait contract with no unique implementation established.
+    TraitDispatch,
+    FunctionReference,
+    TypeRef,
+    Construct,
+    Read,
+    Write,
+    Use,
+    /// Impl declaration or a concrete impl use referring to its trait item.
+    Implements,
+}
+
+impl UsageRelation {
+    pub fn is_call(self) -> bool {
+        matches!(self, Self::Call | Self::TraitDispatch)
+    }
+}
+
 /// A non-import reference to an Item. One record per concrete reference site,
 /// so `who_uses(target)` can return file:range tuples and so `dead_pub` can
 /// distinguish a never-referenced item from one only referenced inside its
@@ -171,6 +197,32 @@ pub struct Usage {
     /// enclosing fn.
     #[serde(default)]
     pub consumer_function: Option<NodeId>,
+    /// Nearest declaring item, including fields, aliases and const/static
+    /// initializers. Closures belong to their enclosing function.
+    #[serde(default)]
+    pub consumer_item: Option<NodeId>,
+    #[serde(default)]
+    pub relation: UsageRelation,
+}
+
+/// An observed call with no graph target. This is evidence of incomplete
+/// resolution, never an edge to a guessed function. Stored by lexical owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnresolvedCall {
+    pub consumer_module: NodeId,
+    pub consumer_item: Option<NodeId>,
+    pub file: String,
+    pub start: u32,
+    pub end: u32,
+    pub expression: String,
+    pub reason: UnresolvedCallReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnresolvedCallReason {
+    IndirectCallable,
+    TargetOutsideGraph,
+    Unresolved,
 }
 
 /// v9 (Phase 5) — per-function signature record.
@@ -277,11 +329,12 @@ pub struct ExtractionModel {
     pub nodes: BTreeMap<NodeId, Node>,
     pub bindings: Vec<Binding>,
     pub usages: Vec<Usage>,
+    pub unresolved_calls: Vec<UnresolvedCall>,
     /// (parent, child) — workspace→crate, crate→root_module, module→child_module, module→item.
     pub contains: Vec<(NodeId, NodeId)>,
     /// v9: one entry per local function whose signature was extractable
-    /// (free fns, inherent assoc fns, trait declaration fns; not impl-trait
-    /// method bodies). Persisted to `signatures_by_target`.
+    /// (free/nested fns and inherent/trait associated fns).
+    /// Persisted to `signatures_by_target`.
     pub signatures: Vec<(NodeId, FunctionSignature)>,
     /// v10 (Phase 7 Path B): one entry per local `static` item with the HIR
     /// type stringified via `HirDisplay` and the `mut` flag. Persisted to

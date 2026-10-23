@@ -334,6 +334,7 @@ fn emit_skeleton(loaded: &LoadedWorkspace, crates: &[Crate], timing: bool) -> Sk
         nodes: Default::default(),
         bindings: Vec::new(),
         usages: Vec::new(),
+        unresolved_calls: Vec::new(),
         contains: Vec::new(),
         signatures: Vec::new(),
         statics: Vec::new(),
@@ -462,6 +463,7 @@ fn run_passes(
     // assoc-const / assoc-type and v7 enum-variant Items already exist in
     // `model.nodes` and `def_to_node`) and before usages (purely for ordering
     // — the two passes are independent).
+    super::structure::extract_structural_items(model, &loaded.db, &loaded.vfs, crates, &mut def_to_node, module_node_for);
     let t = std::time::Instant::now();
     extract_attributes(model, &loaded.db, &loaded.vfs, crates, &def_to_node);
     if timing {

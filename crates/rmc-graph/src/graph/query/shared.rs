@@ -152,7 +152,7 @@ impl OpenedSnapshot {
             }))
     }
 
-    pub(super) fn usages_for_target<'txn>(
+    pub(in crate::graph) fn usages_for_target<'txn>(
         &'txn self,
         rtxn: &'txn RoTxn<'_, heed::WithoutTls>,
         target: NodeId,
@@ -200,7 +200,7 @@ impl OpenedSnapshot {
             }))
     }
 
-    pub(super) fn usages_for_consumer_function<'txn>(
+    pub(in crate::graph) fn usages_for_consumer_function<'txn>(
         &'txn self,
         rtxn: &'txn RoTxn<'_, heed::WithoutTls>,
         caller_fn: NodeId,

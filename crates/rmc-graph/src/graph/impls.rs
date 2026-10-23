@@ -6,16 +6,14 @@
 //! valid targets for `Definition::usages` so that `who_uses(Foo::bar)` and
 //! `who_uses(Trait::method)` can answer non-empty.
 //!
-//! Trait *impl* method bodies (`impl T for Foo { fn m() {...} }`) are
-//! deliberately NOT extracted — RA's `Definition::usages` resolves call sites
-//! `x.m()` and `Foo::m()` back to the trait declaration's def, so the trait
-//! Item alone covers `who_uses` for trait dispatch. Adding impl-body items
-//! would emit duplicate nodes that just shadow the trait declaration.
+//! Trait implementation items are distinct from contract declarations: their
+//! bodies own references and concrete dispatch can name them. Qualified names
+//! include the implemented trait, so two traits' same-named methods stay apart.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use ra_ap_hir::{AssocItem, Crate, Enum, EnumVariant, HasCrate, Impl, Semantics, Trait, attach_db};
+use ra_ap_hir::{AssocItem, Crate, DisplayTarget, Enum, EnumVariant, HasCrate, HirDisplay, Impl, Semantics, Trait, attach_db};
 use ra_ap_hir_def::{AdtId, ModuleDefId, TraitId};
 use ra_ap_ide::TryToNav;
 use ra_ap_ide_db::RootDatabase;
@@ -24,6 +22,7 @@ use ra_ap_vfs::Vfs;
 
 use super::audit_util::resolve_workspace_relative;
 use super::ids::NodeId;
+use super::labels::module_qualified_path;
 use super::model::{ExtractionModel, ItemKind, Node, NodeKind};
 
 pub(crate) fn extract_impl_items(
@@ -64,27 +63,22 @@ pub(crate) fn extract_impl_items(
             };
             let crate_name = crate_name_for.get(&krate).cloned().unwrap_or_default();
 
-            // Inherent-impl items.
+            // Inherent and trait implementation items.
             for impl_ in Impl::all_in_crate(db, krate) {
-                // Only inherent impls (no trait): trait-impl bodies are deferred.
-                if impl_.trait_(db).is_some() {
-                    continue;
-                }
-                let Some(adt) = impl_.self_ty(db).as_adt() else {
-                    continue;
-                };
-                let adt_id: AdtId = adt.into();
-                let Some(&adt_node_id) = adt_node_for.get(&adt_id) else {
-                    // Out-of-workspace ADT — skip. (Inherent impls of types
-                    // declared in dep crates aren't tracked in v1.)
+                let type_parent = impl_.self_ty(db).as_adt().and_then(|adt| adt_node_for.get(&adt.into()).copied());
+                let parent = type_parent.or_else(|| {
+                    let module = impl_.module(db).nearest_non_block_module(db);
+                    def_to_node.get(&ModuleDefId::ModuleId(module.into())).copied()
+                });
+                let Some(parent) = parent else {
                     continue;
                 };
-                if adt.krate(db) != krate {
-                    // Defensive: an inherent impl found in this crate's
-                    // def_map should always have a self-ty defined here, but
-                    // skip gracefully if not.
-                    continue;
-                }
+                let impl_qualified = impl_.trait_(db).map(|trait_| {
+                    let module = module_qualified_path(db, impl_.module(db).nearest_non_block_module(db).into());
+                    let self_ty = impl_.self_ty(db).display(db, DisplayTarget::from_crate(db, krate.into())).to_string();
+                    let trait_module = module_qualified_path(db, trait_.module(db).into());
+                    format!("{module}::<{self_ty} as {trait_module}::{}>", trait_.name(db).as_str())
+                });
 
                 for assoc in impl_.items(db) {
                     emit_assoc_item(
@@ -95,7 +89,8 @@ pub(crate) fn extract_impl_items(
                         def_to_node,
                         crate_node_id,
                         &crate_name,
-                        adt_node_id,
+                        parent,
+                        impl_qualified.as_deref(),
                         assoc,
                     );
                 }
@@ -117,6 +112,7 @@ pub(crate) fn extract_impl_items(
                         crate_node_id,
                         &crate_name,
                         trait_node_id,
+                        None,
                         assoc,
                     );
                 }
@@ -162,6 +158,7 @@ fn emit_assoc_item(
     crate_node_id: NodeId,
     crate_name: &str,
     parent_node_id: NodeId,
+    qualified_parent: Option<&str>,
     assoc: AssocItem,
 ) {
     let db = sema.db;
@@ -217,11 +214,11 @@ fn emit_assoc_item(
     let start: u32 = u32::from(nav.full_range.start());
     let end: u32 = u32::from(nav.full_range.end());
 
-    let parent_qual = model
+    let parent_qual = qualified_parent.map(str::to_owned).unwrap_or_else(|| model
         .nodes
         .get(&parent_node_id)
         .map(|n| n.qualified_name.clone())
-        .unwrap_or_default();
+        .unwrap_or_default());
     let qualified = if parent_qual.is_empty() {
         name.clone()
     } else {

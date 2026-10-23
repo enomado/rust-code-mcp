@@ -1,5 +1,9 @@
 # Graph truth corpus: baseline, 2026-10-23
 
+This document preserves the pre-fix baseline. Current corrections and the v15
+contract are described in [Edge semantics](GRAPH_EDGE_SEMANTICS.md); the oracle
+source sites and expected semantic edges below have not been rewritten.
+
 The independent oracle is [expected.tsv](../crates/rmc-graph/tests/fixtures/graph_truth/expected.tsv),
 with [structural facts](../crates/rmc-graph/tests/fixtures/graph_truth/expected-structure.json).
 It was written from Rust source before inspecting extraction output. There are

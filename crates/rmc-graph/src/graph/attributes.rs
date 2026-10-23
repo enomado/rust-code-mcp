@@ -118,18 +118,9 @@ fn visit_module(
         }
     }
 
-    // 2. Inherent impls of every local Adt — assoc items inside.
+    // 2. Associated items of local impl blocks, including trait bodies.
     for impl_ in module.impl_defs(db) {
-        // Skip trait impls (their bodies aren't extracted as Item nodes,
-        // matching impls.rs's policy).
-        if impl_.trait_(db).is_some() {
-            continue;
-        }
-        // Defensive: only walk impls whose self-ty is a local ADT.
-        let Some(adt) = impl_.self_ty(db).as_adt() else {
-            continue;
-        };
-        if adt.krate(db) != krate {
+        if impl_.krate(db) != krate {
             continue;
         }
         for assoc in impl_.items(db) {
