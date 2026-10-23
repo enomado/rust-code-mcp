@@ -45,6 +45,24 @@ class TruthAssessment(unittest.TestCase):
             result = TRUTH.assess(root, {"nodes": [], "bindings": [], "usages": []})
             self.assertEqual(result["sites"][0]["start"], source.encode().index(b"leaf"))
 
+    def test_unknown_call_requires_its_lexical_owner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = "fn caller() { /*@indirect*/f(); }"
+            (root / "lib.rs").write_text(source)
+            (root / "expected.tsv").write_text(
+                "site\ttoken\trelation\ttarget\towner\tcoverage\n"
+                "indirect\tf\tUnresolvedCall\t?\tapp::caller\tpoints-to\n")
+            start = source.index("f();")
+            raw = {"nodes": [{"id": [1], "qualified_name": "app::caller"}], "bindings": [], "usages": [],
+                   "unresolved_calls": [{"file": "lib.rs", "start": start, "end": start + 3, "consumer_item": None}]}
+            result = TRUTH.assess(root, raw)["sites"][0]
+            self.assertEqual(result["issues"], ["missing_explicit_unknown"])
+            raw["unresolved_calls"][0]["consumer_item"] = [1]
+            result = TRUTH.assess(root, raw)["sites"][0]
+            self.assertEqual(result["issues"], [])
+            self.assertEqual(result["status"], "observed_unresolved")
+
 
 if __name__ == "__main__":
     unittest.main()

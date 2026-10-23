@@ -63,7 +63,7 @@ def assess(root, evidence):
             if row["relation"] == "UnresolvedCall":
                 unknowns = [u for u in evidence.get("unresolved_calls", []) if u["file"] == file
                             and u["start"] <= start and u["end"] >= end
-                            and node(u.get("consumer_item"))["qualified_name"] == row["owner"]]
+                            and (node(u.get("consumer_item")) or {}).get("qualified_name") == row["owner"]]
                 status = "observed_unresolved" if unknowns and not hits else "unrepresented_unknown"
                 if not unknowns:
                     issues.append("missing_explicit_unknown")
