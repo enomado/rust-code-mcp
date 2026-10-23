@@ -117,3 +117,37 @@ Memory grows with the input and model state. On a private workspace (about 25k n
 internal typed pairs), a single graph-tool layered fit used about 4 GiB. Control
 concurrent fits separately from RA extraction, and never run multiple heavy RA
 builders just to prepare these views.
+
+## Explicit operation impact previews
+
+`graph_operation_impact.py INPUT SPEC OUTPUT --sources FROZEN --current REPO`
+reuses the same frozen input to inspect a proposed physical split/move/merge.
+It does not fit a model or run RA. This is an offline research tool, not an MCP
+endpoint or a Rust refactoring engine. The output is a location relabel preview;
+it cannot establish compilation, privacy or the effects of an unimplemented API.
+
+The JSON spec pins `graph_id` and `source_revision` and contains `name` and
+`moves`. Each move requires `cargo_target`, `file`, exact qualified `names` and
+`to_file`; optional `descendants` follows semantic parents within that same
+file/target. Missing/ambiguous selectors, overlapping moves and foreign slices
+fail. A compound spec may contain `scenarios`, each with its own name/moves;
+OUTPUT is then a directory. Whole source files are compared with the current
+tree when both source roots are supplied; changed sources are explicitly stale.
+
+Every incident typed pair keeps its original endpoints, relation, independent
+weights and raw evidence. The report counts newly crossing and internalized
+file dependencies without deleting any observed relation. File identities
+include Cargo target. Lexical module and semantic owner stay in the inventory,
+and unresolved observations are reported. Observed imports remain separate and
+are not automatically rewritten. Mutual usage file pairs mean direct two-way
+dependencies only; this is not an SCC computation or a Cargo-cycle analysis.
+
+A module-attributed impl-header reference may travel with its impl while the
+module node stays put. An optional `source_edge_moves` entry pins the complete
+raw `evidence` list, original `file`/`cargo_target`, destination `to_file` and an
+explicit source-audit `reason`. The preview changes only the hypothetical source
+file for that pair. Partial pair/site moves are rejected; they require raw-row
+reaggregation. The raw consumer/module is preserved. New impl headers, import
+rewrites, visibility changes and new contract edges still require a source patch
+and subsequent graph extraction. Thus a preview never presents a synthetic
+shortcut or an unchanged edge count as an observed post-refactoring graph.
