@@ -93,6 +93,29 @@ architectural expectations. Exit 2 means one or more seeds are unavailable/stale
 Schema/data errors fail explicitly. Run its standard-library tests with
 `python3 -m unittest discover -s tools -p 'test_graph_reference_check.py'`.
 
+For comparisons across source versions, `tools/graph_boundary_compare.py
+BEFORE.jsonl AFTER.jsonl SPEC.json OUTPUT.json` labels explicitly declared
+physical boundaries without matching NodeIds. `SPEC` version 1 contains
+`boundaries: {name: [{cargo_target, files?, file_prefixes?}]}` and
+`seeds: {name: {before: selector|null, after: selector|null}}`. A selector has
+exact `cargo_target`, `file`, `name`, `item_kind`. A null selector requires the
+other slice's address to be absent. Overlapping boundaries and missing or
+ambiguous seeds fail. Target identity uses `name[kind]@target-root-file`.
+
+The result keeps both metadata manifests, exact seed addresses (physical file,
+lexical module and semantic parent separately), incident evidence, unresolved
+observations and typed boundary deltas. Usage sources follow the observation's
+physical file, including macro sites; binding sources follow their lexical
+module and have no invented source range. `Outside` means unlabelled local
+code, `External` means a persisted external stub. Containment is not a dependency
+layer. Typed pairs, source sites, observations and bindings have separate units;
+site counts are not additive across relation layers. Renames must be declared
+in selectors; this tool does not infer architectural owners or causal effects.
+It loads O(nodes + selected evidence) memory and checks all canonical table
+counts before comparing. Tests: `test_graph_boundary_compare.py` uses a small
+independent lib/bin corpus with moved bodies, shifted ids/offsets, typed edges,
+macro source files and unresolved callbacks.
+
 Usage extraction never skips tokens/items after an RA panic. A failed query
 rejects the entire staged snapshot. A propagated parallel-query cancellation
 can be transient: the builder retries with a fresh RA database (at most three
