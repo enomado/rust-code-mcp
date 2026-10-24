@@ -160,6 +160,13 @@ pub(crate) const BUILD_LOCK_FILENAME: &str = "BUILD.lock";
 pub(crate) const SNAPSHOTS_DIRNAME: &str = "snapshots";
 pub(crate) const MANIFEST_FILENAME: &str = "manifest.json";
 
+// A map is an address-space reservation, not an eager RAM/disk allocation.
+// The complete graph of a large workspace exceeds 1 GiB with its canonical rows and
+// secondary indexes. Keep headroom on 64-bit hosts; narrower hosts retain the
+// original limit. Callers can still choose their own GraphEnvOptions.map_size.
+#[cfg(target_pointer_width = "64")]
+const DEFAULT_MAP_SIZE: usize = 16 << 30; // 16 GiB
+#[cfg(not(target_pointer_width = "64"))]
 const DEFAULT_MAP_SIZE: usize = 1 << 30; // 1 GiB
 // v13 uses 15 named sub-DBs; the margin keeps the next table from failing
 // with MDB_DBS_FULL on open.

@@ -26,6 +26,13 @@ target/release/examples/graph_export --build /project /graph-data /data/raw.json
 python3 tools/graph_aggregate.py /data/raw.jsonl /data/files.jsonl --level file
 ```
 
+The default LMDB map reserves 16 GiB of virtual address space on 64-bit hosts
+(1 GiB on narrower hosts). RAM and database-file allocation follow actual pages,
+not the reservation. The complete graph of a large workspace exceeds the former 1 GiB cap
+once canonical rows and secondary indexes are written. Embedders can override
+`GraphEnvOptions.map_size`; `MDB_MAP_FULL` rejects the staged build and preserves
+CURRENT rather than publishing a truncated graph.
+
 The first JSONL line has `metadata`; subsequent lines have `table`, `key`,
 `record`. Record NodeIds use the existing JSON array of 32 bytes; row keys and
 cursor bytes are lowercase hex. Keys are scoped to the manifest's workspace
