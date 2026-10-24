@@ -84,9 +84,16 @@ def stable_cores(vectors, edges, family, retention=0.8):
             if len(group) < 3:
                 small.extend(group)
                 continue
+            # Connectivity can split a qualifying intersection into small
+            # fractions of its parent blocks. Each published core must satisfy
+            # the retention rule itself, rather than inherit the intersection's.
+            group_fraction = len(group)/parent_size
+            if group_fraction < retention:
+                uncertain.extend(group)
+                continue
             member_set = set(group)
             internal = sum(t in member_set for s in group for t in adjacency[s])//2
-            cores.append(dict(members=group, parent_retention=fraction,
+            cores.append(dict(members=group, parent_retention=group_fraction,
                               internal_untyped_pairs=internal))
     cores.sort(key=lambda c: (-len(c['members']), c['members'][0]))
     return dict(cores=cores, small_stable=small, uncertain=uncertain,

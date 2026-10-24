@@ -97,6 +97,16 @@ These are conservative repeatability diagnostics, not posterior probabilities.
 Different views/scales keep separate cores instead of hiding disagreements in
 one consensus partition.
 
+The retention threshold applies to each final connected core. A disconnected
+intersection that retains 80% can split into components that individually fail
+the threshold; those nontrivial components belong to the uncertain periphery.
+They must not inherit the larger intersection's retention value. Regression
+tests cover connected repeated parent blocks whose intersection splits into two
+40% components, and a surviving 80% component split from a 90% intersection.
+Reports produced before this correction can overstate component retention;
+regenerate their cores from saved memberships without refitting the models.
+The resolution-probe client imports the same corrected core rule.
+
 `graph_resolution_probe.py INPUT CONFIG PROBE.json OUTPUT` adds separately
 predeclared Leiden resolutions for named views when a concrete development case
 remains unresolved. `PROBE.json` contains `reason`, `views` and `resolutions`.

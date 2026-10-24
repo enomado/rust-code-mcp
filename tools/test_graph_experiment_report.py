@@ -56,6 +56,29 @@ class StabilityTests(unittest.TestCase):
         self.assertEqual(result['cores'], [])
         self.assertEqual(sorted(result['uncertain']), list(range(8)))
 
+    def test_each_connected_core_must_retain_the_parent_block(self):
+        # Both repeated parent blocks are connected through their own fringe.
+        # Their 80% unanimous intersection has two disconnected components;
+        # each component retains only 40%, so neither is a stable core.
+        vectors = [np.array([0]*10 + [1]*2),
+                   np.array([0]*8 + [1]*2 + [0]*2)]
+        edges = [(0, 1), (1, 2), (2, 3), (4, 5), (5, 6), (6, 7),
+                 (3, 8), (8, 4), (8, 9), (3, 10), (10, 4), (10, 11)]
+        result = stable_cores(vectors, edges, 'leiden')
+        self.assertEqual(result['cores'], [])
+        self.assertEqual(sorted(result['uncertain']), list(range(12)))
+
+    def test_connected_core_reports_its_own_retention(self):
+        # The intersection retains 90%, its surviving connected core 80%.
+        vectors = [np.array([0]*10 + [1]),
+                   np.array([0]*9 + [1, 0])]
+        edges = list(zip(range(7), range(1, 8)))
+        edges += [(3, 9), (9, 8), (3, 10), (10, 8)]
+        result = stable_cores(vectors, edges, 'leiden')
+        self.assertEqual(len(result['cores']), 1)
+        self.assertEqual(result['cores'][0]['members'], list(range(8)))
+        self.assertEqual(result['cores'][0]['parent_retention'], 0.8)
+
 
 if __name__ == '__main__':
     unittest.main()
