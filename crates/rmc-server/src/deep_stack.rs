@@ -234,8 +234,14 @@ where
             } else {
                 GateGuard::Shared(enter_shared())
             };
+            // Caught for its text only: the thread ends either way, and the
+            // caller used to get "panicked" with no hint of what. Unwind
+            // safety is what it was — `work` owns its inputs, and a mutex it
+            // held while panicking is poisoned by the unwind, before this.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                .map_err(|payload| crate::panic_boundary::panic_message(payload.as_ref()));
             // A send error means the caller went away; nothing to report to.
-            let _ = tx.send(work());
+            let _ = tx.send(outcome);
         })
         .map_err(|error| {
             McpError::internal_error(
@@ -244,10 +250,16 @@ where
             )
         })?;
 
-    // The sender is dropped without sending only if the thread panicked, which
-    // is the same failure `spawn_blocking` reported as a join error.
-    rx.await
-        .map_err(|_| McpError::internal_error(format!("{what}: analysis thread panicked"), None))
+    // The sender is dropped without sending only if the thread died outside
+    // the catch — the gate wait or the send itself.
+    match rx.await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(message)) => Err(McpError::internal_error(
+            format!("{what}: analysis thread panicked: {message}"),
+            None,
+        )),
+        Err(_) => Err(McpError::internal_error(format!("{what}: analysis thread panicked"), None)),
+    }
 }
 
 /// Run work against the shared [`SemanticService`] on the analysis thread.
@@ -269,7 +281,15 @@ where
 /// (`SemanticService::unload_drifted`). It is a fact about the files, not a
 /// bug, and it has a cure — unload the context, load it again on the next
 /// call — so it comes back as an error saying so, and the service stays
-/// usable. Every other panic unwinds as before.
+/// usable.
+///
+/// Every other panic is caught as well, and costs every loaded context. Left
+/// to unwind, it poisoned the mutex for the life of the daemon: every semantic
+/// tool after it failed on the lock, the timed garbage collection panicked on
+/// it, and `clear_runtime` — the one cure a session could reach — panicked
+/// too. What the panic interrupted is unknown (a load half-done, a context
+/// mid-update), so nothing loaded is kept: the next call loads afresh, as
+/// after a drift.
 pub(crate) async fn with_semantic<T, F>(
     semantic: &Arc<Mutex<SemanticService>>,
     what: &'static str,
@@ -284,23 +304,40 @@ where
         let mut service = semantic.lock().map_err(|error| {
             McpError::internal_error(format!("Failed to acquire lock: {}", error), None)
         })?;
-        // Caught while the guard is alive, so a drift does not poison it; the
-        // unwind is resumed — and poisons — for any other panic.
+        // Caught while the guard is alive, so no panic poisons it.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut service))) {
             Ok(outcome) => outcome,
             Err(panic) => {
                 let unloaded = service.unload_drifted();
-                if unloaded.is_empty() {
-                    std::panic::resume_unwind(panic);
+                if !unloaded.is_empty() {
+                    return Err(McpError::internal_error(
+                        drift_refusal(what, &unloaded),
+                        None,
+                    ));
                 }
+                let message = crate::panic_boundary::panic_message(panic.as_ref());
+                let dropped = service.clear_all();
+                tracing::error!(
+                    target: "panic",
+                    "{what} panicked inside the semantic service ({message}); dropped all {dropped} loaded contexts"
+                );
                 Err(McpError::internal_error(
-                    drift_refusal(what, &unloaded),
+                    panic_refusal(what, &message, dropped),
                     None,
                 ))
             }
         }
     })
     .await?
+}
+
+/// What a call whose analysis panicked for any other reason is told.
+fn panic_refusal(what: &str, message: &str, dropped: usize) -> String {
+    format!(
+        "{what}: rust-analyzer work panicked ({message}); all {dropped} loaded projects were \
+         unloaded and load afresh on the next call — retrying is safe, and a repeat of the same \
+         panic is a bug worth reporting with the daemon log's backtrace"
+    )
 }
 
 /// What a call that hit a changed dependency source is told.
@@ -537,10 +574,42 @@ mod tests {
             run_analysis("test", || panic!("boom in analysis")).await;
         let error = outcome.expect_err("a panic must surface as an error");
         assert!(
-            error.message.contains("panicked"),
-            "unexpected error message: {}",
+            error.message.contains("panicked") && error.message.contains("boom in analysis"),
+            "the error names the panic, not just that one happened: {}",
             error.message
         );
+    }
+
+    /// A panic that is not a drift: the call gets an error naming it, every
+    /// loaded context is gone (what the panic interrupted is unknown), and —
+    /// the point — the next call is served, not refused on a poisoned lock.
+    /// Before the catch covered every panic, the second call here failed with
+    /// "Failed to acquire lock" and so would every later one.
+    #[tokio::test]
+    async fn any_panic_in_semantic_work_keeps_the_service() {
+        use ra_ap_ide::AnalysisHost;
+
+        let semantic = test_semantic();
+        let dir = tempfile::tempdir().expect("tempdir");
+        semantic
+            .lock()
+            .unwrap()
+            .insert_for_test(dir.path().join("project"), AnalysisHost::default());
+
+        let outcome: Result<(), McpError> =
+            with_semantic(&semantic, "find_references", |_| panic!("boom in rust-analyzer")).await;
+        let error = outcome.expect_err("a panic must surface as an error");
+        assert!(
+            error.message.starts_with("find_references: ")
+                && error.message.contains("boom in rust-analyzer")
+                && error.message.contains("unloaded"),
+            "the error names the tool, the panic and what happened to the loaded projects: {}",
+            error.message
+        );
+
+        let left = with_semantic(&semantic, "count", |service| Ok(service.project_count())).await;
+        assert_eq!(left.expect("the service survives the panic"), 0, "nothing loaded is kept");
+        assert!(!semantic.is_poisoned());
     }
 
     /// A dependency source changed behind a loaded context: the call that

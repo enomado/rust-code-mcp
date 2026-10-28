@@ -240,8 +240,17 @@ impl SyncManager {
         for (i, dir) in dirs.iter().enumerate() {
             tracing::debug!("[{}/{}] Syncing: {}", i + 1, dirs.len(), dir.display());
 
-            if let Err(e) = self.sync_directory(dir).await {
-                tracing::error!("Failed to sync {}: {}", dir.display(), e);
+            // A panic is this directory's failed sync, like an `Err`: left to
+            // unwind, it ended the background task for the daemon's lifetime
+            // with nothing in the log to say so (see `panic_boundary`).
+            match crate::panic_boundary::catch_panic(self.sync_directory(dir)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::error!("Failed to sync {}: {}", dir.display(), e),
+                Err(message) => tracing::error!(
+                    target: "panic",
+                    "sync of {} panicked: {message}; the next cycle tries again",
+                    dir.display()
+                ),
             }
         }
 

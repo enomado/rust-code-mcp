@@ -93,6 +93,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi(false)
         .init();
 
+    // Every panic is caught somewhere in a daemon (`rmc_server::panic_boundary`)
+    // and the client is told only its text. Where it came from lives here: the
+    // default hook writes no backtrace without `RUST_BACKTRACE` — which nobody
+    // sets for a spawned daemon, and which would make `anyhow` capture one on
+    // every error — and no pid, in a log two daemons share. salsa's
+    // cancellations travel by `resume_unwind`, which skips the hook, so this
+    // fires only for real panics and the capture costs nothing in between.
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        tracing::error!(target: "panic", "{info}\n{backtrace}");
+    }));
+
     // Resolve the mode before the expensive startup: a client of the shared
     // daemon needs neither a `ServerRuntime`, nor the EP census probe, nor a
     // background sync task — it is a pipe between stdio and the socket.

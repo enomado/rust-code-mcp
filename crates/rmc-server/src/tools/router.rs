@@ -799,8 +799,13 @@ impl ServerHandler for SearchToolRouter {
             .unwrap_or_default();
         let mem =
             rmc_engine::mem_trace::MemSpan::start(format!("tool {}{}", request.name, directory));
+        let tool = request.name.clone();
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let result = self.tool_router.call(tcc).await;
+        // rmcp sends the response from inside the task it spawned for this
+        // request, so a panic that leaves this future sends none: the client
+        // would wait out its timeout. See `panic_boundary`.
+        let result =
+            crate::panic_boundary::answer_or_error(&tool, self.tool_router.call(tcc)).await;
         mem.finish();
         result
     }
@@ -850,5 +855,70 @@ mod tests {
         let sync_mgr = Arc::new(crate::mcp::SyncManager::new(300));
         let _router = SearchToolRouter::with_sync_manager(sync_mgr);
         assert!(_router.runtime.sync_manager().is_some());
+    }
+
+    /// A tool that panics on the async side answers with an error, and the
+    /// connection keeps serving. rmcp sends a response from inside the task it
+    /// spawned for the request, so without the catch in `call_tool` the panic
+    /// took the response with it and the client waited out its own timeout —
+    /// here, the 10 s bound below.
+    ///
+    /// Raw JSON-RPC lines over a duplex pipe against the real `serve`, so what
+    /// is checked is what a client reads off the wire.
+    #[tokio::test]
+    async fn a_panicking_tool_answers_with_an_error_and_the_server_keeps_serving() {
+        use rmcp::ServiceExt;
+        use rmcp::handler::server::router::tool::ToolRoute;
+        use serde_json::{Value, json};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let mut router = SearchToolRouter::new();
+        router.tool_router.add_route(ToolRoute::new_dyn(
+            rmcp::model::Tool::new("panic_probe", "panics", std::sync::Arc::new(serde_json::Map::new())),
+            |_| Box::pin(async { panic!("boom in a tool") }),
+        ));
+        let (server_io, client_io) = tokio::io::duplex(1 << 16);
+        let server = tokio::spawn(async move {
+            let service = router.serve(server_io).await.expect("handshake");
+            let _ = service.waiting().await;
+        });
+
+        let (reader, mut writer) = tokio::io::split(client_io);
+        let mut lines = BufReader::new(reader).lines();
+        let mut send = async |message: Value| {
+            writer.write_all(format!("{message}\n").as_bytes()).await.unwrap();
+        };
+        send(json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": { "name": "test", "version": "0" } } }))
+        .await;
+        let mut answer = async |id: u64| loop {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
+                .await
+                .expect("an answer, not a client timeout")
+                .unwrap()
+                .expect("the connection is open");
+            let value: Value = serde_json::from_str(&line).unwrap();
+            if value["id"] == json!(id) {
+                return value;
+            }
+        };
+        answer(1).await;
+        send(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await;
+
+        send(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "panic_probe", "arguments": {} } }))
+        .await;
+        let failed = answer(2).await;
+        let message = failed["error"]["message"].as_str().unwrap_or_default().to_owned();
+        assert!(
+            message.contains("panic_probe") && message.contains("boom in a tool"),
+            "the error names the tool and the panic: {failed}"
+        );
+
+        // Same connection, next request: the server is still there.
+        send(json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" })).await;
+        assert!(answer(3).await["result"]["tools"].is_array());
+        server.abort();
     }
 }

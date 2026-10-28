@@ -28,6 +28,8 @@ rmc-indexing = { path = "../rmc-indexing" }
 # MCP and async runtime
 rmcp  = { workspace = true }
 tokio = { workspace = true }
+# `FutureExt::catch_unwind`: the tool-call and sync-loop panic boundaries.
+futures = { workspace = true }
 
 # Search and indexing
 tantivy = { workspace = true }

@@ -7146,6 +7146,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "directories",
+ "futures",
  "heed",
  "hir-def",
  "ide",

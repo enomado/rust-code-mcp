@@ -34,6 +34,7 @@ static TEST_GLOBAL_ALLOCATOR: mcp::heap_census::CensusAllocator<std::alloc::Syst
     };
 
 pub(crate) mod deep_stack;
+pub mod panic_boundary;
 pub mod tools;
 pub mod mcp;
 pub mod semantic;
