@@ -245,6 +245,153 @@ pub(super) fn card_total_bytes() -> Option<u64> {
     card_vram_bytes("mem_info_vram_total")
 }
 
+/// The card a GPU session will be created on, found through KFD.
+///
+/// The sums above are the wrong thing to compare a session's price with: on
+/// the reference machine they include an integrated GPU, whose free 480 MiB
+/// would be counted as room on the discrete card.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceCard {
+    /// HIP device ordinal the execution provider uses.
+    pub ordinal: usize,
+    /// KFD `gpu_id`: the suffix of this card's `vram_<gpu_id>` in the
+    /// per-process KFD directory.
+    pub gpu_id: u32,
+    /// PCI address, `0000:03:00.0`.
+    pub pci: String,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+}
+
+impl DeviceCard {
+    pub fn free_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.used_bytes)
+    }
+}
+
+/// The card behind HIP device `ordinal`, with a fresh reading of its memory.
+///
+/// HIP numbers the GPU agents in KFD topology order (`nodes/<n>` with a
+/// non-zero `gpu_id`, ascending `n`), after `ROCR_VISIBLE_DEVICES` and then
+/// `HIP_VISIBLE_DEVICES` select among them. `None` = no KFD, a visibility
+/// list that is not plain indices (UUIDs are not resolved here), or no DRM
+/// card at that PCI address: the device cannot be located, which the caller
+/// reports as such.
+#[cfg(target_os = "linux")]
+pub fn device_card(ordinal: usize) -> Option<DeviceCard> {
+    let nodes_dir = std::path::Path::new("/sys/class/kfd/kfd/topology/nodes");
+    let mut nodes: Vec<(u32, u32, u64)> = Vec::new(); // (node, gpu_id, location_id)
+    for entry in std::fs::read_dir(nodes_dir).ok()?.flatten() {
+        let Ok(node) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let gpu_id: u32 = std::fs::read_to_string(entry.path().join("gpu_id"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        if gpu_id == 0 {
+            continue; // a CPU node
+        }
+        let properties = std::fs::read_to_string(entry.path().join("properties")).ok()?;
+        nodes.push((node, gpu_id, kfd_property(&properties, "location_id")?));
+    }
+    nodes.sort_unstable();
+    let mut agents: Vec<(u32, u64)> = nodes.into_iter().map(|(_, g, l)| (g, l)).collect();
+    for var in ["ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"] {
+        if let Some(list) = std::env::var(var).ok().filter(|v| !v.trim().is_empty()) {
+            agents = select_visible(&agents, &list)?;
+        }
+    }
+    let &(gpu_id, location) = agents.get(ordinal)?;
+    // `location_id` is the PCI bus/device/function, `bus << 8 | dev << 3 | fn`.
+    let pci_tail = format!(
+        "{:02x}:{:02x}.{:x}",
+        (location >> 8) & 0xff,
+        (location >> 3) & 0x1f,
+        location & 0x7
+    );
+    for entry in std::fs::read_dir("/sys/class/drm").ok()?.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("card") || name.contains('-') {
+            continue;
+        }
+        let device = entry.path().join("device");
+        let Ok(target) = std::fs::canonicalize(&device) else {
+            continue;
+        };
+        let pci = target.file_name()?.to_string_lossy().to_string();
+        if !pci.ends_with(&pci_tail) {
+            continue;
+        }
+        let read = |counter: &str| -> Option<u64> {
+            std::fs::read_to_string(device.join(counter))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        return Some(DeviceCard {
+            ordinal,
+            gpu_id,
+            pci,
+            total_bytes: read("mem_info_vram_total")?,
+            used_bytes: read("mem_info_vram_used")?,
+        });
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn device_card(_ordinal: usize) -> Option<DeviceCard> {
+    None
+}
+
+/// `location_id 768` from a KFD node's `properties`.
+fn kfd_property(properties: &str, key: &str) -> Option<u64> {
+    properties.lines().find_map(|line| {
+        let (k, v) = line.split_once(' ')?;
+        (k == key).then(|| v.trim().parse().ok()).flatten()
+    })
+}
+
+/// Apply a `*_VISIBLE_DEVICES` list of indices; `None` if it is anything else.
+fn select_visible<T: Copy>(agents: &[T], list: &str) -> Option<Vec<T>> {
+    list.split(',')
+        .map(|i| agents.get(i.trim().parse::<usize>().ok()?).copied())
+        .collect()
+}
+
+/// This process's KFD VRAM by `gpu_id`.
+#[cfg(target_os = "linux")]
+pub(super) fn process_kfd_vram_by_gpu() -> std::collections::BTreeMap<u32, u64> {
+    let dir = std::path::Path::new("/sys/class/kfd/kfd/proc").join(std::process::id().to_string());
+    let mut by_gpu = std::collections::BTreeMap::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(gpu) = name
+            .to_string_lossy()
+            .strip_prefix("vram_")
+            .and_then(|g| g.parse().ok())
+        else {
+            continue;
+        };
+        if let Some(bytes) = std::fs::read_to_string(entry.path())
+            .ok()
+            .and_then(|t| t.trim().parse::<u64>().ok())
+        {
+            by_gpu.insert(gpu, bytes);
+        }
+    }
+    by_gpu
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn process_kfd_vram_by_gpu() -> std::collections::BTreeMap<u32, u64> {
+    std::collections::BTreeMap::new()
+}
+
 /// Sum of one amdgpu sysfs counter over every DRM card that has it.
 #[cfg(target_os = "linux")]
 fn card_vram_bytes(counter: &str) -> Option<u64> {
@@ -320,8 +467,9 @@ struct Ledger {
     next_id: u64,
     live: Vec<LiveSession>,
     owners: std::collections::BTreeMap<EmbeddingOwner, OwnerTotals>,
-    /// The largest full charge (creation + first run, KFD meter) seen for a
-    /// session of each profile: what the broker expects the next one to cost.
+    /// The largest full charge (creation + first run, KFD meter; the whole
+    /// process for its only session) seen for a session of each profile:
+    /// what the broker expects the next one to cost.
     max_charge_by_profile: std::collections::BTreeMap<String, u64>,
 }
 
@@ -423,11 +571,31 @@ impl VramTicket {
         let profile = session.profile.clone();
         // A negative charge (a neighbour freed memory inside the window) says
         // nothing about the price; it is not recorded.
-        if let Some(bytes) = charge.process_bytes.and_then(|b| u64::try_from(b).ok()) {
-            let known = ledger.max_charge_by_profile.entry(profile).or_insert(0);
-            *known = (*known).max(bytes);
+        // What the card has to have free for such a session. A process's
+        // only session is priced at the whole process: it brings up the HIP
+        // runtime too, and part of that lands outside the creation and
+        // first-run windows (measured: charge 1386, process 1436 MiB). A
+        // fresh daemon's first session is exactly the case the price is for.
+        let only_session = ledger.live.len() == 1;
+        let price = match (charge.process_bytes, after.process_bytes) {
+            (Some(charge), Some(process)) if only_session => Some(charge.max(process as i64)),
+            (charge, _) => charge,
+        };
+        let mut grew = None;
+        if let Some(bytes) = price.and_then(|b| u64::try_from(b).ok()) {
+            let known = ledger
+                .max_charge_by_profile
+                .entry(profile.clone())
+                .or_insert(0);
+            if bytes > *known {
+                *known = bytes;
+                grew = Some(bytes);
+            }
         }
         drop(ledger);
+        if let Some(bytes) = grew {
+            remember_price(&profile, bytes);
+        }
         tracing::info!(
             target: VRAM_LOG_TARGET,
             session = self.id,
@@ -477,10 +645,102 @@ impl Drop for VramTicket {
     }
 }
 
-/// What a fully loaded session of `profile` cost the last time one was
-/// measured (the largest such charge). `None` = never measured in this process.
+/// What a fully loaded session of `profile` costs: the largest charge
+/// measured in this process, or, before the first one, the largest one an
+/// earlier process wrote down (see [`remember_price`]). `None` = never
+/// measured on this machine.
 pub(super) fn known_session_charge(profile: &str) -> Option<u64> {
-    ledger().max_charge_by_profile.get(profile).copied()
+    let here = ledger().max_charge_by_profile.get(profile).copied();
+    let before = remembered_price(profile);
+    here.max(before)
+}
+
+/// After any run of the only live session: raise the price of `profile` to
+/// what the whole process holds now.
+///
+/// Why after every run and not only the first: runs after the warm-up still
+/// allocate, a little and a bounded number of times — measured,
+/// `runs_after_warm_up_by_thread`: 1386 after the warm-up, +25 MiB on the
+/// first run from another thread and once more a few runs later, then flat
+/// at 1436 for good (the oracle's 50 passes). That is the process's steady
+/// weight, and it is what the next process's first session has to find free
+/// on the card. Two sysfs reads per run; a run is one batch.
+pub(super) fn observe_after_run(profile: &str) {
+    let Some(process) = process_kfd_vram_bytes() else {
+        return;
+    };
+    let mut ledger = ledger();
+    if ledger.live.len() != 1 {
+        return;
+    }
+    let known = ledger
+        .max_charge_by_profile
+        .entry(profile.to_string())
+        .or_insert(0);
+    if process <= *known {
+        return;
+    }
+    *known = process;
+    drop(ledger);
+    remember_price(profile, process);
+}
+
+/// Make this process believe a session of `profile` costs `bytes`.
+#[cfg(test)]
+pub(super) fn set_price_for_test(profile: &str, bytes: u64) {
+    ledger()
+        .max_charge_by_profile
+        .insert(profile.to_string(), bytes);
+}
+
+/// Where the price of a session of `profile` is kept between processes: the
+/// same cache root as the models and the MIGraphX kernels.
+///
+/// Why it is kept at all: the first session of a daemon is the one that must
+/// be checked against the card's free memory, and without a price from an
+/// earlier run there is nothing to check it against.
+fn price_path(profile: &str) -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "rust-code-mcp").map(|d| {
+        d.cache_dir()
+            .join("vram")
+            .join(format!("{profile}.session_bytes"))
+    })
+}
+
+fn remembered_price(profile: &str) -> Option<u64> {
+    std::fs::read_to_string(price_path(profile)?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Write the price down if it is above what is there. Zero is never written:
+/// it is what a machine without the KFD meter measures, not a price.
+/// Best effort: a read-only cache costs only the check of the next process's
+/// first session.
+fn remember_price(profile: &str, bytes: u64) {
+    let Some(path) = price_path(profile) else {
+        return;
+    };
+    if bytes == 0 || remembered_price(profile).is_some_and(|known| known >= bytes) {
+        return;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let written = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&tmp, bytes.to_string()))
+        .and_then(|()| std::fs::rename(&tmp, &path));
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!(
+            target: VRAM_LOG_TARGET,
+            path = %path.display(),
+            %error,
+            "cannot write down the price of a GPU session"
+        );
+    }
 }
 
 /// One run granted by the broker to `owner`, after waiting `waited`.
@@ -631,6 +891,17 @@ mod tests {
         assert_eq!(parse_drm_fdinfo(legacy), Some(("7".into(), 2 << 20)));
         let both = "drm-client-id:\t7\ndrm-memory-vram:\t2 MiB\ndrm-total-vram:\t3 MiB\n";
         assert_eq!(parse_drm_fdinfo(both), Some(("7".into(), 3 << 20)));
+    }
+
+    #[test]
+    fn kfd_location_and_visibility_lists() {
+        let properties = "cpu_cores_count 0\nsimd_count 108\nlocation_id 768\ndomain 0\n";
+        assert_eq!(kfd_property(properties, "location_id"), Some(768));
+        assert_eq!(kfd_property(properties, "location"), None);
+        let agents = [10, 20, 30];
+        assert_eq!(select_visible(&agents, "2, 0"), Some(vec![30, 10]));
+        assert_eq!(select_visible(&agents, "3"), None);
+        assert_eq!(select_visible(&agents, "GPU-1234"), None);
     }
 
     #[test]

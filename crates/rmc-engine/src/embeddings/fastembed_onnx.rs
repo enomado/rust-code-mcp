@@ -200,6 +200,16 @@ impl FastembedOnnxEmbedder {
         result
     }
 
+    /// One run on a throw-away text, so that the session's first run — where
+    /// MIGraphX puts the program on the GPU — happens now, inside the
+    /// broker's admitted window, and not in somebody's query later.
+    ///
+    /// One text is enough: the session has a fixed input shape, so a single
+    /// row is padded to the same `rows × seq_len` every real batch runs as.
+    pub(super) fn warm_up(&self) -> Result<(), EmbeddingError> {
+        self.embed_documents(&["fn warm_up() {}"]).map(|_| ())
+    }
+
     pub(super) fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Embedding>, EmbeddingError> {
         let prefixed: Vec<String> = texts
             .iter()
@@ -255,7 +265,12 @@ pub(super) fn probe_provider_census(
     let census = (|| {
         // The census session is profiled from its creation, so it cannot be
         // the broker's shared one; it is a second session for the duration of
-        // the probe, and passes the same budget check.
+        // the probe, and passes the same checks, under the same lock, held
+        // for the whole probe: its first run allocates like any session's.
+        let _gpu = backend
+            .is_fastembed_onnx_gpu()
+            .then(crate::embeddings::gpu_lock::GpuLock::acquire)
+            .transpose()?;
         if backend.is_fastembed_onnx_gpu() {
             crate::embeddings::gpu_broker::admit(backend)?;
         }

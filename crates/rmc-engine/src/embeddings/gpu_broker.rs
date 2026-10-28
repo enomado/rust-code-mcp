@@ -24,10 +24,12 @@
 //!   codemap rerank) before the index, the index before the graph cache. A
 //!   run is one sub-batch, so a query waits at most one batch.
 //! - A session is created lazily, by the first grant that finds none, and
-//!   only within the VRAM budget ([`VramBudget`]): the process's current KFD
-//!   reading plus the last measured price of a session of this profile. Over
-//!   the budget the run is refused with the numbers, instead of letting
-//!   MIGraphX find out by aborting.
+//!   only within the VRAM budget ([`VramBudget`]: the process's current KFD
+//!   reading plus the measured price of a session of this profile) and the
+//!   free memory of its card ([`room_on_card`]). Creation and a warm-up run —
+//!   every allocation the session will make — happen under the cross-process
+//!   `gpu_lock`. Over either limit the run is refused with the numbers,
+//!   instead of letting MIGraphX find out by aborting.
 //! - [`release_idle`] drops sessions nobody has used for a while; the daemon's
 //!   watchdog calls it every tick. The next grant creates one again.
 //!
@@ -40,7 +42,7 @@
 use super::backend::EmbeddingBackend;
 use super::error::EmbeddingError;
 use super::fastembed_onnx::FastembedOnnxEmbedder;
-use super::vram_ledger::{self, EmbeddingOwner, VRAM_LOG_TARGET};
+use super::vram_ledger::{self, DeviceCard, EmbeddingOwner, VRAM_LOG_TARGET};
 use serde::Serialize;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -367,33 +369,148 @@ static GPU_BROKER: Broker<EmbeddingBackend, FastembedOnnxEmbedder> = Broker::new
 /// Proof that a GPU session passed the budget check; required by
 /// `FastembedOnnxEmbedder::new_gpu`. Only [`admit`] makes one (and tests).
 pub(super) struct Admission {
-    _private: (),
+    /// The card the check looked at, `None` if it could not be located.
+    card: Option<DeviceCard>,
 }
 
 impl Admission {
     /// For the GPU probes that measure a bare session on purpose.
     #[cfg(test)]
     pub(super) fn for_probe() -> Self {
-        Self { _private: () }
+        Self { card: None }
     }
 }
 
-/// May one more GPU session of `backend` be created in this process now?
+/// HIP device the sessions run on: the MIGraphX execution provider is built
+/// with its default `device_id`, 0 (`migraphx_execution_providers`).
+const SESSION_DEVICE: usize = 0;
+
+/// May one more GPU session of `backend` be created now?
+///
+/// Two checks, because they answer different questions:
+/// - the budget — may THIS PROCESS hold one more session ([`VramBudget`]);
+/// - the room on the card — is there memory for it at all right now, whoever
+///   holds the rest ([`room_on_card`]). Without it the allocation fails inside
+///   MIGraphX, and MIGraphX reports that as a C++ `assert`: the process dies.
+///
+/// 🚨 Only meaningful under the cross-process `gpu_lock`, held until the
+/// session has made every allocation it will make (see [`create_session`]):
+/// otherwise another of our processes can take the room between the check and
+/// the allocation.
 pub(super) fn admit(backend: &EmbeddingBackend) -> Result<Admission, EmbeddingError> {
     let profile = backend.profile.name();
     let budget = VramBudget::from_env(vram_ledger::card_total_bytes())?;
     let process = vram_ledger::read_vram().process_bytes;
-    budget.admit(profile, process, vram_ledger::known_session_charge(profile))?;
-    Ok(Admission { _private: () })
+    let price = vram_ledger::known_session_charge(profile);
+    budget.admit(profile, process, price)?;
+    let card = vram_ledger::device_card(SESSION_DEVICE);
+    room_on_card(profile, card.as_ref(), price)?;
+    Ok(Admission { card })
 }
 
-/// Build a GPU session for `backend` within the VRAM budget.
+/// Is there `price` of free memory on the card the session will go to?
+///
+/// Every number here is a measurement: the card's own counters, and the
+/// largest charge of such a session measured on this machine (kept between
+/// processes). No margin is added on top — the price already includes the
+/// first run, which is where MIGraphX allocates, and the HIP context of a
+/// process's first session. Without a price (the first session of a profile
+/// ever) or without a card meter there is nothing to compare; that is said in
+/// the log, not refused: the session that runs is what measures the price.
+fn room_on_card(
+    profile: &str,
+    card: Option<&DeviceCard>,
+    price: Option<u64>,
+) -> Result<(), EmbeddingError> {
+    let mib = |b: u64| b >> 20;
+    let Some(card) = card else {
+        tracing::info!(
+            target: VRAM_LOG_TARGET,
+            profile,
+            "GPU session: the device's card cannot be located; free memory not checked"
+        );
+        return Ok(());
+    };
+    let Some(price) = price else {
+        tracing::info!(
+            target: VRAM_LOG_TARGET,
+            profile,
+            card = %card.pci,
+            free_mib = mib(card.free_bytes()),
+            "GPU session: no price measured for this profile yet; free memory not checked"
+        );
+        return Ok(());
+    };
+    if card.free_bytes() >= price {
+        return Ok(());
+    }
+    Err(EmbeddingError::model_init(format!(
+        "GPU embedding session for `{profile}` refused: the card {} has {} MiB free \
+         ({} of {} MiB used, by every process on it), a session costs {} MiB",
+        card.pci,
+        mib(card.free_bytes()),
+        mib(card.used_bytes),
+        mib(card.total_bytes),
+        mib(price),
+    )))
+}
+
+/// Build a GPU session for `backend` and make it allocate everything it will
+/// ever allocate, all under the cross-process lock and within the checks of
+/// [`admit`].
+///
+/// The warm-up run is what makes the check hold: VRAM is allocated at
+/// creation and in the session's FIRST run (MIGraphX loads the program there;
+/// measured: after it, 100 runs moved KFD 1411 → 1411 MiB). Left to the
+/// first real run, that allocation would happen after the lock was released
+/// and the room counted for it possibly gone.
 fn create_session(
     backend: &EmbeddingBackend,
     owner: EmbeddingOwner,
 ) -> Result<FastembedOnnxEmbedder, EmbeddingError> {
+    let _gpu = super::gpu_lock::GpuLock::acquire()?;
     let admission = admit(backend)?;
-    FastembedOnnxEmbedder::new_gpu(backend, owner, &admission)
+    let before = vram_ledger::process_kfd_vram_by_gpu();
+    let session = FastembedOnnxEmbedder::new_gpu(backend, owner, &admission)?;
+    session.warm_up()?;
+    check_landed_on(&admission, &before, &vram_ledger::process_kfd_vram_by_gpu());
+    Ok(session)
+}
+
+/// The free-memory check watched one card; the session's memory must have
+/// grown on that card. If it grew elsewhere the device mapping in
+/// [`vram_ledger::device_card`] is wrong for this machine, and the check is
+/// guarding the wrong card — said loudly, since nothing else would show it.
+fn check_landed_on(
+    admission: &Admission,
+    before: &std::collections::BTreeMap<u32, u64>,
+    after: &std::collections::BTreeMap<u32, u64>,
+) {
+    let Some(card) = &admission.card else {
+        return;
+    };
+    let grown = after
+        .iter()
+        .map(|(gpu, bytes)| {
+            (
+                *gpu,
+                bytes.saturating_sub(before.get(gpu).copied().unwrap_or(0)),
+            )
+        })
+        .max_by_key(|&(_, delta)| delta);
+    if let Some((gpu, delta)) = grown
+        && delta > 0
+        && gpu != card.gpu_id
+    {
+        tracing::warn!(
+            target: VRAM_LOG_TARGET,
+            checked_gpu_id = card.gpu_id,
+            checked_card = %card.pci,
+            landed_gpu_id = gpu,
+            landed_bytes = delta,
+            "GPU session allocated on a different GPU than the one its free memory was checked on"
+        );
+    }
 }
 
 /// See [`Broker::ensure`].
@@ -422,7 +539,11 @@ pub(super) fn with_session<T>(
             "waited for the shared GPU embedding session"
         );
     }
-    f(grant.session())
+    let result = f(grant.session());
+    // Read while the grant is still held: no other run of this process can
+    // be moving the meter.
+    vram_ledger::observe_after_run(backend.profile.name());
+    result
 }
 
 /// Drop every GPU session nobody has used for `max_idle`; returns how many.
@@ -572,12 +693,31 @@ pub struct BrokerReport {
     /// The budget as it would apply to the next creation; an unparsable
     /// knob is shown as its error.
     pub budget: Result<VramBudget, String>,
+    /// The card sessions are created on, as the free-memory check sees it
+    /// now. `None` = it cannot be located (and nothing is checked).
+    pub device_card: Option<DeviceCard>,
+    /// Price of one session by profile, as the next check would use it
+    /// (this process's measurement, else the one written down by an earlier
+    /// process).
+    pub session_price_bytes: Vec<(String, Option<u64>)>,
 }
 
 pub(super) fn broker_report(card_total: Option<u64>) -> BrokerReport {
+    let slots = GPU_BROKER.slot_reports(|backend| backend.profile.name().to_string());
+    let session_price_bytes = slots
+        .iter()
+        .map(|s| {
+            (
+                s.backend.clone(),
+                vram_ledger::known_session_charge(&s.backend),
+            )
+        })
+        .collect();
     BrokerReport {
-        slots: GPU_BROKER.slot_reports(|backend| backend.profile.name().to_string()),
+        slots,
         budget: VramBudget::from_env(card_total).map_err(|e| e.to_string()),
+        device_card: vram_ledger::device_card(SESSION_DEVICE),
+        session_price_bytes,
     }
 }
 
@@ -871,6 +1011,11 @@ mod tests {
         let slot = &report.broker.slots[0];
         assert_eq!(slot.sessions_created, 1);
         assert!(slot.grants >= 2 * ROUNDS as u64, "grants {}", slot.grants);
+        eprintln!(
+            "process VRAM after passes 1..=5, MiB: {:?}; price {:?} MiB",
+            readings[..5].iter().map(|b| b >> 20).collect::<Vec<_>>(),
+            vram_ledger::known_session_charge("local-gpu-bge").map(|b| b >> 20),
+        );
         let early = readings[4];
         let last = *readings.last().unwrap();
         eprintln!(
@@ -882,6 +1027,108 @@ mod tests {
             (last as i64 - early as i64).abs() <= 64 << 20,
             "VRAM moved {} MiB between pass 5 and pass {ROUNDS}",
             (last as i64 - early as i64) >> 20
+        );
+    }
+
+    fn card(total_mib: u64, used_mib: u64) -> DeviceCard {
+        DeviceCard {
+            ordinal: 0,
+            gpu_id: 18572,
+            pci: "0000:03:00.0".into(),
+            total_bytes: total_mib << 20,
+            used_bytes: used_mib << 20,
+        }
+    }
+
+    #[test]
+    fn room_on_card_refuses_with_the_numbers() {
+        let price = Some(1454 << 20);
+        room_on_card("bge", Some(&card(12272, 10818)), price).unwrap();
+        let err = room_on_card("bge", Some(&card(12272, 10819)), price)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("has 1453 MiB free") && err.contains("costs 1454 MiB"),
+            "{err}"
+        );
+        assert!(err.contains("0000:03:00.0"), "{err}");
+        // Nothing to compare: not refused.
+        room_on_card("bge", Some(&card(12272, 12272)), None).unwrap();
+        room_on_card("bge", None, price).unwrap();
+    }
+
+    /// The no-abort check on the real card, without allocating anything: the
+    /// price of `local-gpu-bge` is set above what the card has free, and the
+    /// broker must refuse to create the session — with the card's numbers —
+    /// while this process's VRAM stays where it was. Mutation that must fail
+    /// it: drop the `room_on_card` call from `admit`.
+    ///
+    /// Takes the real `gpu_lock` for a moment (as every creation does). The
+    /// process budget is switched off, or it would refuse first:
+    /// `RMC_VRAM_BUDGET_MB=0 cargo test -p rmc-engine room_on_the_real_card -- --ignored`
+    #[test]
+    #[ignore = "reads the real card through KFD and takes the real GPU lock"]
+    fn room_on_the_real_card_is_checked_before_any_allocation() {
+        assert_eq!(
+            VramBudget::from_env(None).unwrap(),
+            VramBudget::Disabled,
+            "run with RMC_VRAM_BUDGET_MB=0"
+        );
+        let card = vram_ledger::device_card(SESSION_DEVICE).expect("no KFD GPU at ordinal 0");
+        eprintln!("{card:?}");
+        let backend = EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
+        vram_ledger::set_price_for_test(backend.profile.name(), card.free_bytes() + (1 << 30));
+        let before = vram_ledger::read_vram().process_bytes;
+        let err = ensure_session(&backend, EmbeddingOwner::Tool)
+            .err()
+            .expect("created a session the card has no room for")
+            .to_string();
+        assert!(err.contains("MiB free") && err.contains(&card.pci), "{err}");
+        assert_eq!(vram_ledger::read_vram().process_bytes, before);
+        let report = broker_report(None);
+        assert_eq!(report.slots[0].state, "empty");
+        assert_eq!(report.slots[0].sessions_created, 0);
+    }
+
+    /// Does a run allocate after the warm-up? Runs the shared session from
+    /// fresh OS threads, one after another, and reads KFD after each.
+    ///
+    /// `cargo test --release -p rmc-engine --features embeddings-migraphx runs_after_warm_up -- --ignored --nocapture`
+    #[cfg(feature = "embeddings-migraphx")]
+    #[test]
+    #[ignore = "needs an AMD GPU, ORT with MIGraphX and a downloaded model"]
+    fn runs_after_warm_up_by_thread() {
+        let backend = EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
+        ensure_session(&backend, EmbeddingOwner::Tool).unwrap();
+        let mut readings = vec![vram_ledger::read_vram().process_bytes.unwrap() >> 20];
+        for round in 0..8 {
+            let backend = backend.clone();
+            std::thread::spawn(move || {
+                with_session(&backend, EmbeddingOwner::Tool, |s| {
+                    s.embed_documents(&[&format!("fn round_{round}() {{}}")])
+                })
+                .unwrap();
+            })
+            .join()
+            .unwrap();
+            readings.push(vram_ledger::read_vram().process_bytes.unwrap() >> 20);
+        }
+        // Same thread twice more.
+        for _ in 0..2 {
+            with_session(&backend, EmbeddingOwner::Tool, |s| {
+                s.embed_documents(&["x"])
+            })
+            .unwrap();
+            readings.push(vram_ledger::read_vram().process_bytes.unwrap() >> 20);
+        }
+        let price = vram_ledger::known_session_charge("local-gpu-bge").unwrap() >> 20;
+        eprintln!(
+            "price {price} MiB; after warm-up, then after each run (8 fresh threads, 2 on this one): {readings:?}"
+        );
+        // The price follows the process up to its steady weight.
+        assert!(
+            price >= *readings.iter().max().unwrap(),
+            "price {price} below {readings:?}"
         );
     }
 
