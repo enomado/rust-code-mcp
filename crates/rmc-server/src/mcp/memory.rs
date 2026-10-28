@@ -447,6 +447,19 @@ pub fn release_free_memory() -> bool {
     }
 }
 
+/// Release the shared GPU embedding sessions unused for `max_idle`; the
+/// daemon's watchdog calls it every tick. Returns how many went. The binary
+/// reaches the engine only through this crate.
+pub fn release_idle_gpu_sessions(max_idle: std::time::Duration) -> usize {
+    rmc_engine::embeddings::release_idle_gpu_sessions(max_idle)
+}
+
+/// The VRAM budget the next GPU session would be checked against, for the
+/// daemon's startup line.
+pub fn gpu_vram_budget() -> Result<rmc_engine::embeddings::VramBudget, String> {
+    rmc_engine::embeddings::gpu_ledger_report().broker.budget
+}
+
 /// What a release attempt did, in numbers the caller can print.
 ///
 /// `before`/`after` are `None` where RSS is unreadable; `released_kib` is then

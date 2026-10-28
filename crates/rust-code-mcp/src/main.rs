@@ -49,8 +49,12 @@ use tracing_subscriber::{self, EnvFilter, fmt::time::FormatTime};
 /// `rmc_mem` is `rmc_engine::mem_trace::LOG_TARGET`, spelled out because the
 /// binary does not depend on `rmc-engine` at runtime (see Cargo.toml); the
 /// test `default_filter_enables_memory_lines` keeps the two in step.
+///
+/// `embeddings::vram` is `rmc_engine::embeddings::VRAM_LOG_TARGET` (GPU
+/// session created / first run / granted after a wait / released), kept in
+/// step by `default_filter_enables_vram_lines`.
 const DEFAULT_LOG_FILTER: &str =
-    "warn,rust_code_mcp=info,rmc_server=info,rmc_indexing=info,rmc_mem=info";
+    "warn,rust_code_mcp=info,rmc_server=info,rmc_indexing=info,rmc_mem=info,embeddings::vram=info";
 
 /// The default timestamp followed by `[pid]`.
 ///
@@ -289,6 +293,17 @@ mod tests {
     #[test]
     fn default_filter_enables_memory_lines() {
         let directive = format!("{}=info", rmc_engine::mem_trace::LOG_TARGET);
+        assert!(
+            DEFAULT_LOG_FILTER.split(',').any(|d| d == directive),
+            "{DEFAULT_LOG_FILTER:?} must contain {directive:?}"
+        );
+    }
+
+    /// The same for the GPU ledger: its lines are how a session count is read
+    /// from the log after a crash, when `runtime_status` is gone.
+    #[test]
+    fn default_filter_enables_vram_lines() {
+        let directive = format!("{}=info", rmc_engine::embeddings::VRAM_LOG_TARGET);
         assert!(
             DEFAULT_LOG_FILTER.split(',').any(|d| d == directive),
             "{DEFAULT_LOG_FILTER:?} must contain {directive:?}"

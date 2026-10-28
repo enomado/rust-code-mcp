@@ -53,6 +53,11 @@ use serde::Serialize;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Log target of every ledger and broker line. Named so the daemon's default
+/// filter can enable it by reference: an unnamed `embeddings::*` target sat
+/// below the default `warn` and none of these lines reached the daemon log.
+pub const VRAM_LOG_TARGET: &str = "embeddings::vram";
+
 /// Which part of the program a GPU session belongs to.
 ///
 /// Required at every construction of an [`super::EmbeddingGenerator`]: the
@@ -235,6 +240,11 @@ fn parse_kib(value: &str) -> Option<u64> {
     }
 }
 
+/// Size of the card(s): `mem_info_vram_total` summed like the used meter.
+pub(super) fn card_total_bytes() -> Option<u64> {
+    card_vram_bytes("mem_info_vram_total")
+}
+
 /// Sum of one amdgpu sysfs counter over every DRM card that has it.
 #[cfg(target_os = "linux")]
 fn card_vram_bytes(counter: &str) -> Option<u64> {
@@ -289,6 +299,9 @@ struct OwnerTotals {
     released_charge: VramDelta,
     /// Sum of what came back when they were released (positive = freed).
     released_returned: VramDelta,
+    /// Runs granted to this owner by the broker, and how long they waited.
+    grants: u64,
+    grant_wait_ms: u64,
 }
 
 impl OwnerTotals {
@@ -297,6 +310,8 @@ impl OwnerTotals {
         released: 0,
         released_charge: VramDelta::ZERO,
         released_returned: VramDelta::ZERO,
+        grants: 0,
+        grant_wait_ms: 0,
     };
 }
 
@@ -305,6 +320,9 @@ struct Ledger {
     next_id: u64,
     live: Vec<LiveSession>,
     owners: std::collections::BTreeMap<EmbeddingOwner, OwnerTotals>,
+    /// The largest full charge (creation + first run, KFD meter) seen for a
+    /// session of each profile: what the broker expects the next one to cost.
+    max_charge_by_profile: std::collections::BTreeMap<String, u64>,
 }
 
 /// The process has one GPU and one set of meters, so one ledger.
@@ -312,6 +330,7 @@ static LEDGER: Mutex<Ledger> = Mutex::new(Ledger {
     next_id: 0,
     live: Vec::new(),
     owners: std::collections::BTreeMap::new(),
+    max_charge_by_profile: std::collections::BTreeMap::new(),
 });
 
 fn ledger() -> std::sync::MutexGuard<'static, Ledger> {
@@ -368,7 +387,7 @@ impl VramTicket {
         let live = ledger.live.len();
         drop(ledger);
         tracing::info!(
-            target: "embeddings::vram",
+            target: VRAM_LOG_TARGET,
             session = id,
             owner = ?owner,
             profile,
@@ -401,9 +420,16 @@ impl VramTicket {
         let session = ledger.live.iter_mut().find(|s| s.id == self.id).unwrap();
         session.at_first_run = Some(delta);
         let charge = session.charge();
+        let profile = session.profile.clone();
+        // A negative charge (a neighbour freed memory inside the window) says
+        // nothing about the price; it is not recorded.
+        if let Some(bytes) = charge.process_bytes.and_then(|b| u64::try_from(b).ok()) {
+            let known = ledger.max_charge_by_profile.entry(profile).or_insert(0);
+            *known = (*known).max(bytes);
+        }
         drop(ledger);
         tracing::info!(
-            target: "embeddings::vram",
+            target: VRAM_LOG_TARGET,
             session = self.id,
             owner = ?self.owner,
             first_run_process_bytes = ?delta.process_bytes,
@@ -437,7 +463,7 @@ impl Drop for VramTicket {
         let live = ledger.live.len();
         drop(ledger);
         tracing::info!(
-            target: "embeddings::vram",
+            target: VRAM_LOG_TARGET,
             session = self.id,
             owner = ?session.owner,
             live_sessions = live,
@@ -449,6 +475,20 @@ impl Drop for VramTicket {
             "GPU embedding session released"
         );
     }
+}
+
+/// What a fully loaded session of `profile` cost the last time one was
+/// measured (the largest such charge). `None` = never measured in this process.
+pub(super) fn known_session_charge(profile: &str) -> Option<u64> {
+    ledger().max_charge_by_profile.get(profile).copied()
+}
+
+/// One run granted by the broker to `owner`, after waiting `waited`.
+pub(super) fn record_grant(owner: EmbeddingOwner, waited: std::time::Duration) {
+    let mut ledger = ledger();
+    let totals = ledger.owners.entry(owner).or_insert(OwnerTotals::NONE_YET);
+    totals.grants += 1;
+    totals.grant_wait_ms += waited.as_millis() as u64;
 }
 
 /// One live session in the report.
@@ -475,6 +515,9 @@ pub struct OwnerReport {
     pub released_returned: VramDelta,
     /// `released_charge - released_returned`: what released sessions kept.
     pub released_kept: VramDelta,
+    /// Runs the broker granted to this owner, and their summed wait.
+    pub grants: u64,
+    pub grant_wait_ms: u64,
 }
 
 /// The `gpu` section of `runtime_status`.
@@ -490,6 +533,8 @@ pub struct GpuLedgerReport {
     pub unaccounted_process_bytes: Option<i64>,
     /// Card VRAM held by everything that is not this process.
     pub other_than_this_process_bytes: Option<i64>,
+    /// Who holds which shared session right now, and the VRAM budget.
+    pub broker: super::gpu_broker::BrokerReport,
 }
 
 /// Snapshot the ledger together with a fresh reading of both meters.
@@ -533,11 +578,14 @@ pub fn gpu_ledger_report() -> GpuLedgerReport {
                 released_kept: totals
                     .released_charge
                     .plus(totals.released_returned.negated()),
+                grants: totals.grants,
+                grant_wait_ms: totals.grant_wait_ms,
             }
         })
         .collect();
     drop(ledger);
     GpuLedgerReport {
+        broker: super::gpu_broker::broker_report(card_total_bytes),
         unaccounted_process_bytes: (|| {
             Some(now.process_bytes? as i64 - live_charge.process_bytes?)
         })(),

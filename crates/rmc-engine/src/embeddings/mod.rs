@@ -38,7 +38,12 @@ mod gpu_lock;
 mod vram_ledger;
 pub use vram_ledger::{
     gpu_ledger_report, read_vram, EmbeddingOwner, GpuLedgerReport, LiveSessionReport,
-    OwnerReport, VramDelta, VramReading,
+    OwnerReport, VramDelta, VramReading, VRAM_LOG_TARGET,
+};
+
+mod gpu_broker;
+pub use gpu_broker::{
+    release_idle_gpu_sessions, BrokerReport, BrokerSlotReport, VramBudget, VRAM_BUDGET_ENV,
 };
 
 mod fastembed_onnx;
@@ -178,7 +183,11 @@ pub struct EmbeddingGenerator {
 enum EmbeddingGeneratorInner {
     #[cfg(feature = "embeddings-cuda")]
     Qwen3(Arc<qwen3::Qwen3Embedder>),
+    /// CPU only: a GPU session is never owned by a generator.
     FastembedOnnx(Arc<fastembed_onnx::FastembedOnnxEmbedder>),
+    /// A fastembed GPU runtime: the session lives in `gpu_broker`, one per
+    /// backend per process, and each run borrows it as `owner`.
+    GpuBrokered { owner: EmbeddingOwner },
     OpenRouter(Arc<openrouter::OpenRouterEmbedder>),
 }
 
@@ -213,12 +222,15 @@ impl EmbeddingGenerator {
             EmbeddingRuntime::OpenRouter => EmbeddingGeneratorInner::OpenRouter(Arc::new(
                 openrouter::OpenRouterEmbedder::new(&backend)?,
             )),
-            EmbeddingRuntime::LocalFastembedOnnxCpu
-            | EmbeddingRuntime::LocalFastembedOnnxMigraphx
+            EmbeddingRuntime::LocalFastembedOnnxCpu => EmbeddingGeneratorInner::FastembedOnnx(
+                Arc::new(fastembed_onnx::FastembedOnnxEmbedder::new_cpu(&backend, owner)?),
+            ),
+            EmbeddingRuntime::LocalFastembedOnnxMigraphx
             | EmbeddingRuntime::LocalFastembedOnnxDirectml => {
-                EmbeddingGeneratorInner::FastembedOnnx(Arc::new(
-                    fastembed_onnx::FastembedOnnxEmbedder::new(&backend, owner)?,
-                ))
+                // Built here if the broker has none, so a broken GPU fails at
+                // construction as it always did; otherwise free.
+                gpu_broker::ensure_session(&backend, owner)?;
+                EmbeddingGeneratorInner::GpuBrokered { owner }
             }
         };
         Ok(Self { inner, backend })
@@ -230,6 +242,7 @@ impl EmbeddingGenerator {
             #[cfg(feature = "embeddings-cuda")]
             EmbeddingGeneratorInner::Qwen3(inner) => inner.dim(),
             EmbeddingGeneratorInner::FastembedOnnx(inner) => inner.dim(),
+            EmbeddingGeneratorInner::GpuBrokered { .. } => self.backend.dim(),
             EmbeddingGeneratorInner::OpenRouter(inner) => inner.dim(),
         }
     }
@@ -307,6 +320,26 @@ impl EmbeddingGenerator {
                         EmbedSide::Documents => inner.embed_documents(&refs),
                         EmbedSide::Queries => inner.embed_queries(&refs),
                     }
+                })
+                .await
+                .map_err(|e| EmbeddingError::task_join(e.to_string()))?
+            }
+            EmbeddingGeneratorInner::GpuBrokered { owner } => {
+                let owner = *owner;
+                let backend = self.backend.clone();
+                tokio::task::spawn_blocking(move || {
+                    // The broker orders this process's users (queries
+                    // first), the flock orders processes; in that order, so
+                    // a query never queues behind another process's lock
+                    // while holding nothing.
+                    gpu_broker::with_session(&backend, owner, |session| {
+                        let _gpu = gpu_lock::GpuLock::acquire()?;
+                        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+                        match side {
+                            EmbedSide::Documents => session.embed_documents(&refs),
+                            EmbedSide::Queries => session.embed_queries(&refs),
+                        }
+                    })
                 })
                 .await
                 .map_err(|e| EmbeddingError::task_join(e.to_string()))?

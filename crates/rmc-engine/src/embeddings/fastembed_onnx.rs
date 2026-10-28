@@ -9,6 +9,7 @@ use crate::embeddings::batching::FixedInputShape;
 use crate::embeddings::ep_census::ProviderCensus;
 use crate::embeddings::profile::FastembedOnnxModel;
 use crate::embeddings::{Embedding, EmbeddingError};
+use crate::embeddings::gpu_broker::Admission;
 use crate::embeddings::vram_ledger::{read_vram, EmbeddingOwner, VramTicket};
 use fastembed::{EmbeddingModel, FixedBatchShape, TextEmbedding, TextInitOptions};
 use std::sync::Mutex;
@@ -41,9 +42,28 @@ impl Drop for Session {
 }
 
 impl FastembedOnnxEmbedder {
-    pub(super) fn new(
+    /// A CPU session. GPU backends are refused: their sessions are made only
+    /// by `gpu_broker`, through [`Self::new_gpu`].
+    pub(super) fn new_cpu(
         backend: &EmbeddingBackend,
         owner: EmbeddingOwner,
+    ) -> Result<Self, EmbeddingError> {
+        if backend.is_fastembed_onnx_gpu() {
+            return Err(EmbeddingError::model_init(format!(
+                "profile `{}` runs on the GPU; its session is created by the GPU broker only",
+                backend.profile.name()
+            )));
+        }
+        Self::new_inner(backend, owner, None)
+    }
+
+    /// A GPU session. The [`Admission`] is the broker's budget check, and the
+    /// only way to get one; it is what keeps a second session per backend
+    /// from being built behind the broker's back.
+    pub(super) fn new_gpu(
+        backend: &EmbeddingBackend,
+        owner: EmbeddingOwner,
+        _admitted: &Admission,
     ) -> Result<Self, EmbeddingError> {
         Self::new_inner(backend, owner, None)
     }
@@ -233,6 +253,12 @@ pub(super) fn probe_provider_census(
     })?;
 
     let census = (|| {
+        // The census session is profiled from its creation, so it cannot be
+        // the broker's shared one; it is a second session for the duration of
+        // the probe, and passes the same budget check.
+        if backend.is_fastembed_onnx_gpu() {
+            crate::embeddings::gpu_broker::admit(backend)?;
+        }
         let embedder = FastembedOnnxEmbedder::new_profiled(backend, &dir.join("census"))?;
         // The census must be based on the session's WORK: before the first run
         // the profile is empty, and 'zero nodes on GPU' would mean 'did not look'.
@@ -683,7 +709,7 @@ mod tests {
 
         let _gpu = crate::embeddings::gpu_lock::GpuLock::acquire().unwrap();
         let card_before = read_vram().card_used_bytes.expect("no amdgpu sysfs meter");
-        let embedder = FastembedOnnxEmbedder::new(&backend, EmbeddingOwner::Tool).unwrap();
+        let embedder = FastembedOnnxEmbedder::new_gpu(&backend, EmbeddingOwner::Tool, &Admission::for_probe()).unwrap();
         embedder.embed_documents(&refs).unwrap();
         let card_after = read_vram().card_used_bytes.unwrap();
 
@@ -761,7 +787,7 @@ mod tests {
                 eprintln!("stop before cycle {cycle}: card free {} MiB < {} MiB", mib(free), mib(min_free));
                 break;
             }
-            let embedder = FastembedOnnxEmbedder::new(&backend, EmbeddingOwner::Tool).unwrap();
+            let embedder = FastembedOnnxEmbedder::new_gpu(&backend, EmbeddingOwner::Tool, &Admission::for_probe()).unwrap();
             {
                 let _gpu = crate::embeddings::gpu_lock::GpuLock::acquire().unwrap();
                 embedder.embed_documents(&refs).unwrap();

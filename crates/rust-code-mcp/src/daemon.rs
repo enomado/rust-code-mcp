@@ -64,7 +64,8 @@ mod relay;
 use fs2::FileExt;
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENV, EMBEDDING_PROFILE_ENV, EP_CENSUS_ENV, RuntimeClearRequest,
-    RuntimeClearScope, RuntimeState, RuntimeTaskReport, ServerRuntime, mem_available_kib,
+    RuntimeClearScope, RuntimeState, RuntimeTaskReport, ServerRuntime, gpu_vram_budget,
+    mem_available_kib, release_idle_gpu_sessions,
     release_free_memory, rss_kib,
 };
 use rmc_server::tools::SearchTool;
@@ -111,6 +112,17 @@ pub const RETIRE_GRACE_ENV: &str = "RMC_RETIRE_GRACE_SECS";
 /// How often the daemon collects garbage in its loaded analyses, in seconds.
 /// `0` disables it — see [`should_collect_garbage`].
 pub const GC_INTERVAL_ENV: &str = "RMC_GC_INTERVAL_SECS";
+/// How long a shared GPU embedding session may sit unused before it is
+/// released, in seconds. `0` keeps it for the life of the daemon.
+pub const GPU_IDLE_ENV: &str = "RMC_GPU_IDLE_SECS";
+
+/// Fifteen minutes. A session holds ≈ 1.4 GB of VRAM (`local-gpu-bge`,
+/// measured by the ledger) and the background sync runs whenever files
+/// change, so in an active day the session is busy every few minutes and
+/// stays; overnight, or for a daemon whose clients only read, the card gets
+/// it back. Rebuilding it reloads the compiled program from the MIGraphX
+/// kernel cache, seconds rather than the minute of a cold compile.
+const DEFAULT_GPU_IDLE_SECS: u64 = 900;
 
 /// A prefix policy rather than a list, because a list falls behind the code.
 ///
@@ -317,6 +329,13 @@ Memory watchdog (daemon only; 0 disables a threshold):
                              trim left, at most every 5 minutes
   RMC_MAX_PROJECTS=3         how many analysis contexts stay loaded; past the
                              cap the least recently used one is dropped
+
+GPU embedding (one shared session per embedding backend; runtime_status.gpu):
+  RMC_GPU_IDLE_SECS=900      release a session unused this long (0 never);
+                             a retired daemon releases its idle ones at once
+  RMC_VRAM_BUDGET_MB=<half of the card>
+                             refuse to build another session past this much
+                             VRAM held by the daemon (0 disables)
 
 Index durability (0 disables the guard):
   RMC_MIN_INDEX_FREE_MB=2048 refuse persistent index writes below this much
@@ -1463,6 +1482,14 @@ pub async fn run_daemon(
         GROWTH_TRIM_COOLDOWN,
         TRIM_GROWTH_ENV,
     );
+    let gpu_idle = Duration::from_secs(env_u64(GPU_IDLE_ENV, DEFAULT_GPU_IDLE_SECS));
+    tracing::info!(
+        "GPU embedding sessions: released after {:?} unused ({} to change; 0 keeps them), VRAM budget {:?} ({})",
+        gpu_idle,
+        GPU_IDLE_ENV,
+        gpu_vram_budget(),
+        "RMC_VRAM_BUDGET_MB",
+    );
     let mut last_gc = SystemTime::now();
     let mut last_unload: Option<SystemTime> = None;
     let mut last_trim: Option<SystemTime> = None;
@@ -1662,6 +1689,21 @@ pub async fn run_daemon(
                     last_unload = Some(SystemTime::now());
                 }
             }
+        }
+
+        // Shared GPU sessions nobody has run for `gpu_idle` go back to the card.
+        // A retired daemon lets go of every idle one at once: its successor is
+        // building its own on the same card, and the two together are what the
+        // budget's default half-card split is about.
+        let gpu_max_idle = if retiring { Some(Duration::ZERO) } else { (!gpu_idle.is_zero()).then_some(gpu_idle) };
+        if let Some(max_idle) = gpu_max_idle {
+            // Blocking pool: dropping a session frees device memory and reads
+            // the VRAM meters.
+            tokio::task::spawn_blocking(move || {
+                release_idle_gpu_sessions(max_idle)
+            })
+            .await
+            .expect("releasing idle GPU sessions does not panic");
         }
 
         // A rebuilt binary at the launch path: every client of this daemon is
