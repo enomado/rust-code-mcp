@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Measure generator creation separately
     let gen_start = Instant::now();
-    let generator = EmbeddingGenerator::new()
+    let generator = EmbeddingGenerator::new(rmc_engine::embeddings::EmbeddingOwner::Tool)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
         })?;

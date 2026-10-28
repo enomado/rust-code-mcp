@@ -282,7 +282,11 @@ pub(crate) async fn create_hybrid_search(
         collection = paths.collection_name,
         "Creating hybrid search with embedding profile"
     );
-    let embedding_generator = EmbeddingGenerator::with_backend(backend).map_err(|e| {
+    let embedding_generator = EmbeddingGenerator::with_backend(
+        backend,
+        rmc_engine::embeddings::EmbeddingOwner::Search,
+    )
+    .map_err(|e| {
         McpError::invalid_params(
             format!("Failed to initialize embedding generator: {}", e),
             None,

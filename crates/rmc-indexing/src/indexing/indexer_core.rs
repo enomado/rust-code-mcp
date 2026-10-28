@@ -34,7 +34,7 @@
 use rmc_engine::chunker::{Chunker, ChunkSplitConfig, CodeChunk};
 use rmc_config::config::IndexerCoreConfig;
 use rmc_engine::embeddings::{
-    Embedding, EmbeddingBackend, EmbeddingGenerator, EmbeddingTokenCounter,
+    Embedding, EmbeddingBackend, EmbeddingGenerator, EmbeddingOwner, EmbeddingTokenCounter,
 };
 use crate::indexing::embedding_batcher::EmbeddingBatcher;
 use crate::indexing::file_processor::FileProcessor;
@@ -138,7 +138,7 @@ impl IndexerCore {
         }
 
         let embedding_generator =
-            EmbeddingGenerator::with_backend(self.embedding_backend.clone())?;
+            EmbeddingGenerator::with_backend(self.embedding_backend.clone(), EmbeddingOwner::Index)?;
         let batcher = Arc::new(EmbeddingBatcher::new(
             embedding_generator,
             self.gpu_batch_size,

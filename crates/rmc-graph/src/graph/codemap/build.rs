@@ -248,7 +248,9 @@ pub async fn build_codemap(
             if opts.embedding_policy == EmbeddingPolicy::NoRerank || prompt.unwrap_or("").is_empty() {
                 None
             } else {
-                let generator = rmc_engine::embeddings::EmbeddingGenerator::new()
+                let generator = rmc_engine::embeddings::EmbeddingGenerator::new(
+                    rmc_engine::embeddings::EmbeddingOwner::CodemapRerank,
+                )
                     .map_err(|e| anyhow::anyhow!("EmbeddingGenerator init: {e}"))?;
                 // Query-side: the prompt is a retrieval query scored against
                 // cached document vectors — apply the instruction prefix.

@@ -35,6 +35,12 @@ mod kernel_cache;
 
 mod gpu_lock;
 
+mod vram_ledger;
+pub use vram_ledger::{
+    gpu_ledger_report, read_vram, EmbeddingOwner, GpuLedgerReport, LiveSessionReport,
+    OwnerReport, VramDelta, VramReading,
+};
+
 mod fastembed_onnx;
 
 /// Census of graph nodes per execution provider, taken from one profiled
@@ -179,12 +185,18 @@ enum EmbeddingGeneratorInner {
 impl EmbeddingGenerator {
     /// Construct with the default backend (Qwen3-Embedding-0.6B,
     /// max_len=1024, GPU).
-    pub fn new() -> Result<Self, EmbeddingError> {
-        Self::with_backend(EmbeddingBackend::default())
+    pub fn new(owner: EmbeddingOwner) -> Result<Self, EmbeddingError> {
+        Self::with_backend(EmbeddingBackend::default(), owner)
     }
 
     /// Construct with an explicit backend configuration.
-    pub fn with_backend(backend: EmbeddingBackend) -> Result<Self, EmbeddingError> {
+    ///
+    /// `owner` is who the session is for; a GPU session is entered in the
+    /// VRAM ledger under it (see `vram_ledger`).
+    pub fn with_backend(
+        backend: EmbeddingBackend,
+        owner: EmbeddingOwner,
+    ) -> Result<Self, EmbeddingError> {
         let inner = match backend.runtime {
             EmbeddingRuntime::LocalQwen3CandleCuda => {
                 #[cfg(feature = "embeddings-cuda")]
@@ -205,7 +217,7 @@ impl EmbeddingGenerator {
             | EmbeddingRuntime::LocalFastembedOnnxMigraphx
             | EmbeddingRuntime::LocalFastembedOnnxDirectml => {
                 EmbeddingGeneratorInner::FastembedOnnx(Arc::new(
-                    fastembed_onnx::FastembedOnnxEmbedder::new(&backend)?,
+                    fastembed_onnx::FastembedOnnxEmbedder::new(&backend, owner)?,
                 ))
             }
         };

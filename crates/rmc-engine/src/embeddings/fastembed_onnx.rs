@@ -9,18 +9,43 @@ use crate::embeddings::batching::FixedInputShape;
 use crate::embeddings::ep_census::ProviderCensus;
 use crate::embeddings::profile::FastembedOnnxModel;
 use crate::embeddings::{Embedding, EmbeddingError};
+use crate::embeddings::vram_ledger::{read_vram, EmbeddingOwner, VramTicket};
 use fastembed::{EmbeddingModel, FixedBatchShape, TextEmbedding, TextInitOptions};
 use std::sync::Mutex;
 
 pub(super) struct FastembedOnnxEmbedder {
-    inner: Mutex<TextEmbedding>,
+    inner: Mutex<Session>,
     backend: EmbeddingBackend,
     dim: usize,
 }
 
+/// The ORT session and, on a GPU runtime, its entry in the VRAM ledger.
+///
+/// Together under one mutex because the ledger's "first run" is a property of
+/// the session's runs, which that mutex already serialises.
+///
+/// 🚨 Field order is load-bearing: `model` drops before `ticket`, so the
+/// ticket's drop sees the memory the session gave back. The reading before
+/// it is taken in `Session::drop`, which runs before either field drops.
+struct Session {
+    model: TextEmbedding,
+    ticket: Option<VramTicket>,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.as_mut() {
+            ticket.release_starting();
+        }
+    }
+}
+
 impl FastembedOnnxEmbedder {
-    pub(super) fn new(backend: &EmbeddingBackend) -> Result<Self, EmbeddingError> {
-        Self::new_inner(backend, None)
+    pub(super) fn new(
+        backend: &EmbeddingBackend,
+        owner: EmbeddingOwner,
+    ) -> Result<Self, EmbeddingError> {
+        Self::new_inner(backend, owner, None)
     }
 
     /// The same initialization path, but with ORT profiling enabled.
@@ -36,13 +61,14 @@ impl FastembedOnnxEmbedder {
         backend: &EmbeddingBackend,
         prefix: &std::path::Path,
     ) -> Result<Self, EmbeddingError> {
-        Self::new_inner(backend, Some(prefix))
+        Self::new_inner(backend, EmbeddingOwner::ProviderCensus, Some(prefix))
     }
 
     /// Close the ORT profile and return the path of the written file.
     fn end_profiling(&self) -> Result<std::path::PathBuf, EmbeddingError> {
-        let mut model = self.inner.lock().unwrap();
-        model
+        let mut session = self.inner.lock().unwrap();
+        session
+            .model
             .end_profiling()
             .map(std::path::PathBuf::from)
             .map_err(|e| EmbeddingError::model_init(e.to_string()))
@@ -50,6 +76,7 @@ impl FastembedOnnxEmbedder {
 
     fn new_inner(
         backend: &EmbeddingBackend,
+        owner: EmbeddingOwner,
         profiling_prefix: Option<&std::path::Path>,
     ) -> Result<Self, EmbeddingError> {
         if !backend.is_fastembed_onnx() {
@@ -100,6 +127,8 @@ impl FastembedOnnxEmbedder {
         if let Some(prefix) = profiling_prefix {
             options = options.with_profiling(prefix.to_path_buf());
         }
+        // Read before the session exists, so its creation is charged to it.
+        let before_creation = on_gpu.then(read_vram);
         let mut inner = TextEmbedding::try_new(options)
             .map_err(|e| EmbeddingError::model_init(e.to_string()))?;
         if let (true, Some(shape)) = (on_gpu, shape) {
@@ -115,8 +144,14 @@ impl FastembedOnnxEmbedder {
             );
         }
 
+        let ticket = before_creation
+            .map(|before| VramTicket::open(owner, backend.profile.name(), before));
+
         Ok(Self {
-            inner: Mutex::new(inner),
+            inner: Mutex::new(Session {
+                model: inner,
+                ticket,
+            }),
             backend: backend.clone(),
             dim: backend.dim(),
         })
@@ -127,10 +162,22 @@ impl FastembedOnnxEmbedder {
     }
 
     pub(super) fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Embedding>, EmbeddingError> {
-        let mut model = self.inner.lock().unwrap();
-        model
+        let mut session = self.inner.lock().unwrap();
+        // The first run is where MIGraphX puts the program on the GPU; see
+        // `vram_ledger` for why it is charged separately from creation.
+        let before_first_run = session
+            .ticket
+            .as_ref()
+            .filter(|t| t.first_run_pending())
+            .map(|_| read_vram());
+        let result = session
+            .model
             .embed(texts, None)
-            .map_err(|e| EmbeddingError::embed_failed(e.to_string()))
+            .map_err(|e| EmbeddingError::embed_failed(e.to_string()));
+        if let (Some(before), Some(ticket)) = (before_first_run, session.ticket.as_mut()) {
+            ticket.first_run_finished(before);
+        }
+        result
     }
 
     pub(super) fn embed_queries(&self, texts: &[&str]) -> Result<Vec<Embedding>, EmbeddingError> {
@@ -594,6 +641,146 @@ mod tests {
             "{} nodes left on CPU (slack {CPU_TAIL_SLACK}) — the subgraph did not move to the GPU entirely: {census}",
             census.nodes_on(CPU_EP),
         );
+    }
+
+    /// One full GPU batch: 32 texts fill the fixed 32×512 shape of `local-gpu-bge`.
+    #[cfg(feature = "embeddings-migraphx")]
+    fn full_gpu_batch() -> Vec<String> {
+        (0..32)
+            .map(|i| format!("fn probe_{i}(x: u64) -> u64 {{ x.wrapping_mul({i}) }} ").repeat(40))
+            .collect()
+    }
+
+    #[cfg(feature = "embeddings-migraphx")]
+    fn owner_totals(owner: EmbeddingOwner) -> crate::embeddings::OwnerReport {
+        crate::embeddings::gpu_ledger_report()
+            .owners
+            .into_iter()
+            .find(|o| o.owner == owner)
+            .unwrap()
+    }
+
+    /// Oracle for the VRAM ledger: what it charges a session is what the card
+    /// lost, ±5 %.
+    ///
+    /// The ledger weighs sessions with the process meter (DRM fdinfo); the
+    /// reference is the card meter (sysfs), read by this test around the
+    /// whole create-and-first-run window, outside the ledger's code. The
+    /// window is held under the cross-process GPU lock, so no other daemon's
+    /// run lands inside it. Also checked: the first run is charged at all —
+    /// MIGraphX puts its program on the GPU there, not at creation, and a
+    /// ledger that weighed only creation would miss most of the session.
+    ///
+    /// `cargo test --release -p rmc-engine --features embeddings-migraphx vram_ledger_charge -- --ignored --nocapture`
+    #[cfg(feature = "embeddings-migraphx")]
+    #[test]
+    #[ignore = "needs an AMD GPU, ORT with MIGraphX and a downloaded model"]
+    fn vram_ledger_charge_matches_the_card() {
+        let _guard = model_guard();
+        let backend = EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
+        let texts = full_gpu_batch();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+        let _gpu = crate::embeddings::gpu_lock::GpuLock::acquire().unwrap();
+        let card_before = read_vram().card_used_bytes.expect("no amdgpu sysfs meter");
+        let embedder = FastembedOnnxEmbedder::new(&backend, EmbeddingOwner::Tool).unwrap();
+        embedder.embed_documents(&refs).unwrap();
+        let card_after = read_vram().card_used_bytes.unwrap();
+
+        let report = crate::embeddings::gpu_ledger_report();
+        let session = report
+            .live_sessions
+            .iter()
+            .filter(|s| s.owner == EmbeddingOwner::Tool)
+            .max_by_key(|s| s.id)
+            .unwrap();
+        eprintln!("session: {session:?}");
+        eprintln!("card delta: {}", card_after as i64 - card_before as i64);
+
+        let first_run = session.at_first_run.expect("first run not recorded");
+        assert!(
+            first_run.process_bytes.unwrap() > 0,
+            "first run charged nothing: {session:?}"
+        );
+        let charged = session.charge.process_bytes.unwrap() as f64;
+        let card = (card_after as i64 - card_before as i64) as f64;
+        assert!(card > 0.0, "the card did not move: {card}");
+        let error = (charged - card).abs() / card;
+        assert!(
+            error <= 0.05,
+            "ledger charged {charged} bytes, card moved {card} ({:.1} %)",
+            error * 100.0
+        );
+    }
+
+    /// Probe for `leak-repro`: does dropping a session give its VRAM back?
+    ///
+    /// N × (create a session, one full 32×512 batch, drop), printing both
+    /// meters and the ledger's charge/returned after every cycle. Answers the
+    /// question rather than asserting an answer: how much each cycle keeps,
+    /// and whether it is the drop that leaks.
+    ///
+    /// The card is shared with live daemons, so the loop stops before the
+    /// card is pushed into an allocation failure: below
+    /// `RMC_LEAK_PROBE_MIN_FREE_MB` free (default 3072) it reports and ends.
+    /// `RMC_LEAK_PROBE_CYCLES` (default 20).
+    ///
+    /// `cargo test --release -p rmc-engine --features embeddings-migraphx session_drop_leak_probe -- --ignored --nocapture`
+    #[cfg(feature = "embeddings-migraphx")]
+    #[test]
+    #[ignore = "needs an AMD GPU, ORT with MIGraphX and a downloaded model; a probe, not a gate"]
+    fn session_drop_leak_probe() {
+        fn env_u64(name: &str, default: u64) -> u64 {
+            match std::env::var(name) {
+                Ok(v) => v.parse().unwrap_or_else(|_| panic!("{name}={v} is not a number")),
+                Err(_) => default,
+            }
+        }
+        let cycles = env_u64("RMC_LEAK_PROBE_CYCLES", 20);
+        let min_free = env_u64("RMC_LEAK_PROBE_MIN_FREE_MB", 3072) << 20;
+        let total = crate::embeddings::gpu_ledger_report()
+            .card_total_bytes
+            .expect("no amdgpu sysfs meter");
+
+        let _guard = model_guard();
+        let backend = EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
+        let texts = full_gpu_batch();
+        let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mib = |b: u64| b >> 20;
+
+        let start = read_vram();
+        eprintln!(
+            "start: process {} MiB, card {} / {} MiB",
+            mib(start.process_bytes.unwrap()),
+            mib(start.card_used_bytes.unwrap()),
+            mib(total)
+        );
+        for cycle in 1..=cycles {
+            let free = total - read_vram().card_used_bytes.unwrap();
+            if free < min_free {
+                eprintln!("stop before cycle {cycle}: card free {} MiB < {} MiB", mib(free), mib(min_free));
+                break;
+            }
+            let embedder = FastembedOnnxEmbedder::new(&backend, EmbeddingOwner::Tool).unwrap();
+            {
+                let _gpu = crate::embeddings::gpu_lock::GpuLock::acquire().unwrap();
+                embedder.embed_documents(&refs).unwrap();
+            }
+            let loaded = read_vram();
+            drop(embedder);
+            let after = read_vram();
+            let totals = owner_totals(EmbeddingOwner::Tool);
+            eprintln!(
+                "cycle {cycle:2}: loaded process {} MiB → after drop {} MiB, card {} MiB; \
+                 total charged {} MiB, returned {} MiB, kept {} MiB",
+                mib(loaded.process_bytes.unwrap()),
+                mib(after.process_bytes.unwrap()),
+                mib(after.card_used_bytes.unwrap()),
+                totals.released_charge.process_bytes.unwrap() >> 20,
+                totals.released_returned.process_bytes.unwrap() >> 20,
+                totals.released_kept.process_bytes.unwrap() >> 20,
+            );
+        }
     }
 
     /// Positive control for the oracle above: on the CPU profile the census must

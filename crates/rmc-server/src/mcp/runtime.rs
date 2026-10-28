@@ -102,6 +102,9 @@ pub struct RuntimeStatus {
     pub semantic: SemanticServiceStatus,
     pub background_sync: BackgroundSyncStatus,
     pub process: ProcessStatus,
+    /// GPU embedding sessions by owner and the VRAM they were charged,
+    /// against this process's and the card's meters.
+    pub gpu: rmc_engine::embeddings::GpuLedgerReport,
 }
 
 #[derive(Clone)]
@@ -189,6 +192,7 @@ impl RuntimeState {
                 running: self.background_sync_running(),
             },
             process: current_process_status(),
+            gpu: rmc_engine::embeddings::gpu_ledger_report(),
         }
     }
 
