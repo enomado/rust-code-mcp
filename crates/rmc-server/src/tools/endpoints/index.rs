@@ -18,15 +18,15 @@ pub struct IndexCodebaseParams {
     #[schemars(description = "Force full reindex even if already indexed (default: false)")]
     pub force_reindex: Option<bool>,
     #[schemars(
-        description = "Repair the `stale_skips` reported by health_check: files the metadata cache calls indexed while the vector store holds no vectors for them. Such files are skipped by every ordinary run, so they never come back on their own. This forgets their cache entries and re-embeds exactly those, leaving the rest of the index untouched — minutes, not the hour-plus of force_reindex. Ignored when force_reindex is set. Default: false."
+        description = "Re-embed only health_check's `stale_skips` (cached as indexed, no vectors) — minutes instead of a full force_reindex. Ignored with force_reindex."
     )]
     pub repair_coverage: Option<bool>,
     #[schemars(
-        description = "Optional legacy local Qwen3/CUDA model variant. One of: \"qwen3-0.6b\" (1024-dim), \"qwen3-4b\" (2560-dim), \"qwen3-8b\" (4096-dim). Picking a variant different from an existing index returns a version-mismatch error pointing to clear_cache."
+        description = "Legacy: qwen3-0.6b | qwen3-4b | qwen3-8b. Prefer embedding_profile."
     )]
     pub model: Option<String>,
     #[schemars(
-        description = "Optional embedding profile. Preferred over `model` when both are set. Default when omitted: \"local-cpu-small\" (BGESmallENV15Q CPU). Use \"local-gpu-small\", \"local-qwen3-4b\", or \"local-qwen3-8b\" to explicitly opt into local CUDA; \"openrouter-qwen3-8b\" uses the remote API profile."
+        description = "Embedding profile; default local-cpu-small. Others: local-gpu-small, local-qwen3-4b, local-qwen3-8b, openrouter-qwen3-8b."
     )]
     pub embedding_profile: Option<String>,
 }

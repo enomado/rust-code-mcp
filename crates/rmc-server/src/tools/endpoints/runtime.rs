@@ -14,7 +14,7 @@ pub(crate) struct RuntimeStatusParams {}
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct ClearRuntimeParams {
     #[schemars(
-        description = "Cleanup scope for in-memory runtime caches and sync tracking. Defaults to all. Values: all, workspace, semantic_only, search_cache_only, sync_tracking_only. This does not stop the background sync task; process shutdown cancels tasks through ServerRuntime."
+        description = "all (default) | workspace | semantic_only | search_cache_only | sync_tracking_only."
     )]
     #[serde(default)]
     pub scope: Option<RuntimeClearScope>,
@@ -28,7 +28,7 @@ pub(crate) struct ClearRuntimeParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct AnalysisMemoryParams {
     #[schemars(
-        description = "Workspace root of an analysis this daemon has ALREADY loaded. The tool will not load one to answer: a database built for the question measures a cold start, not what the daemon is holding. Pass a path runtime_status lists under `semantic`."
+        description = "Workspace root of an analysis already loaded — a path runtime_status lists under `semantic`."
     )]
     pub directory: String,
     #[schemars(

@@ -429,10 +429,66 @@ pub(crate) async fn recursive_callers_count(
 
 pub(crate) async fn module_tree(params: ModuleTreeParams) -> Result<CallToolResult, McpError> {
     let snap = open_workspace_snapshot(&params.directory)?;
-    let tree: ModuleTreeNode = snap
+    let mut tree: ModuleTreeNode = snap
         .module_tree(&params.krate, params.depth)
         .map_err(internal_error("module_tree"))?;
-    json_result(&ModuleTreeResponse { tree })
+    let total_nodes = count_tree_nodes(&tree);
+    // An explicit `depth` is the caller's choice and is served whole. Without
+    // one, a large crate's full tree runs to hundreds of KB, so the default
+    // keeps the deepest levels that fit the node budget and says so.
+    let depth_applied = match params.depth {
+        Some(_) => None,
+        None if total_nodes <= MODULE_TREE_DEFAULT_NODE_BUDGET => None,
+        None => {
+            let mut depth = 0;
+            while count_tree_nodes_to(&tree, depth + 1) <= MODULE_TREE_DEFAULT_NODE_BUDGET {
+                depth += 1;
+            }
+            prune_tree_below(&mut tree, depth);
+            Some(depth)
+        }
+    };
+    let returned_nodes = count_tree_nodes(&tree);
+    json_result(&ModuleTreeResponse {
+        tree,
+        total_nodes,
+        returned_nodes,
+        truncated_at_depth: depth_applied,
+        note: depth_applied.map(|d| {
+            format!(
+                "tree cut at depth {d}: {returned_nodes} of {total_nodes} nodes; pass `depth` explicitly for more"
+            )
+        }),
+    })
+}
+
+/// Node budget for a `module_tree` call that passes no `depth`.
+const MODULE_TREE_DEFAULT_NODE_BUDGET: usize = 400;
+
+fn count_tree_nodes(node: &ModuleTreeNode) -> usize {
+    1 + node.children.iter().map(count_tree_nodes).sum::<usize>()
+}
+
+/// Nodes at depth `<= max_depth` below `node` (the node itself is depth 0).
+fn count_tree_nodes_to(node: &ModuleTreeNode, max_depth: usize) -> usize {
+    if max_depth == 0 {
+        return 1;
+    }
+    1 + node
+        .children
+        .iter()
+        .map(|child| count_tree_nodes_to(child, max_depth - 1))
+        .sum::<usize>()
+}
+
+fn prune_tree_below(node: &mut ModuleTreeNode, max_depth: usize) {
+    if max_depth == 0 {
+        node.children.clear();
+        return;
+    }
+    for child in &mut node.children {
+        prune_tree_below(child, max_depth - 1);
+    }
 }
 
 pub(crate) async fn workspace_stats(
@@ -598,4 +654,44 @@ pub(crate) struct CallGraphResponse {
 #[derive(Debug, Serialize)]
 pub(crate) struct ModuleTreeResponse {
     pub(crate) tree: ModuleTreeNode,
+    pub(crate) total_nodes: usize,
+    pub(crate) returned_nodes: usize,
+    /// Set when the default node budget cut the tree; nodes at this depth
+    /// come back with their children dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) truncated_at_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) note: Option<String>,
+}
+
+#[cfg(test)]
+mod module_tree_budget_tests {
+    use super::*;
+
+    fn node(name: &str, children: Vec<ModuleTreeNode>) -> ModuleTreeNode {
+        ModuleTreeNode {
+            qualified_name: name.to_string(),
+            display_name: name.to_string(),
+            kind: "Module".to_string(),
+            item_kind: None,
+            visibility: None,
+            children,
+        }
+    }
+
+    #[test]
+    fn counts_and_prunes_by_depth() {
+        // root -> a -> (a1, a2), b
+        let mut tree = node(
+            "root",
+            vec![node("a", vec![node("a1", vec![]), node("a2", vec![])]), node("b", vec![])],
+        );
+        assert_eq!(count_tree_nodes(&tree), 5);
+        assert_eq!(count_tree_nodes_to(&tree, 0), 1);
+        assert_eq!(count_tree_nodes_to(&tree, 1), 3);
+        assert_eq!(count_tree_nodes_to(&tree, 2), 5);
+        prune_tree_below(&mut tree, 1);
+        assert_eq!(count_tree_nodes(&tree), 3);
+        assert!(tree.children.iter().all(|c| c.children.is_empty()));
+    }
 }

@@ -25,7 +25,7 @@ pub(crate) struct HealthCheckParams {
     )]
     pub directory: Option<String>,
     #[schemars(
-        description = "Optional embedding profile (built-in name or one from embedding_profiles.toml). The BM25 index, vector store, and collection name are all keyed by the embedder identity, so this must match the profile the directory was indexed with. Default: local-cpu-small."
+        description = "Profile the directory was indexed with; default local-cpu-small."
     )]
     #[serde(default)]
     pub embedding_profile: Option<String>,

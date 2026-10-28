@@ -27,7 +27,7 @@ pub(crate) struct ClearCacheParams {
     /// the hypergraph forces the next `build_hypergraph` call to do a
     /// full re-index.
     #[schemars(
-        description = "When true, also wipe the persisted hypergraph snapshot directory at <data_dir>/graphs/<workspace_hash>/. Defaults to false. Forces the next build_hypergraph call to do a full re-index."
+        description = "Also wipe the persisted graph snapshot; next build_hypergraph is full."
     )]
     #[serde(default)]
     pub include_hypergraph: Option<bool>,
