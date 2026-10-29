@@ -14,6 +14,7 @@ use lancedb::DistanceType;
 use lancedb::connect;
 use lancedb::index::Index;
 use lancedb::index::scalar::BTreeIndexBuilder;
+use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::optimize::Duration as ChronoDuration;
 use lancedb::table::{CompactionOptions, OptimizeAction, OptimizeOptions};
@@ -66,6 +67,78 @@ const COMPACT_MIN_SMALL_FRAGMENTS: usize = 8;
 /// tables that have one lose it (see `maintain`).
 const SCALAR_INDEX_COLUMNS: [&str; 2] = ["id", "file_path"];
 const DROPPED_INDEX_COLUMNS: [&str; 1] = ["symbol_kind"];
+
+/// The vector column and the name of its ANN index.
+const VECTOR_COLUMN: &str = "vector";
+const VECTOR_INDEX_NAME: &str = "vector_idx";
+
+/// Rows from which `maintain` builds the ANN index (IVF_PQ, cosine).
+///
+/// Below it the exact scan is cheap and an index would be trained on too
+/// few vectors to partition well. The scan costs about 2.2 CPU-s per query
+/// at 0.93M rows of 384 floats (measured 2026-10-29), so ~0.24 at the
+/// default; the index brings 0.93M rows to ~0.02. `0` turns the index off
+/// (and keeps an existing one as it is).
+const ANN_MIN_ROWS_ENV: &str = "RMC_VECTOR_ANN_MIN_ROWS";
+const DEFAULT_ANN_MIN_ROWS: usize = 100_000;
+
+// How the three ANN numbers below were chosen — measured 2026-10-29 on a copy
+// of a 1.06M-row bge-small store (384 dims), 40 phrase and identifier queries
+// of the kind agents send, recall against the exact scan of the same query
+// vector (`probe_ann_recall_on_real_queries`). The exact scan: 2.3–2.65 CPU-s
+// and 0.6–2 s per query.
+//
+// - PQ sub-vectors: lance's default (dim/16 = 24) tops out at recall@10 0.90
+//   even re-ranking 1000 candidates; dim/8 = 48 reaches 0.995. dim/4 = 96 was
+//   no better (0.975) and builds twice as slow. Build at 48: 75–160 s,
+//   ~320 CPU-s, once per store.
+// - nprobes: 20 leaves queries whose neighbours sit in unprobed partitions
+//   (worst query 0/10 found); 40 lifts the worst to 8–9/10.
+// - re-ranked candidates: at limit 100 (hybrid search's candidate count),
+//   1000 → recall 0.956, 2000 → 0.970–0.976, 5000 → 0.972–0.978 at 1.5x the
+//   CPU. 2000 it is. With all three defaults: recall@10 0.998 (worst query
+//   9/10), recall@100 0.976, 0.054 CPU-s and ~0.1 s per query — about 45x
+//   below the scan. IVF training is randomised: recall moved by ~0.01 and
+//   the worst query by tens of ranks between builds of the same table.
+
+/// PQ sub-vectors of the ANN index: an eighth of the dimension (see above).
+/// lance needs them to divide the dimension; for a dimension that is not a
+/// multiple of 8 lance's own default is used.
+fn ann_sub_vectors(dim: usize) -> Option<u32> {
+    (dim % 8 == 0).then_some((dim / 8) as u32)
+}
+
+/// IVF partitions a query searches. More is closer to the exact result and
+/// slower; see the measurement above for the default.
+const ANN_NPROBES_ENV: &str = "RMC_VECTOR_ANN_NPROBES";
+const DEFAULT_ANN_NPROBES: usize = 40;
+
+/// How many candidates are re-ranked by their full vectors, whatever the
+/// limit: the refine factor is this divided by the limit. Without re-ranking
+/// the order is by PQ-compressed distances, and on this model's embeddings
+/// (neighbours within ~0.05 cosine of each other) that put recall at 0.25
+/// whatever the nprobes. A budget rather than a factor because the factor
+/// multiplies the limit: one factor is either too few candidates at limit 10
+/// or too many at limit 100. See the measurement above for the default.
+const ANN_RERANK_ENV: &str = "RMC_VECTOR_ANN_RERANK";
+const DEFAULT_ANN_RERANK: usize = 2000;
+
+/// The refine factor that re-ranks at least `budget` candidates for `limit`
+/// results (and never fewer than the results themselves).
+fn refine_factor(budget: usize, limit: usize) -> u32 {
+    budget.div_ceil(limit.max(1)).max(1) as u32
+}
+
+/// A numeric knob from the environment: unset is the default, set to
+/// something unparsable is an error rather than a silent default.
+fn knob<T: std::str::FromStr>(name: &str, default: T) -> Result<T, VectorStoreError> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(value) => value.trim().parse().map_err(|_| {
+            VectorStoreError::backend(format!("{name}={value:?} is not a valid number"))
+        }),
+    }
+}
 
 fn compaction_options() -> CompactionOptions {
     CompactionOptions {
@@ -466,9 +539,8 @@ fn decode_chunk_rows(batch: &RecordBatch) -> Result<Vec<(ChunkId, CodeChunk)>, V
     let mut rows = Vec::with_capacity(batch.num_rows());
     for i in 0..batch.num_rows() {
         let id_str = id_array.value(i);
-        let chunk_id = ChunkId::from_string(id_str).map_err(|e| {
-            VectorStoreError::serialization(format!("Invalid chunk ID: {:?}", e))
-        })?;
+        let chunk_id = ChunkId::from_string(id_str)
+            .map_err(|e| VectorStoreError::serialization(format!("Invalid chunk ID: {:?}", e)))?;
         let chunk: CodeChunk = serde_json::from_str(chunk_json_array.value(i)).map_err(|e| {
             VectorStoreError::serialization(format!("Failed to deserialize chunk: {}", e))
         })?;
@@ -481,6 +553,56 @@ fn decode_chunk_rows(batch: &RecordBatch) -> Result<Vec<(ChunkId, CodeChunk)>, V
         rows.push((chunk_id, chunk));
     }
     Ok(rows)
+}
+
+/// Build the ANN index if the table has none and holds at least `min_rows`
+/// rows (`0`: never). Returns whether it built one.
+///
+/// Built by maintenance and not at table creation: IVF trains its
+/// partitions on the vectors present, and an empty table has none. Once
+/// built, the `OptimizeAction::Index` pass of `maintain` extends it with the
+/// rows written since; the partitions themselves stay as trained.
+async fn ensure_ann_index(
+    table: &lancedb::Table,
+    dim: usize,
+    min_rows: usize,
+) -> Result<bool, VectorStoreError> {
+    if min_rows == 0 {
+        return Ok(false);
+    }
+    let has_ann = table
+        .list_indices()
+        .await
+        .map_err(|e| VectorStoreError::backend(format!("Failed to list indices: {}", e)))?
+        .iter()
+        .any(|config| config.columns.iter().any(|column| column == VECTOR_COLUMN));
+    if has_ann {
+        return Ok(false);
+    }
+    let rows = table
+        .count_rows(None)
+        .await
+        .map_err(|e| VectorStoreError::query(format!("Failed to count rows: {}", e)))?;
+    if rows < min_rows {
+        return Ok(false);
+    }
+    let started = std::time::Instant::now();
+    let mut builder = IvfPqIndexBuilder::default().distance_type(DistanceType::Cosine);
+    if let Some(sub_vectors) = ann_sub_vectors(dim) {
+        builder = builder.num_sub_vectors(sub_vectors);
+    }
+    table
+        .create_index(&[VECTOR_COLUMN], Index::IvfPq(builder))
+        .name(VECTOR_INDEX_NAME.to_string())
+        .execute()
+        .await
+        .map_err(|e| VectorStoreError::backend(format!("Failed to build the ANN index: {}", e)))?;
+    tracing::info!(
+        "Built the ANN index (IVF_PQ, cosine) over {} rows in {:.1}s",
+        rows,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(true)
 }
 
 #[async_trait]
@@ -517,10 +639,19 @@ impl VectorStoreBackend for LanceDbBackend {
     ) -> Result<Vec<VectorSearchResult>, VectorStoreError> {
         let table = self.get_table().await?;
 
+        // Both knobs act only when the ANN index exists; without it the
+        // search is the exact scan. Rows written since the index was last
+        // extended are scanned exactly next to the indexed ones, so a fresh
+        // file is found before any maintenance.
         let results = table
             .vector_search(query_vector)
             .map_err(|e| VectorStoreError::query(format!("Failed to create search: {}", e)))?
             .distance_type(DistanceType::Cosine)
+            .nprobes(knob(ANN_NPROBES_ENV, DEFAULT_ANN_NPROBES)?)
+            .refine_factor(refine_factor(
+                knob(ANN_RERANK_ENV, DEFAULT_ANN_RERANK)?,
+                limit,
+            ))
             .limit(limit)
             .execute()
             .await
@@ -600,7 +731,10 @@ impl VectorStoreBackend for LanceDbBackend {
         // Ids are UUIDs: nothing in them needs quoting. The `id` column has a
         // BTree index (see `ensure_table_exists`), so this is a point lookup
         // per id, not a scan.
-        let ids: Vec<String> = chunk_ids.iter().map(|id| format!("'{}'", id.to_string())).collect();
+        let ids: Vec<String> = chunk_ids
+            .iter()
+            .map(|id| format!("'{}'", id.to_string()))
+            .collect();
         let stream = table
             .query()
             .only_if(format!("id IN ({})", ids.join(", ")))
@@ -712,7 +846,11 @@ impl VectorStoreBackend for LanceDbBackend {
             .map_err(|e| backend("table version", e))?;
         let stats = table.stats().await.map_err(|e| backend("table stats", e))?;
         let mut indices = Vec::new();
-        for config in table.list_indices().await.map_err(|e| backend("indices", e))? {
+        for config in table
+            .list_indices()
+            .await
+            .map_err(|e| backend("indices", e))?
+        {
             // `None`: the index was dropped since the listing — `maintain`
             // of another daemon on the same table can do that. Gone is gone.
             let Some(coverage) = table
@@ -821,7 +959,10 @@ impl VectorStoreBackend for LanceDbBackend {
                 .any(|column| DROPPED_INDEX_COLUMNS.contains(&column.as_str()))
             {
                 table.drop_index(&config.name).await.map_err(|e| {
-                    VectorStoreError::backend(format!("Failed to drop index {}: {}", config.name, e))
+                    VectorStoreError::backend(format!(
+                        "Failed to drop index {}: {}",
+                        config.name, e
+                    ))
                 })?;
                 tracing::info!("Dropped unused vector-store index {}", config.name);
             }
@@ -875,6 +1016,13 @@ impl VectorStoreBackend for LanceDbBackend {
             .map_err(|e| {
                 VectorStoreError::backend(format!("Failed to update vector-store indices: {}", e))
             })?;
+
+        ensure_ann_index(
+            &table,
+            self.vector_dim,
+            knob(ANN_MIN_ROWS_ENV, DEFAULT_ANN_MIN_ROWS)?,
+        )
+        .await?;
 
         // `older_than` is the load-bearing argument, and it must be passed:
         // lance defaults it to SEVEN DAYS, and on a store written every few
@@ -1119,7 +1267,11 @@ mod tests {
             .iter()
             .map(|file| {
                 let id = ChunkId::new();
-                (id, vec![0.1, 0.2, 0.3, 0.4], create_test_chunk(id, "fn f() {}", file))
+                (
+                    id,
+                    vec![0.1, 0.2, 0.3, 0.4],
+                    create_test_chunk(id, "fn f() {}", file),
+                )
             })
             .collect();
         backend.insert_chunks(rows).await.unwrap();
@@ -1135,6 +1287,110 @@ mod tests {
             backend.indexed_file_paths().await.unwrap(),
             HashSet::from(["kept.rs".to_string()])
         );
+    }
+
+    #[test]
+    fn the_rerank_budget_becomes_a_refine_factor_per_limit() {
+        assert_eq!(refine_factor(2000, 10), 200);
+        assert_eq!(refine_factor(2000, 100), 20);
+        assert_eq!(
+            refine_factor(2000, 30),
+            67,
+            "rounded up: at least the budget"
+        );
+        assert_eq!(refine_factor(2000, 5000), 1, "never fewer than the results");
+        assert_eq!(refine_factor(2000, 0), 2000);
+        assert_eq!(ann_sub_vectors(384), Some(48));
+        assert_eq!(ann_sub_vectors(1024), Some(128));
+        assert_eq!(ann_sub_vectors(4), None);
+    }
+
+    /// Deterministic, spread-out unit vectors: row `i` of a `dim`-wide
+    /// table, every `i` its own (a splitmix64 hash per coordinate).
+    fn spread_vector(i: usize, dim: usize) -> Vec<f32> {
+        let raw: Vec<f32> = (0..dim)
+            .map(|d| {
+                let mut z = ((i * dim + d) as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                (z >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect();
+        let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+        raw.into_iter().map(|x| x / norm).collect()
+    }
+
+    /// The ANN index is built only past the row threshold, once; a search
+    /// through it still finds rows written after it was built (the
+    /// unindexed tail is scanned exactly) — a file synced a minute ago is
+    /// not invisible until the next maintenance — and the next maintenance
+    /// extends the index over them.
+    #[tokio::test]
+    async fn the_ann_index_is_built_past_the_threshold_and_misses_no_fresh_row() {
+        const DIM: usize = 32;
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LanceDbBackend::new(temp_dir.path().to_path_buf(), DIM, "test-embedder:v1")
+            .await
+            .unwrap();
+        let rows = (0..2000)
+            .map(|i| {
+                let id = ChunkId::new();
+                (
+                    id,
+                    spread_vector(i, DIM),
+                    create_test_chunk(id, "fn f() {}", "old.rs"),
+                )
+            })
+            .collect();
+        backend.insert_chunks(rows).await.unwrap();
+        let table = backend.get_table().await.unwrap();
+
+        assert!(
+            !ensure_ann_index(&table, DIM, 2001).await.unwrap(),
+            "below the threshold"
+        );
+        assert!(
+            !ensure_ann_index(&table, DIM, 0).await.unwrap(),
+            "0 turns it off"
+        );
+        assert!(ensure_ann_index(&table, DIM, 2000).await.unwrap());
+        assert!(
+            !ensure_ann_index(&table, DIM, 2000).await.unwrap(),
+            "built once"
+        );
+        let ann = |layout: &VectorStoreLayout| {
+            layout
+                .indices
+                .iter()
+                .find(|index| index.name == VECTOR_INDEX_NAME)
+                .cloned()
+                .expect("the ANN index exists")
+        };
+        assert_eq!(ann(&backend.layout().await.unwrap()).indexed_rows, 2000);
+
+        let fresh_id = ChunkId::new();
+        let fresh_vector = spread_vector(5000, DIM);
+        backend
+            .insert_chunks(vec![(
+                fresh_id,
+                fresh_vector.clone(),
+                create_test_chunk(fresh_id, "fn fresh() {}", "fresh.rs"),
+            )])
+            .await
+            .unwrap();
+        assert_eq!(ann(&backend.layout().await.unwrap()).unindexed_rows, 1);
+        let hits = backend.search(fresh_vector.clone(), 5).await.unwrap();
+        assert_eq!(hits.first().map(|hit| hit.chunk_id), Some(fresh_id));
+
+        backend
+            .maintain(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        let after = ann(&backend.layout().await.unwrap());
+        assert_eq!((after.indexed_rows, after.unindexed_rows), (2001, 0));
+        let hits = backend.search(fresh_vector, 5).await.unwrap();
+        assert_eq!(hits.first().map(|hit| hit.chunk_id), Some(fresh_id));
     }
 
     /// The oracle for the index pass in `maintain`: indices created on the
@@ -1172,7 +1428,10 @@ mod tests {
             "{before:#?}"
         );
 
-        backend.maintain(std::time::Duration::from_secs(3600)).await.unwrap();
+        backend
+            .maintain(std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
 
         let after = backend.layout().await.unwrap();
         assert_eq!(after.rows, 60);
@@ -1186,7 +1445,11 @@ mod tests {
         expected.sort();
         assert_eq!(columns, expected, "{after:#?}");
         for index in &after.indices {
-            assert_eq!((index.indexed_rows, index.unindexed_rows), (60, 0), "{index:#?}");
+            assert_eq!(
+                (index.indexed_rows, index.unindexed_rows),
+                (60, 0),
+                "{index:#?}"
+            );
         }
     }
 
@@ -1310,6 +1573,189 @@ mod tests {
                 / 1024
         };
         (field("VmRSS:"), field("VmHWM:"))
+    }
+
+    /// Queries for the recall probe: searches of the kind agents run on the
+    /// store under test, phrases and identifiers. One per line in the file
+    /// named by `RMC_LANCE_PROBE_QUERIES`; blank lines and `#` comments are
+    /// skipped. They belong to the store's project, so they live with it and
+    /// not in this repository.
+    fn probe_queries() -> Vec<String> {
+        let path = std::env::var("RMC_LANCE_PROBE_QUERIES").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let queries: Vec<String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_string)
+            .collect();
+        assert!(!queries.is_empty(), "{path} holds no queries");
+        queries
+    }
+
+    /// Cumulative user+system CPU seconds of this process.
+    fn cpu_secs() -> f64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        // Fields after the parenthesised command: utime is the 12th, stime the 13th.
+        let after = &stat[stat.rfind(')').unwrap() + 2..];
+        let fields: Vec<&str> = after.split(' ').collect();
+        let ticks: f64 = fields[11].parse::<f64>().unwrap() + fields[12].parse::<f64>().unwrap();
+        ticks / 100.0
+    }
+
+    /// Recall probe, not a test: is the ANN index close enough to the exact
+    /// scan on queries people actually run? Point `RMC_LANCE_PROBE_DIR` at a
+    /// COPY of a live vector store (it builds the index there) and
+    /// `RMC_LANCE_PROBE_EMBEDDER` at the `embedder_version` in its
+    /// `metadata.json`; dim 384 (bge-small).
+    ///
+    /// The queries are embedded with the CPU bge-small profile (quantised
+    /// twin of the GPU one: a slightly different vector, the same kind of
+    /// query). Recall compares ANN and exact search for the SAME vector, so
+    /// that difference does not enter it. Prints recall@10, latency and
+    /// CPU per query for each nprobes / refine_factor point.
+    #[tokio::test]
+    #[ignore]
+    async fn probe_ann_recall_on_real_queries() {
+        use crate::embeddings::{EmbeddingBackend, EmbeddingGenerator, EmbeddingOwner};
+        use lancedb::query::Select;
+
+        let dir = std::env::var("RMC_LANCE_PROBE_DIR").unwrap();
+        let embedder = std::env::var("RMC_LANCE_PROBE_EMBEDDER").unwrap();
+        let backend = LanceDbBackend::open_existing(PathBuf::from(dir), 384, &embedder)
+            .await
+            .unwrap();
+        let table = backend.get_table().await.unwrap();
+        let generator = EmbeddingGenerator::with_backend(
+            EmbeddingBackend::from_profile_name("local-cpu-small").unwrap(),
+            EmbeddingOwner::Tool,
+        )
+        .unwrap();
+        let vectors = generator.embed_queries(probe_queries()).await.unwrap();
+        eprintln!(
+            "{} rows, {} queries",
+            backend.count().await.unwrap(),
+            vectors.len()
+        );
+        // `RMC_LANCE_PROBE_LIMIT`: results per query, 10 unless set. Hybrid
+        // search asks the vector side for 100 candidates, and refine_factor
+        // multiplies the limit, so the choice is measured at 100 too.
+        let limit: usize = std::env::var("RMC_LANCE_PROBE_LIMIT")
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(10);
+
+        // (nprobes, refine_factor); `None` = the exact scan.
+        let run = |point: Option<(usize, u32)>| {
+            let table = table.clone();
+            let vectors = vectors.clone();
+            async move {
+                // Per query: the ids found and their distances, nearest first.
+                let mut results: Vec<(HashSet<String>, Vec<f32>)> = Vec::new();
+                let mut latencies = Vec::new();
+                let cpu0 = cpu_secs();
+                for vector in vectors {
+                    let mut query = table
+                        .vector_search(vector)
+                        .unwrap()
+                        .distance_type(DistanceType::Cosine)
+                        .select(Select::columns(&["id"]))
+                        .limit(limit);
+                    query = match point {
+                        None => query.bypass_vector_index(),
+                        Some((nprobes, refine)) => query.nprobes(nprobes).refine_factor(refine),
+                    };
+                    let started = std::time::Instant::now();
+                    let batches: Vec<RecordBatch> =
+                        query.execute().await.unwrap().try_collect().await.unwrap();
+                    latencies.push(started.elapsed().as_secs_f64() * 1e3);
+                    let mut ids = HashSet::new();
+                    let mut distances = Vec::new();
+                    for batch in &batches {
+                        let column = batch.column_by_name("id").unwrap();
+                        let array = column.as_any().downcast_ref::<StringArray>().unwrap();
+                        ids.extend((0..array.len()).map(|i| array.value(i).to_string()));
+                        let column = batch.column_by_name("_distance").unwrap();
+                        let array = column.as_any().downcast_ref::<Float32Array>().unwrap();
+                        distances.extend(array.values().iter().copied());
+                    }
+                    distances.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    results.push((ids, distances));
+                }
+                let cpu = (cpu_secs() - cpu0) / results.len() as f64;
+                latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                (results, latencies[latencies.len() / 2], cpu)
+            }
+        };
+
+        let (exact, p50, cpu) = run(None).await;
+        eprintln!("exact scan: p50 {p50:.0} ms, {cpu:.3} CPU-s/query");
+
+        // `RMC_LANCE_PROBE_SUB_VECTORS`: PQ sub-vectors of the index built
+        // here (unset — what `maintain` builds); an existing index is
+        // replaced.
+        let sub_vectors: Option<u32> = std::env::var("RMC_LANCE_PROBE_SUB_VECTORS")
+            .ok()
+            .map(|v| v.parse().unwrap())
+            .or(ann_sub_vectors(384));
+        let cpu0 = cpu_secs();
+        let started = std::time::Instant::now();
+        let mut builder = IvfPqIndexBuilder::default().distance_type(DistanceType::Cosine);
+        if let Some(n) = sub_vectors {
+            builder = builder.num_sub_vectors(n);
+        }
+        table
+            .create_index(&[VECTOR_COLUMN], Index::IvfPq(builder))
+            .name(VECTOR_INDEX_NAME.to_string())
+            .replace(true)
+            .execute()
+            .await
+            .unwrap();
+        eprintln!(
+            "IVF_PQ sub_vectors={sub_vectors:?} built in {:.1}s, {:.0} CPU-s",
+            started.elapsed().as_secs_f64(),
+            cpu_secs() - cpu0
+        );
+
+        // The defaults `search` runs with first, then neighbours of them.
+        let defaults = (
+            DEFAULT_ANN_NPROBES,
+            refine_factor(DEFAULT_ANN_RERANK, limit),
+        );
+        for point in [
+            defaults,
+            (20, defaults.1),
+            (60, defaults.1),
+            (40, 10),
+            (40, 50),
+        ] {
+            let (got, p50, cpu) = run(Some(point)).await;
+            // By id, and by distance: a found row counts when it is no
+            // farther than the exact 10th. The second does not punish a tie
+            // — two rows with the same vector (duplicate chunks) are equally
+            // right answers, but only one of their ids is in the exact set.
+            let by_id: Vec<usize> = exact
+                .iter()
+                .zip(&got)
+                .map(|((truth, _), (found, _))| truth.intersection(found).count())
+                .collect();
+            let by_distance: Vec<usize> = exact
+                .iter()
+                .zip(&got)
+                .map(|((_, truth), (_, found))| {
+                    let tenth = truth.last().copied().unwrap_or(f32::MAX);
+                    found.iter().filter(|d| **d <= tenth + 1e-6).count()
+                })
+                .collect();
+            let mean = |v: &[usize]| v.iter().sum::<usize>() as f64 / (limit * v.len()) as f64;
+            eprintln!(
+                "nprobes {:>2} refine {:>3}: recall@{limit} by id {:.3}, by distance {:.3} (worst {}/{limit}), p50 {p50:.1} ms, {cpu:.4} CPU-s/query",
+                point.0,
+                point.1,
+                mean(&by_id),
+                mean(&by_distance),
+                by_distance.iter().min().unwrap(),
+            );
+        }
     }
 
     /// Memory probe, not a test: what ONE background-sync cycle's
