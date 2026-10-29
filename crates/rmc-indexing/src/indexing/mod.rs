@@ -9,6 +9,7 @@ pub(crate) mod file_processor;
 mod identity;
 mod incremental;
 pub mod incremental_service;
+pub mod index_stats;
 mod indexer_core;
 mod merkle;
 pub mod project_paths;
