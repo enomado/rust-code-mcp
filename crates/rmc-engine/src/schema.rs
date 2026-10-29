@@ -95,17 +95,30 @@ impl Default for FileSchema {
 ///   vector store, which holds it anyway.
 pub const BM25_SCHEMA_VERSION: u32 = 2;
 
-/// Directory of the BM25 index of [`BM25_SCHEMA_VERSION`] inside a project's
-/// index directory (`<data>/index/<dir_hash>`).
+/// Directory of the BM25 index of [`BM25_SCHEMA_VERSION`] over the vector
+/// collection `collection_name`, inside the project's index directory
+/// (`<data>/index/<dir_hash>`).
 ///
-/// Inside, not next to it: disk tooling treats `index/<dir_hash>` as the
-/// project's whole keyword index and deletes it as one, and a sibling with a
-/// suffix would be an unknown name to it. tantivy never touches a
-/// subdirectory of its own directory — its garbage collection removes only
-/// the files it lists in `.managed.json` — so a version-1 index living in the
-/// parent directory and this one do not interfere.
-pub fn bm25_index_dir(project_index_dir: &std::path::Path) -> std::path::PathBuf {
-    project_index_dir.join(format!("bm25-v{BM25_SCHEMA_VERSION}"))
+/// One per collection, because the index holds that collection's chunk ids
+/// and nothing else: the chunk of a hit is read from the collection. A
+/// project has a collection per embedding profile and chunking identity, and
+/// a BM25 index shared between two of them answers with ids the other does
+/// not have — so it was, with one directory per project, between the CPU and
+/// the GPU profile and between a daemon and its successor with a new
+/// chunking identity, both writing into it.
+///
+/// Inside the project's directory, not next to it: disk tooling treats
+/// `index/<dir_hash>` as the project's whole keyword index and deletes it as
+/// one, and a sibling with a suffix would be an unknown name to it. tantivy
+/// never touches a subdirectory of its own directory — its garbage
+/// collection removes only the files it lists in `.managed.json` — so a
+/// version-1 index living in the parent directory and these do not
+/// interfere.
+pub fn bm25_index_dir(
+    project_index_dir: &std::path::Path,
+    collection_name: &str,
+) -> std::path::PathBuf {
+    project_index_dir.join(format!("bm25-v{BM25_SCHEMA_VERSION}-{collection_name}"))
 }
 
 /// Schema for chunk-level BM25 search — an inverted index of chunk ids.
@@ -276,11 +289,15 @@ mod tests {
     }
 
     #[test]
-    fn bm25_index_dir_is_versioned_inside_the_project_index_dir() {
+    fn bm25_index_dir_is_versioned_per_collection_inside_the_project_index_dir() {
         let project = std::path::Path::new("/data/index/abc");
         assert_eq!(
-            bm25_index_dir(project),
-            project.join(format!("bm25-v{BM25_SCHEMA_VERSION}"))
+            bm25_index_dir(project, "code_chunks_abc_def"),
+            project.join(format!("bm25-v{BM25_SCHEMA_VERSION}-code_chunks_abc_def"))
+        );
+        assert_ne!(
+            bm25_index_dir(project, "code_chunks_abc_def"),
+            bm25_index_dir(project, "code_chunks_abc_123")
         );
     }
 

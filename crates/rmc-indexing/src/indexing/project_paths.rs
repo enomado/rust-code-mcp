@@ -61,7 +61,10 @@ impl IndexingProjectPaths {
         Self {
             cache_path: data_root.join("cache").join(&dir_hash),
             metadata_cache_salt: metadata_cache_salt(backend, &chunking_identity),
-            tantivy_path: bm25_index_dir(&data_root.join("index").join(&dir_hash)),
+            tantivy_path: bm25_index_dir(
+                &data_root.join("index").join(&dir_hash),
+                &collection_name,
+            ),
             vector_path: data_root.join("cache").join("vectors").join(&collection_name),
             collection_name,
             snapshot_path,
@@ -103,7 +106,10 @@ impl IndexingProjectPaths {
         Self {
             cache_path: data_root.join("cache").join(&dir_hash),
             metadata_cache_salt: metadata_cache_salt(backend, &chunking_identity),
-            tantivy_path: bm25_index_dir(&data_root.join("index").join(&dir_hash)),
+            tantivy_path: bm25_index_dir(
+                &data_root.join("index").join(&dir_hash),
+                &collection_name,
+            ),
             vector_path: vectors_root.join(&collection_name),
             collection_name,
             snapshot_path,
@@ -327,7 +333,10 @@ mod tests {
         );
         assert_eq!(
             paths.tantivy_path,
-            bm25_index_dir(&data_root.path().join("index").join(&paths.dir_hash))
+            bm25_index_dir(
+                &data_root.path().join("index").join(&paths.dir_hash),
+                &paths.collection_name
+            )
         );
         assert_eq!(
             paths.vector_path,
@@ -344,6 +353,12 @@ mod tests {
         assert_ne!(paths.indexing_identity, alternate.indexing_identity);
         assert_ne!(paths.collection_name, alternate.collection_name);
         assert_ne!(paths.snapshot_path, alternate.snapshot_path);
+        // The BM25 index holds its collection's chunk ids: never shared.
+        assert_ne!(paths.tantivy_path, alternate.tantivy_path);
+        let gpu = EmbeddingBackend::from_profile_name("local-gpu-bge").unwrap();
+        let other_profile =
+            IndexingProjectPaths::from_directory(data_root.path(), project_dir, &gpu);
+        assert_ne!(paths.tantivy_path, other_profile.tantivy_path);
     }
 
     #[test]
@@ -371,7 +386,10 @@ mod tests {
         );
         assert_eq!(
             paths.tantivy_path,
-            bm25_index_dir(&data_root.path().join("index").join(&paths.dir_hash))
+            bm25_index_dir(
+                &data_root.path().join("index").join(&paths.dir_hash),
+                &collection_name
+            )
         );
     }
 
