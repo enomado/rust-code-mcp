@@ -12,7 +12,11 @@ default-members = ["crates/rust-code-mcp"]
 
 [workspace.dependencies]
 # MCP and async runtime
-rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", branch = "main", features = [
+# Pinned to the commit that added `Tool::meta` (#534, rmcp 0.8.5+): `list_tools`
+# sets `_meta["anthropic/alwaysLoad"]` on the core tools (see EAGER_TOOLS in
+# rmc-server/src/tools/router.rs). `branch = "main"` would drift to an
+# incompatible major on the next `cargo update`.
+rmcp = { git = "https://github.com/modelcontextprotocol/rust-sdk", rev = "03040f8b0bfb9ac43e73234189d409da67e1fe5b", features = [
   "server",
   "transport-io",
 ] }
