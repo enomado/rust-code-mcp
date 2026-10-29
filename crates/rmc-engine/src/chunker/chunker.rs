@@ -200,6 +200,101 @@ mod tests {
     use crate::parser::RustParser;
     use std::path::PathBuf;
 
+    /// Chunk-count probe, not a test: what the chunker makes of one real
+    /// file (`RMC_CHUNK_PROBE_FILE`), before the oversize split. Prints the
+    /// count per symbol kind, how many chunks lie inside another chunk's
+    /// line span, how many share their exact span with another, and the
+    /// bytes of code against the file's own size.
+    #[test]
+    #[ignore]
+    fn probe_chunks_of_a_real_file() {
+        let path = PathBuf::from(std::env::var("RMC_CHUNK_PROBE_FILE").unwrap());
+        let source = std::fs::read_to_string(&path).unwrap();
+        let parsed = RustParser::new()
+            .unwrap()
+            .parse_source_complete(&source)
+            .unwrap();
+        let chunks = Chunker::new().chunk_file(&path, &source, &parsed).unwrap();
+
+        let mut by_kind = std::collections::BTreeMap::<&str, usize>::new();
+        for chunk in &chunks {
+            *by_kind
+                .entry(chunk.context.symbol_kind.as_str())
+                .or_default() += 1;
+        }
+        let spans: Vec<(usize, usize)> = chunks
+            .iter()
+            .map(|c| (c.context.line_start, c.context.line_end))
+            .collect();
+        let nested = spans
+            .iter()
+            .enumerate()
+            .filter(|(i, (s, e))| {
+                spans
+                    .iter()
+                    .enumerate()
+                    .any(|(j, (s2, e2))| j != *i && s2 <= s && e <= e2 && (s2, e2) != (s, e))
+            })
+            .count();
+        let mut sorted = spans.clone();
+        sorted.sort();
+        let same_span = sorted.windows(2).filter(|w| w[0] == w[1]).count();
+        let code_bytes: usize = chunks.iter().map(|c| c.content.len()).sum();
+        let json_bytes: usize = chunks
+            .iter()
+            .map(|c| serde_json::to_string(c).unwrap().len())
+            .sum();
+        eprintln!(
+            "{}: {} lines, {} bytes -> {} chunks; nested in another chunk: {}; same span as another: {}; \
+             code {} bytes ({:.2}x the file), chunk JSON {} bytes",
+            path.display(),
+            source.lines().count(),
+            source.len(),
+            chunks.len(),
+            nested,
+            same_span,
+            code_bytes,
+            code_bytes as f64 / source.len() as f64,
+            json_bytes,
+        );
+        eprintln!("by kind: {by_kind:?}");
+        // The oversize split as bge-small runs it (384 target / 512 hard
+        // tokens), with tokens estimated as a quarter of the formatted
+        // text's bytes — the real counter needs the model's tokenizer; this
+        // is for the order of magnitude.
+        let split = Chunker::new().split_oversized_chunks(
+            chunks.clone(),
+            crate::chunker::ChunkSplitConfig::new(384, 512),
+            |chunk| Some(chunk.format_for_embedding().len() / 4),
+        );
+        let content: usize = split.iter().map(|c| c.content.len()).sum();
+        let formatted: usize = split.iter().map(|c| c.format_for_embedding().len()).sum();
+        let docstring: usize = split
+            .iter()
+            .map(|c| c.context.docstring.as_ref().map_or(0, String::len))
+            .sum();
+        eprintln!(
+            "after the oversize split (≈ tokens): {} chunks; per chunk: content {} B, embedded text {} B, \
+             of it docstring {} B",
+            split.len(),
+            content / split.len(),
+            formatted / split.len(),
+            docstring / split.len(),
+        );
+        let mut small: Vec<_> = chunks.iter().filter(|c| c.content.len() < 80).collect();
+        small.truncate(8);
+        for chunk in small {
+            eprintln!(
+                "  small {} {} L{}-{}: {:?}",
+                chunk.context.symbol_kind,
+                chunk.context.symbol_name,
+                chunk.context.line_start,
+                chunk.context.line_end,
+                chunk.content
+            );
+        }
+    }
+
     #[test]
     fn test_chunker_creation() {
         let chunker = Chunker::new();
