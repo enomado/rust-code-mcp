@@ -1096,8 +1096,6 @@ mod tests {
                 line_start: 1,
                 line_end: 10,
             },
-            overlap_prev: None,
-            overlap_next: None,
         }
     }
 
@@ -1799,6 +1797,175 @@ mod tests {
                 started.elapsed().as_secs_f64()
             );
         }
+    }
+
+    /// Size probe, not a test: what of `chunk_json` a real store pays for.
+    /// Reads `RMC_LANCE_PROBE_DIR` (a live store is fine: it only reads) and
+    /// samples every `RMC_LANCE_PROBE_EVERY`-th row (20 unless set).
+    ///
+    /// Prints the bytes per JSON field, then what the row would weigh in the
+    /// slim form chunks are written in — `imports` and `outgoing_calls` cut
+    /// to the `EMBEDDED_CONTEXT_ITEMS` the embedded text names, no overlap
+    /// fields — and, for the chunk-count decision, the bytes of docstrings
+    /// that a split symbol's later parts repeat. With `RMC_LANCE_PROBE_OUT`
+    /// set it also writes the slim sample into two tables there, lance's
+    /// default string encoding and zstd, and prints their size on disk.
+    #[tokio::test]
+    #[ignore]
+    async fn probe_chunk_json_weight_on_real_store() {
+        use crate::chunker::EMBEDDED_CONTEXT_ITEMS;
+        use lancedb::query::Select;
+        use serde_json::Value;
+
+        let dir = std::env::var("RMC_LANCE_PROBE_DIR").unwrap();
+        let every: usize = std::env::var("RMC_LANCE_PROBE_EVERY")
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(20);
+        let db = connect(&dir).execute().await.unwrap();
+        let table = db.open_table(TABLE_NAME).execute().await.unwrap();
+        let mut stream = table
+            .query()
+            .select(Select::columns(&["chunk_json"]))
+            .execute()
+            .await
+            .unwrap();
+
+        let mut rows = 0usize;
+        let mut sampled = 0usize;
+        let mut json_bytes = 0usize;
+        let mut slim_bytes = 0usize;
+        let mut field_bytes = std::collections::BTreeMap::<String, usize>::new();
+        let mut over_limit = [0usize; 2]; // rows with more imports / calls than embedded
+        let mut later_part_docstring = 0usize;
+        let mut slim_sample = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..column.len() {
+                rows += 1;
+                if rows % every != 0 {
+                    continue;
+                }
+                sampled += 1;
+                let json = column.value(i);
+                json_bytes += json.len();
+                let mut value: Value = serde_json::from_str(json).unwrap();
+                let object = value.as_object_mut().unwrap();
+                for (key, field) in object.iter() {
+                    if key == "context" {
+                        for (inner, field) in field.as_object().unwrap() {
+                            *field_bytes.entry(format!("context.{inner}")).or_default() +=
+                                field.to_string().len();
+                        }
+                    } else {
+                        *field_bytes.entry(key.clone()).or_default() += field.to_string().len();
+                    }
+                }
+                object.remove("overlap_prev");
+                object.remove("overlap_next");
+                let context = object.get_mut("context").unwrap().as_object_mut().unwrap();
+                for (slot, key) in ["imports", "outgoing_calls"].into_iter().enumerate() {
+                    let list = context.get_mut(key).unwrap().as_array_mut().unwrap();
+                    if list.len() > EMBEDDED_CONTEXT_ITEMS {
+                        over_limit[slot] += 1;
+                        list.truncate(EMBEDDED_CONTEXT_ITEMS);
+                    }
+                }
+                if context
+                    .get("split_part")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1)
+                    > 1
+                {
+                    later_part_docstring += context
+                        .get("docstring")
+                        .and_then(Value::as_str)
+                        .map_or(0, str::len);
+                }
+                let slim = value.to_string();
+                slim_bytes += slim.len();
+                slim_sample.push(slim);
+            }
+        }
+
+        let mib = |bytes: usize| bytes as f64 * every as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "{rows} rows, {sampled} sampled; chunk_json {:.0} MiB (est. whole table), {} B/row",
+            mib(json_bytes),
+            json_bytes / sampled
+        );
+        let mut fields: Vec<_> = field_bytes.into_iter().collect();
+        fields.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
+        for (key, bytes) in fields {
+            eprintln!(
+                "  {key:28} {:6} B/row  {:5.1} %",
+                bytes / sampled,
+                100.0 * bytes as f64 / json_bytes as f64
+            );
+        }
+        eprintln!(
+            "slim: {:.0} MiB, {} B/row ({:.1} % of now); rows over {EMBEDDED_CONTEXT_ITEMS} imports {:.1} %, \
+             over {EMBEDDED_CONTEXT_ITEMS} calls {:.1} %",
+            mib(slim_bytes),
+            slim_bytes / sampled,
+            100.0 * slim_bytes as f64 / json_bytes as f64,
+            100.0 * over_limit[0] as f64 / sampled as f64,
+            100.0 * over_limit[1] as f64 / sampled as f64,
+        );
+        eprintln!(
+            "docstrings repeated by split parts 2..n: {:.0} MiB ({:.1} % of slim)",
+            mib(later_part_docstring),
+            100.0 * later_part_docstring as f64 / slim_bytes as f64
+        );
+
+        let Ok(out) = std::env::var("RMC_LANCE_PROBE_OUT") else {
+            return;
+        };
+        for scheme in ["default", "zstd"] {
+            let mut metadata = HashMap::new();
+            if scheme != "default" {
+                metadata.insert("lance-encoding:compression".to_string(), scheme.to_string());
+            }
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("chunk_json", DataType::Utf8, false).with_metadata(metadata),
+            ]));
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(StringArray::from(slim_sample.clone()))],
+            )
+            .unwrap();
+            let path = format!("{out}/{scheme}");
+            let db = connect(&path).execute().await.unwrap();
+            let started = std::time::Instant::now();
+            let reader: Box<dyn RecordBatchReader + Send> =
+                Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema));
+            db.create_table("t", reader).execute().await.unwrap();
+            let on_disk: u64 = walk_bytes(Path::new(&path));
+            eprintln!(
+                "slim sample, {scheme}: {:.1} MiB on disk ({:.0} MiB whole table), written in {:.2}s",
+                on_disk as f64 / (1024.0 * 1024.0),
+                on_disk as f64 * every as f64 / (1024.0 * 1024.0),
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    fn walk_bytes(dir: &Path) -> u64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    walk_bytes(&entry.path())
+                } else {
+                    meta.len()
+                }
+            })
+            .sum()
     }
 
     #[tokio::test]

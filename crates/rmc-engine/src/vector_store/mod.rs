@@ -286,8 +286,6 @@ mod tests {
                 line_start: 10,
                 line_end: 20,
             },
-            overlap_prev: None,
-            overlap_next: None,
         }
     }
 

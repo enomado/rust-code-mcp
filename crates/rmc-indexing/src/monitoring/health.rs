@@ -776,8 +776,6 @@ mod tests {
                 line_start: 1,
                 line_end: 1,
             },
-            overlap_prev: None,
-            overlap_next: None,
         };
         store
             .insert_chunks(vec![(chunk.id, vec![0.1, 0.2, 0.3, 0.4], chunk.clone())])

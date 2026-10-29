@@ -67,12 +67,6 @@ impl Chunker {
             }
         }
 
-        for chunk in &mut output {
-            chunk.overlap_prev = None;
-            chunk.overlap_next = None;
-        }
-        self.add_overlap(&mut output);
-
         output
     }
 
@@ -145,8 +139,6 @@ fn make_part_chunk(
     part.content = content.to_string();
     part.context.line_start = source.context.line_start + start_line_offset;
     part.context.line_end = source.context.line_start + end_line_offset.saturating_sub(1);
-    part.overlap_prev = None;
-    part.overlap_next = None;
     part
 }
 
@@ -214,14 +206,12 @@ mod tests {
                 line_start: start,
                 line_end: end,
             },
-            overlap_prev: None,
-            overlap_next: None,
         }
     }
 
     #[test]
     fn test_split_oversized_container_uses_child_chunks() {
-        let chunker = Chunker::with_overlap(0.0);
+        let chunker = Chunker::new();
         let parent = synthetic_chunk("impl Foo", "impl", 1, 12);
         let child_a = synthetic_chunk("a", "function", 2, 4);
         let child_b = synthetic_chunk("b", "function", 6, 8);
@@ -247,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_split_oversized_leaf_by_lines() {
-        let chunker = Chunker::with_overlap(0.0);
+        let chunker = Chunker::new();
         let leaf = synthetic_chunk("large_fn", "function", 10, 18);
 
         let chunks = chunker.split_oversized_chunks(
@@ -267,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_splitter_keeps_small_chunks_unchanged() {
-        let chunker = Chunker::with_overlap(0.0);
+        let chunker = Chunker::new();
         let leaf = synthetic_chunk("small_fn", "function", 1, 2);
         let id = leaf.id;
 
