@@ -339,6 +339,7 @@ mod tests {
     use crate::indexing::index_stats::probe_bm25_index;
     use rmc_engine::chunker::{ChunkContext, ChunkId};
     use std::path::PathBuf;
+    use std::time::Duration;
 
     const CHUNKS_PER_FILE: usize = 30;
 
@@ -448,6 +449,29 @@ mod tests {
         let stats = probe_bm25_index(dir.path()).unwrap();
         assert_eq!(stats.segment_count, 1, "{stats:#?}");
         assert_eq!(stats.live_docs, (DEFAULT_MIN_NUM_SEGMENTS * CHUNKS_PER_FILE) as u64);
+    }
+
+    /// Two daemons of one BM25 schema version share an index directory: a
+    /// replaced binary's daemon lives on while its clients drain. The
+    /// workspace lock is per process, so between daemons the writer lock is
+    /// all there is. It must refuse at once — an error the sync logs and the
+    /// next tick retries — rather than block the second writer behind the
+    /// first's whole sync, and it must be free again once the first is gone.
+    /// The lock is an `flock` on its own open file, so a second open in the
+    /// same process contends exactly like one from another process.
+    #[test]
+    fn a_second_writer_on_the_directory_is_refused_not_queued() {
+        let dir = TempDir::new().unwrap();
+        let first = TantivyAdapter::new(TantivyConfig::default(dir.path())).unwrap();
+
+        let started = Instant::now();
+        let second = TantivyAdapter::new(TantivyConfig::default(dir.path()));
+        let error = format!("{:#}", second.err().expect("the directory's writer is taken"));
+        assert!(error.contains("Failed to create Tantivy writer"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
+
+        drop(first);
+        TantivyAdapter::new(TantivyConfig::default(dir.path())).expect("released with the first");
     }
 
     #[test]
