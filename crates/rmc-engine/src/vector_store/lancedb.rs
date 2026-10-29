@@ -1953,6 +1953,24 @@ mod tests {
         }
     }
 
+    /// Layout probe, not a test: version, fragments, rows and what every
+    /// index covers in `RMC_LANCE_PROBE_DIR` (a live store is fine: it only
+    /// reads), as JSON.
+    #[tokio::test]
+    #[ignore]
+    async fn probe_store_layout() {
+        let dir = std::env::var("RMC_LANCE_PROBE_DIR").unwrap();
+        let db = connect(&dir).execute().await.unwrap();
+        let backend = LanceDbBackend {
+            db,
+            table_name: TABLE_NAME.to_string(),
+            vector_dim: 384,
+            schema: Arc::new(LanceDbBackend::create_schema_for_dim(384)),
+        };
+        let layout = backend.layout().await.unwrap();
+        eprintln!("{}", serde_json::to_string_pretty(&layout).unwrap());
+    }
+
     fn walk_bytes(dir: &Path) -> u64 {
         std::fs::read_dir(dir)
             .unwrap()
