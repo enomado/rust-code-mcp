@@ -37,4 +37,4 @@ pub use tantivy_adapter::TantivyAdapter;
 // For the same reason the nested-project boundary is exported too: where this
 // project ends must be understood the same way by everyone asking about its files.
 pub use traversal::{NESTED_ROOT_MARKER, collect_project_rust_files, is_nested_project_root};
-pub use unified::{IndexFileResult, IndexStats, UnifiedIndexer};
+pub use unified::{IndexFileResult, IndexStats, UnifiedIndexer, rebuild_bm25_from_existing_store};

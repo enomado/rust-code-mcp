@@ -164,7 +164,7 @@ fn vector_store_path(cache_path: &Path, collection_name: &str) -> PathBuf {
 /// that needs none, on a path promised to stay cheap when nothing changed.
 /// No vector store yet means nothing to rebuild from: `None`, as for an
 /// index that is not empty.
-pub(crate) async fn rebuild_bm25_from_existing_store(
+pub async fn rebuild_bm25_from_existing_store(
     cache_path: &Path,
     tantivy_path: &Path,
     collection_name: &str,
@@ -407,6 +407,16 @@ impl UnifiedIndexer {
 
         // Process file (parse and chunk)
         let processed = self.core.process_file_sync(file_path)?;
+
+        // A file indexed through the metadata cache may already have chunks in
+        // both stores: the cache only says the file changed (or was never seen
+        // by THIS cache — after a wipe it has seen nothing), not that the
+        // stores are empty for it. Chunk ids are random, so writing without
+        // deleting first leaves the old chunks next to the new ones for good.
+        // (`reindex_file` callers delete before calling and pass `false`.)
+        if consult_metadata_cache {
+            self.delete_file_chunks(file_path).await?;
+        }
 
         if processed.chunks.is_empty() {
             tracing::warn!("No chunks generated for {}", file_path.display());
@@ -863,6 +873,13 @@ impl UnifiedIndexer {
         // Instead of N file-by-file calls, make single batched calls to each store
         let index_start = Instant::now();
 
+        // Drop whatever the stores hold for these files first — see the same
+        // step in `index_file_impl`: random chunk ids make a write without it
+        // a second copy of the file.
+        for processed_file in processed {
+            self.delete_file_chunks(&processed_file.path).await?;
+        }
+
         // Batch all chunks for Tantivy (single call instead of N calls)
         tracing::debug!("Indexing {} chunks to Tantivy...", all_chunks.len());
         self.tantivy.index_chunks(&all_chunks)?;
@@ -1109,5 +1126,43 @@ pub fn test_function() {
         let vector_store = indexer.vector_store_cloned();
         let count = vector_store.count().await.unwrap();
         assert!(count > 0, "Vector store should have at least one vector");
+    }
+
+    /// A file the metadata cache no longer knows (the cache was wiped, as
+    /// the search path's corruption handling does) is indexed again — and
+    /// must replace its chunks, not add a second copy under new random ids.
+    /// The mutant (no delete before the write) doubles both counts.
+    #[tokio::test]
+    #[ignore] // Requires embedding model
+    async fn reindexing_a_file_the_cache_forgot_replaces_its_chunks() {
+        let temp_dir = TempDir::new().unwrap();
+        // The CPU profile: runs on any machine that has the model files.
+        let backend = EmbeddingBackend::from_profile_name("local-cpu-small").unwrap();
+        let mut indexer = UnifiedIndexer::for_embedded_with_backend(
+            &temp_dir.path().join("cache"),
+            &temp_dir.path().join("tantivy"),
+            "test_reindex_replaces",
+            backend.dim(),
+            &backend.identity(),
+            None,
+            backend.clone(),
+        )
+        .await
+        .unwrap();
+        let test_file = temp_dir.path().join("lib.rs");
+        std::fs::write(&test_file, "pub fn alpha() {}\n\npub fn beta() {}\n").unwrap();
+
+        indexer.index_file(&test_file).await.unwrap();
+        indexer.commit().unwrap();
+        let store = indexer.vector_store_cloned();
+        let first = store.count().await.unwrap();
+        assert!(first > 0);
+
+        indexer.forget_file(&test_file).unwrap();
+        indexer.index_file(&test_file).await.unwrap();
+        indexer.commit().unwrap();
+
+        assert_eq!(store.count().await.unwrap(), first);
+        assert_eq!(indexer.tantivy.committed_doc_count().unwrap(), first as u64);
     }
 }

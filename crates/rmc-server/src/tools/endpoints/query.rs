@@ -13,7 +13,9 @@ use tracing;
 
 use rmc_engine::embeddings::{EmbeddingBackend, EmbeddingGenerator};
 use rmc_engine::search::{Bm25Search, HybridSearch};
-use rmc_indexing::indexing::{open_bm25_search, IndexStats, UnifiedIndexer};
+use rmc_indexing::indexing::{
+    open_bm25_search, rebuild_bm25_from_existing_store, IndexStats, UnifiedIndexer,
+};
 use crate::mcp::{SearchRuntimeCache, SearchRuntimeCacheEntry, SearchRuntimeCacheKey};
 use crate::mcp::project_paths::{
     ProjectPaths, read_embedder_identity, resolve_embedding_backend_for_mcp,
@@ -413,8 +415,38 @@ pub(crate) async fn search(
     // Try existing index; if corrupt or missing, rebuild
     let vector_index_exists = vector_metadata_exists(&paths);
     let mut bm25 = try_open_bm25(&paths);
+
+    // A BM25 index that does not exist yet next to an existing vector store
+    // is not corruption: it is a new BM25 schema version (its own directory)
+    // and is refilled from the store, which holds every chunk. Treating it as
+    // corruption — the branch below — wipes the Merkle snapshot and the
+    // metadata cache and re-embeds the whole project. A refill that fails
+    // (another writer holds the index) leaves this search on vectors alone;
+    // it never escalates to the wipe.
+    let bm25_missing = !paths.tantivy_path.join("meta.json").exists();
+    if bm25.is_none() && bm25_missing && vector_index_exists {
+        let resolved = resolve_query_backend(&paths, requested_backend.clone())?;
+        match rebuild_bm25_from_existing_store(
+            &paths.cache_path,
+            &paths.tantivy_path,
+            &paths.collection_name,
+            resolved.backend.dim(),
+            &resolved.vector_identity,
+            None,
+        )
+        .await
+        {
+            Ok(_) => bm25 = try_open_bm25(&paths),
+            Err(e) => tracing::warn!(
+                "BM25 index of {} is missing and could not be rebuilt from the vector store \
+                 yet; searching vectors only: {e:#}",
+                dir_path.display()
+            ),
+        }
+    }
+
     let mut rebuilt = false;
-    let stats = if bm25.is_some() && vector_index_exists {
+    let stats = if vector_index_exists && (bm25.is_some() || bm25_missing) {
         if let Some(ref sync_mgr) = sync_manager {
             sync_mgr
                 .track_directory_for_backend(dir_path.to_path_buf(), &requested_backend)
