@@ -205,10 +205,13 @@ rust-code-mcp --in-process     # old behaviour (same as RMC_DAEMON=0)
 rust-code-mcp --daemon         # run the daemon in the foreground
 ```
 
-Sockets and daemon logs live in `$XDG_RUNTIME_DIR/rust-code-mcp/`, falling back to
+Sockets live in `$XDG_RUNTIME_DIR/rust-code-mcp/`, falling back to
 `/run/user/<uid>/rust-code-mcp/` when that variable is unset (a session started outside a
 login shell) and to `/tmp/rust-code-mcp-$USER/` when there is no runtime directory at
-all; override with `RMC_DAEMON_DIR`. The fallback order matters: computing the same key
+all; override with `RMC_DAEMON_DIR`. Daemon logs of the default socket go to
+`$XDG_STATE_HOME/rust-code-mcp/<key>.log` (`~/.local/state/rust-code-mcp/`), so they
+survive a reboot; logs untouched for two weeks are deleted on the next spawn. With
+`RMC_DAEMON_DIR` or `--socket` the log stays next to the socket. The fallback order matters: computing the same key
 but looking for it in a different directory is another way to end up with two daemons.
 Unix only; on other platforms the server stays in-process.
 

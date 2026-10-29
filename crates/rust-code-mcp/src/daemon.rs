@@ -90,8 +90,9 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Opt out of the whole scheme: `RMC_DAEMON=0` (`off`/`false`/`no`) keeps the
 /// server inside the client process, as it was before.
 pub const DAEMON_ENV: &str = "RMC_DAEMON";
-/// Directory holding sockets and daemon logs. Defaults to
-/// `$XDG_RUNTIME_DIR/rust-code-mcp`.
+/// Directory holding sockets, and then daemon logs too. Defaults to
+/// `$XDG_RUNTIME_DIR/rust-code-mcp` for sockets and
+/// `$XDG_STATE_HOME/rust-code-mcp` for logs (see [`log_path`]).
 pub const DAEMON_DIR_ENV: &str = "RMC_DAEMON_DIR";
 /// How long a daemon stays alive with no clients, in seconds. `0` means forever.
 pub const IDLE_ENV: &str = "RMC_DAEMON_IDLE_SECS";
@@ -1078,8 +1079,72 @@ fn lock_path(socket: &Path) -> PathBuf {
     socket.with_extension("lock")
 }
 
+/// The log a daemon on `socket` writes its stderr into.
+///
+/// The default socket lives on tmpfs (`$XDG_RUNTIME_DIR`), and its log used to
+/// sit next to it — so a reboot erased the only account of what the daemon
+/// was doing before it. Measured 2026-10-29: a planned reboot mid-soak took
+/// the GPU-session ledger with it, and a 4 GB step in card memory could no
+/// longer be attributed. The log of a default socket therefore goes to the
+/// persistent state directory, under the same key.
+///
+/// A socket somewhere else (`--socket`, `RMC_DAEMON_DIR`) keeps its log beside
+/// it: the user named that place, and two unrelated `--socket <dir>/x.sock`
+/// must not share one `x.log` in the state directory.
 fn log_path(socket: &Path) -> PathBuf {
-    socket.with_extension("log")
+    let default_socket = std::env::var_os(DAEMON_DIR_ENV).is_none_or(|d| d.is_empty())
+        && socket_dir().is_ok_and(|dir| socket.parent() == Some(dir.as_path()));
+    let state_dir = resolve_state_dir(
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    );
+    resolve_log_path(socket, default_socket, state_dir.as_deref())
+}
+
+/// `$XDG_STATE_HOME/rust-code-mcp`, else `$HOME/.local/state/rust-code-mcp`
+/// (the XDG default); `None` without either — then the log stays by the socket.
+fn resolve_state_dir(xdg_state: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    if let Some(dir) = xdg_state.filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir).join("rust-code-mcp"));
+    }
+    home.filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".local/state/rust-code-mcp"))
+}
+
+/// The pure part of [`log_path`], for the same reason as [`resolve_socket_dir`].
+fn resolve_log_path(socket: &Path, default_socket: bool, state_dir: Option<&Path>) -> PathBuf {
+    match (default_socket, state_dir, socket.file_name()) {
+        (true, Some(dir), Some(name)) => dir.join(name).with_extension("log"),
+        _ => socket.with_extension("log"),
+    }
+}
+
+/// Logs untouched this long are deleted on the next spawn. On tmpfs a reboot
+/// did this; on disk every rebuild leaves a log under a new key, and nothing
+/// else would ever remove them. Two weeks covers any investigation that still
+/// needs a dead daemon's log.
+const LOG_KEEP: Duration = Duration::from_secs(14 * 24 * 3600);
+
+/// Remove `*.log` / `*.log.1` in `dir` last written more than `keep` ago.
+/// Failures are ignored, as in [`rotate_log_if_large`].
+fn prune_old_logs(dir: &Path, keep: Duration) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_log = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".log") || n.ends_with(".log.1"));
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|mtime| mtime.elapsed().is_ok_and(|age| age > keep));
+        if is_log && stale {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 /// A file lock around "check / clear a stale socket / spawn / wait".
@@ -1306,8 +1371,17 @@ fn rotate_log_if_large(path: &Path) {
 /// Daemons are told apart inside the shared file by the pid on their
 /// `daemon listening on …` line.
 fn open_daemon_log(socket: &Path) -> io::Result<File> {
-    let path = log_path(socket);
-    rotate_log_if_large(&path);
+    open_log_at(&log_path(socket))
+}
+
+/// [`open_daemon_log`] for an already resolved path: creates its directory
+/// (the state directory may not exist yet), prunes old logs there, rotates.
+fn open_log_at(path: &Path) -> io::Result<File> {
+    if let Some(dir) = path.parent() {
+        ensure_dir(dir)?;
+        prune_old_logs(dir, LOG_KEEP);
+    }
+    rotate_log_if_large(path);
     OpenOptions::new().create(true).append(true).open(path)
 }
 
@@ -2964,5 +3038,67 @@ mod tests {
             !log_path(&socket).with_extension("log.1").exists(),
             "nothing should have been rolled aside"
         );
+    }
+
+    /// The default socket is on tmpfs; its log must not be, or a reboot erases
+    /// what the daemon did before it.
+    #[test]
+    fn a_default_socket_logs_into_the_state_directory() {
+        let socket = Path::new("/run/user/1000/rust-code-mcp/c27a480be53c5b37.sock");
+        assert_eq!(
+            resolve_log_path(socket, true, Some(Path::new("/home/u/.local/state/rust-code-mcp"))),
+            PathBuf::from("/home/u/.local/state/rust-code-mcp/c27a480be53c5b37.log"),
+        );
+        assert_eq!(
+            resolve_log_path(socket, false, Some(Path::new("/home/u/.local/state/rust-code-mcp"))),
+            PathBuf::from("/run/user/1000/rust-code-mcp/c27a480be53c5b37.log"),
+            "a socket the user placed keeps its log beside it"
+        );
+        assert_eq!(
+            resolve_log_path(socket, true, None),
+            PathBuf::from("/run/user/1000/rust-code-mcp/c27a480be53c5b37.log"),
+            "without a home there is nowhere else to put it"
+        );
+    }
+
+    #[test]
+    fn the_state_directory_follows_xdg_then_home() {
+        assert_eq!(
+            resolve_state_dir(Some("/s"), Some("/home/u")),
+            Some(PathBuf::from("/s/rust-code-mcp"))
+        );
+        assert_eq!(
+            resolve_state_dir(Some(""), Some("/home/u")),
+            Some(PathBuf::from("/home/u/.local/state/rust-code-mcp"))
+        );
+        assert_eq!(resolve_state_dir(None, None), None);
+    }
+
+    /// On disk every rebuild leaves a log under a new key; old ones go, fresh
+    /// ones and other files stay.
+    #[test]
+    fn stale_logs_are_pruned_and_fresh_ones_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let old = dir.path().join("old.log");
+        let old_rolled = dir.path().join("old.log.1");
+        let fresh = dir.path().join("fresh.log");
+        let other = dir.path().join("notes.txt");
+        for path in [&old, &old_rolled, &fresh, &other] {
+            std::fs::write(path, "x").expect("seed");
+        }
+        let month_ago = std::time::SystemTime::now() - Duration::from_secs(30 * 24 * 3600);
+        for path in [&old, &old_rolled, &other] {
+            File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_modified(month_ago))
+                .expect("age the file");
+        }
+
+        prune_old_logs(dir.path(), LOG_KEEP);
+
+        assert!(!old.exists() && !old_rolled.exists(), "stale logs must be removed");
+        assert!(fresh.exists(), "a fresh log must stay");
+        assert!(other.exists(), "only logs are pruned");
     }
 }
