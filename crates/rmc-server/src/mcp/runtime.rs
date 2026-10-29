@@ -95,7 +95,30 @@ pub struct ProcessStatus {
     pub rss_kib: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// The BM25 index of one sync-tracked directory, as the probe reads it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Bm25IndexStatus {
+    pub directory: String,
+    /// The probe's report, or why it could not read the index (no index yet
+    /// is an `Err` too — the message says so).
+    pub stats: Result<rmc_indexing::indexing::index_stats::Bm25IndexStats, String>,
+}
+
+/// What the keyword indexes of this daemon look like and cost right now.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Bm25Status {
+    /// Threads of this process named `merge_thread_*` — tantivy's segment
+    /// merge pools, one per live index writer (up to four threads each; the
+    /// pool starts them as merges arrive, so an idle writer shows one). Several
+    /// `merge_thread_0` at once = several writers alive. The only reading of merge
+    /// activity that does not depend on a writer telling the truth: a writer
+    /// dropped with merges in flight (the bug that kept three pools busy on a
+    /// daemon for hours) leaves its threads here, and nowhere else.
+    pub merge_threads: usize,
+    pub indexes: Vec<Bm25IndexStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RuntimeStatus {
     pub sync: RuntimeSyncStatus,
     pub search_cache: SearchRuntimeCacheStatus,
@@ -105,6 +128,7 @@ pub struct RuntimeStatus {
     /// GPU embedding sessions by owner and the VRAM they were charged,
     /// against this process's and the card's meters.
     pub gpu: rmc_engine::embeddings::GpuLedgerReport,
+    pub bm25: Bm25Status,
 }
 
 #[derive(Clone)]
@@ -174,6 +198,12 @@ impl RuntimeState {
     }
 
     pub async fn status(&self) -> RuntimeStatus {
+        let bm25 = match &self.sync_manager {
+            Some(sync_manager) => {
+                bm25_status(&sync_manager.get_tracked_directories().await)
+            }
+            None => bm25_status(&[]),
+        };
         let sync = match &self.sync_manager {
             Some(sync_manager) => RuntimeSyncStatus::from_sync_manager(sync_manager.status().await),
             None => RuntimeSyncStatus::disabled(),
@@ -193,6 +223,7 @@ impl RuntimeState {
             },
             process: current_process_status(),
             gpu: rmc_engine::embeddings::gpu_ledger_report(),
+            bm25,
         }
     }
 
@@ -495,6 +526,48 @@ fn normalize_workspace(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// The BM25 index of every directory background sync tracks, plus the merge
+/// threads alive in this process. Reads `meta.json` and file sizes only (see
+/// `index_stats`), so it is safe while the sync writes.
+fn bm25_status(tracked: &[PathBuf]) -> Bm25Status {
+    let indexes = tracked
+        .iter()
+        .map(|dir| {
+            // The index directory depends on the project only, not on the
+            // embedding profile, so any profile's paths name it.
+            let paths = super::project_paths::ProjectPaths::from_directory(
+                dir,
+                &super::defaults::automatic_embedding_backend(),
+            );
+            Bm25IndexStatus {
+                directory: dir.display().to_string(),
+                stats: rmc_indexing::indexing::index_stats::probe_bm25_index(&paths.tantivy_path)
+                    .map_err(|e| format!("{e:#}")),
+            }
+        })
+        .collect();
+    Bm25Status {
+        merge_threads: merge_thread_count(),
+        indexes,
+    }
+}
+
+/// Threads of this process whose name starts with `merge_thread` (Linux:
+/// `/proc/self/task/*/comm`; elsewhere there is nothing to read and the
+/// count is 0).
+fn merge_thread_count() -> usize {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return 0;
+    };
+    tasks
+        .filter_map(Result::ok)
+        .filter(|task| {
+            std::fs::read_to_string(task.path().join("comm"))
+                .is_ok_and(|name| name.starts_with("merge_thread"))
+        })
+        .count()
+}
+
 fn current_process_status() -> ProcessStatus {
     ProcessStatus {
         pid: std::process::id(),
@@ -505,6 +578,25 @@ fn current_process_status() -> ProcessStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The merge-thread reading sees a live writer's pool. Other tests may
+    /// hold writers of their own at the same time, so the check is on this
+    /// writer's contribution, not on an absolute.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn merge_thread_count_sees_a_live_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = tantivy::Index::create_in_dir(
+            dir.path(),
+            rmc_engine::schema::ChunkSchema::new().schema(),
+        )
+        .unwrap();
+        let before = merge_thread_count();
+        let writer: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+        let with_writer = merge_thread_count();
+        writer.wait_merging_threads().unwrap();
+        assert!(with_writer > before, "{before} -> {with_writer}");
+    }
 
     #[tokio::test]
     async fn runtime_status_reports_owned_empty_state() {

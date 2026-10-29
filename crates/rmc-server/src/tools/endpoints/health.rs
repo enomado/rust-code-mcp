@@ -17,6 +17,26 @@ use rmc_indexing::{
     monitoring::{HealthMonitor, Status},
 };
 
+/// Share of deleted documents in a project's BM25 index above which the
+/// health check warns.
+///
+/// The merge policy expunges any segment past 30 % deleted
+/// (`RMC_BM25_DEL_DOCS_RATIO`), so a whole index above half dead means its
+/// merges are not landing — the state a daemon reached when every sync threw
+/// its merges away (71 %). Between the two leaves room for the segments that
+/// sit just under the policy's threshold.
+const BM25_DELETED_WARN_ENV: &str = "RMC_BM25_DELETED_WARN_RATIO";
+const DEFAULT_BM25_DELETED_WARN_RATIO: f64 = 0.5;
+
+fn bm25_deleted_warn_ratio() -> Result<f64, McpError> {
+    match std::env::var(BM25_DELETED_WARN_ENV) {
+        Ok(value) => value.trim().parse().map_err(|e| {
+            McpError::invalid_params(format!("{BM25_DELETED_WARN_ENV}={value:?}: {e}"), None)
+        }),
+        Err(_) => Ok(DEFAULT_BM25_DELETED_WARN_RATIO),
+    }
+}
+
 /// Health check parameters (optional directory to check specific project)
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct HealthCheckParams {
@@ -177,6 +197,41 @@ pub(crate) async fn health_check(
             );
         }
     }
+    // The keyword index's own shape: how much of it is dead. Reported for a
+    // project only — the system-wide probe has no single index to look at.
+    let mut bm25_warning = None;
+    if directory.is_some() {
+        let probe = rmc_indexing::indexing::index_stats::probe_bm25_index(&bm25_path);
+        if let Ok(stats) = &probe {
+            let threshold = bm25_deleted_warn_ratio()?;
+            if let Some(ratio) = stats.deleted_ratio.filter(|ratio| *ratio > threshold) {
+                bm25_warning = Some(format!(
+                    "BM25 index is {:.0} % deleted documents ({} segments, {:.2} GB on disk); \
+                     above {BM25_DELETED_WARN_ENV}={threshold}: merges are not landing",
+                    ratio * 100.0,
+                    stats.segment_count,
+                    stats.total_bytes_on_disk as f64 / 1e9,
+                ));
+            }
+        }
+        if let Some(obj) = health_value.as_object_mut() {
+            obj.insert(
+                "bm25_index".to_string(),
+                match probe {
+                    Ok(stats) => serde_json::to_value(&stats)
+                        .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+                    Err(e) => serde_json::json!({ "error": format!("{e:#}") }),
+                },
+            );
+            if let Some(warning) = &bm25_warning {
+                obj.insert(
+                    "bm25_warning".to_string(),
+                    serde_json::Value::String(warning.clone()),
+                );
+            }
+        }
+    }
+
     let status_json = serde_json::to_string_pretty(&health_value)
         .map_err(|e| McpError::internal_error(e.to_string(), None))?;
 
@@ -197,6 +252,9 @@ pub(crate) async fn health_check(
         }
     }
 
+    if let Some(warning) = &bm25_warning {
+        response.push_str(&format!("⚠ {warning}\n\n"));
+    }
     response.push_str(&status_json);
     response.push_str("\n\n=== Health Check Guide ===\n");
     response.push_str("- Healthy: All components operational\n");
