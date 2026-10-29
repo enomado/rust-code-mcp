@@ -333,6 +333,7 @@ impl IndexerCore {
 
 fn chunk_split_config_from(config: &IndexerCoreConfig) -> ChunkSplitConfig {
     ChunkSplitConfig::new(config.chunk_target_tokens, config.chunk_hard_max_tokens)
+        .with_context_in_first_part_only(config.chunk_context_first_part_only)
 }
 
 #[cfg(test)]
@@ -340,6 +341,120 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// Chunk-count probe, not a test: what a whole tree (`RMC_CHUNK_PROBE_TREE`)
+    /// costs under each split policy, chunked the way the sync chunks it —
+    /// the same file walk, parser, chunker and oversize split, token counts
+    /// from the real tokenizer of `RMC_CHUNK_PROBE_PROFILE` (`local-gpu-bge`
+    /// unless set) and its split budget. No store, no embedding.
+    ///
+    /// Per policy: chunks, the tokens the model is fed (capped at its max
+    /// length — the GPU's work), and stored chunk JSON bytes; plus the chunk
+    /// counts of the files named in `RMC_CHUNK_PROBE_FILES` (comma-separated
+    /// suffixes). Runs on `RMC_CHUNK_PROBE_THREADS` threads (8 unless set).
+    #[test]
+    #[ignore]
+    fn probe_chunk_counts_of_a_real_tree() {
+        use crate::indexing::traversal::collect_project_rust_files;
+        use rayon::prelude::*;
+        use rmc_engine::embeddings::{EmbeddingProfile, EmbeddingTokenCounter};
+
+        let tree = PathBuf::from(std::env::var("RMC_CHUNK_PROBE_TREE").unwrap());
+        let profile =
+            std::env::var("RMC_CHUNK_PROBE_PROFILE").unwrap_or_else(|_| "local-gpu-bge".into());
+        let threads: usize = std::env::var("RMC_CHUNK_PROBE_THREADS")
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(8);
+        let named: Vec<String> = std::env::var("RMC_CHUNK_PROBE_FILES")
+            .map(|v| v.split(',').map(str::to_string).collect())
+            .unwrap_or_default();
+
+        let spec = EmbeddingProfile::parse(&profile).unwrap();
+        let budget = ChunkSplitConfig::new(
+            spec.default_chunk_target_tokens(),
+            spec.default_chunk_hard_max_tokens(),
+        );
+        let backend = EmbeddingBackend::from_profile(spec);
+        let counter = EmbeddingTokenCounter::from_backend(&backend).unwrap();
+        let max_len = counter.max_len();
+        let (files, walk_errors) = collect_project_rust_files(&tree);
+        eprintln!(
+            "{}: {} .rs files ({walk_errors} walk errors); {profile}, split {}/{} tokens, model max {max_len}",
+            tree.display(),
+            files.len(),
+            budget.target_tokens,
+            budget.hard_max_tokens
+        );
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        for first_part_only in [false, true] {
+            let config = budget.with_context_in_first_part_only(first_part_only);
+            let started = Instant::now();
+            // Per file: (path, chunks, capped tokens, chunk JSON bytes, parts of split symbols).
+            let per_file: Vec<(PathBuf, usize, usize, usize, usize)> = pool.install(|| {
+                files
+                    .par_iter()
+                    .filter_map(|path| {
+                        let source = std::fs::read_to_string(path).ok()?;
+                        let parsed = RustParser::new()
+                            .unwrap()
+                            .parse_source_complete(&source)
+                            .ok()?;
+                        let chunker = Chunker::new();
+                        let chunks = chunker.chunk_file(path, &source, &parsed).ok()?;
+                        let chunks = chunker.split_oversized_chunks(chunks, config, |chunk| {
+                            counter
+                                .count(&chunk.format_for_embedding())
+                                .ok()
+                                .map(|len| len.raw_tokens)
+                        });
+                        let tokens = chunks
+                            .iter()
+                            .map(|c| {
+                                counter
+                                    .count(&c.format_for_embedding())
+                                    .unwrap()
+                                    .raw_tokens
+                                    .min(max_len)
+                            })
+                            .sum();
+                        let json = chunks
+                            .iter()
+                            .map(|c| serde_json::to_string(c).unwrap().len())
+                            .sum();
+                        let parts = chunks
+                            .iter()
+                            .filter(|c| c.context.split_part.is_some())
+                            .count();
+                        Some((path.clone(), chunks.len(), tokens, json, parts))
+                    })
+                    .collect()
+            });
+            let chunks: usize = per_file.iter().map(|f| f.1).sum();
+            let tokens: usize = per_file.iter().map(|f| f.2).sum();
+            let json: usize = per_file.iter().map(|f| f.3).sum();
+            let parts: usize = per_file.iter().map(|f| f.4).sum();
+            eprintln!(
+                "context_in_first_part_only={first_part_only}: {} files, {chunks} chunks ({parts} of them parts \
+                 of split symbols), {:.1} M model tokens, chunk JSON {:.0} MiB; {:.0}s",
+                per_file.len(),
+                tokens as f64 / 1e6,
+                json as f64 / (1024.0 * 1024.0),
+                started.elapsed().as_secs_f64()
+            );
+            for suffix in &named {
+                if let Some(f) = per_file.iter().find(|f| f.0.ends_with(suffix)) {
+                    eprintln!(
+                        "  {}: {} chunks, {} parts, {} tokens",
+                        suffix, f.1, f.4, f.2
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_chunk_split_config_uses_core_config() {

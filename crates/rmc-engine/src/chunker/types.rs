@@ -177,6 +177,19 @@ pub struct ChunkSplitConfig {
     pub target_tokens: usize,
     /// Hard upper bound; single-line chunks may still exceed this.
     pub hard_max_tokens: usize,
+    /// Whether only the first part of a line-split symbol carries its
+    /// docstring, imports and calls; later parts keep the name, place and
+    /// part number.
+    ///
+    /// Off: every part repeats them, and they count against every part's
+    /// budget. On a 2199-line file a part's embedded text was 1647 bytes of
+    /// which 210 were code and 958 docstring (2026-10-29), so a long
+    /// documented function was cut into slivers of a few lines; across a
+    /// 0.95M-chunk store the docstrings of later parts were 736 MiB, half of
+    /// the stored chunk JSON. Changing it changes the embedded text, so a
+    /// store built one way is not the other's (it is part of the identity a
+    /// store is built under).
+    pub context_in_first_part_only: bool,
 }
 
 impl ChunkSplitConfig {
@@ -185,6 +198,15 @@ impl ChunkSplitConfig {
         Self {
             target_tokens,
             hard_max_tokens: hard_max_tokens.max(target_tokens),
+            context_in_first_part_only: false,
+        }
+    }
+
+    /// The same budget with `context_in_first_part_only` set to `on`.
+    pub fn with_context_in_first_part_only(self, on: bool) -> Self {
+        Self {
+            context_in_first_part_only: on,
+            ..self
         }
     }
 }
