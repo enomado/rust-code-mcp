@@ -65,8 +65,7 @@ use fs2::FileExt;
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENV, EMBEDDING_PROFILE_ENV, EP_CENSUS_ENV, RuntimeClearRequest,
     RuntimeClearScope, RuntimeState, RuntimeTaskReport, ServerRuntime, gpu_vram_budget,
-    mem_available_kib, release_idle_gpu_sessions,
-    release_free_memory, rss_kib,
+    mem_available_kib, release_free_memory, release_idle_gpu_sessions, rss_kib,
 };
 use rmc_server::tools::SearchTool;
 use rmcp::ServiceExt;
@@ -74,6 +73,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -1271,10 +1271,7 @@ impl relay::Dialer for SocketDialer {
         let Some(connected) = &self.connected else {
             return false;
         };
-        if self
-            .target()
-            .is_some_and(|target| target != connected.path)
-        {
+        if self.target().is_some_and(|target| target != connected.path) {
             return true;
         }
         socket_file_id(&connected.path) != connected.file
@@ -1383,6 +1380,54 @@ fn open_log_at(path: &Path) -> io::Result<File> {
     }
     rotate_log_if_large(path);
     OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Move this daemon's stderr from the legacy log beside the socket to
+/// [`log_path`], when the two differ.
+///
+/// Whoever spawns a daemon opens its log, and that is a client — usually one
+/// of a session started before the binary was replaced, running the old code
+/// that still put the log on tmpfs. Measured 2026-10-29: the first daemon of
+/// the build that moved logs to disk was spawned by such a client and logged
+/// to `/run/user` anyway. So the daemon checks for itself.
+///
+/// Only a stderr that IS the legacy file is moved: a daemon run by hand in a
+/// terminal keeps its terminal. Failures leave stderr where it was — a log on
+/// tmpfs is still better than none.
+fn adopt_disk_log(socket: &Path) {
+    let legacy = socket.with_extension("log");
+    let target = log_path(socket);
+    if target == legacy {
+        return;
+    }
+    let Ok(legacy_meta) = fs::metadata(&legacy) else {
+        return;
+    };
+    let stderr = io::stderr();
+    let Ok(stderr_meta) = stderr
+        .as_fd()
+        .try_clone_to_owned()
+        .map(File::from)
+        .and_then(|f| f.metadata())
+    else {
+        return;
+    };
+    if (stderr_meta.dev(), stderr_meta.ino()) != (legacy_meta.dev(), legacy_meta.ino()) {
+        return;
+    }
+    let Ok(log) = open_log_at(&target) else {
+        return;
+    };
+    tracing::info!(
+        "pid {}: log continues in {}",
+        std::process::id(),
+        target.display()
+    );
+    // SAFETY: both descriptors are open for the duration of the call; dup2
+    // atomically replaces fd 2, so concurrent writers see either file.
+    unsafe {
+        libc::dup2(log.as_raw_fd(), libc::STDERR_FILENO);
+    }
 }
 
 /// Start the daemon for `socket`, forwarding `--idle-secs` when the client was
@@ -1498,6 +1543,7 @@ pub async fn run_daemon(
     if let Some(parent) = socket.parent() {
         ensure_dir(parent)?;
     }
+    adopt_disk_log(socket);
     let listener = UnixListener::bind(socket).map_err(|e| {
         BoxError::from(format!(
             "cannot bind {}: {e} (is a live daemon already holding it?)",
@@ -1769,15 +1815,17 @@ pub async fn run_daemon(
         // A retired daemon lets go of every idle one at once: its successor is
         // building its own on the same card, and the two together are what the
         // budget's default half-card split is about.
-        let gpu_max_idle = if retiring { Some(Duration::ZERO) } else { (!gpu_idle.is_zero()).then_some(gpu_idle) };
+        let gpu_max_idle = if retiring {
+            Some(Duration::ZERO)
+        } else {
+            (!gpu_idle.is_zero()).then_some(gpu_idle)
+        };
         if let Some(max_idle) = gpu_max_idle {
             // Blocking pool: dropping a session frees device memory and reads
             // the VRAM meters.
-            tokio::task::spawn_blocking(move || {
-                release_idle_gpu_sessions(max_idle)
-            })
-            .await
-            .expect("releasing idle GPU sessions does not panic");
+            tokio::task::spawn_blocking(move || release_idle_gpu_sessions(max_idle))
+                .await
+                .expect("releasing idle GPU sessions does not panic");
         }
 
         // A rebuilt binary at the launch path: every client of this daemon is
@@ -2612,7 +2660,11 @@ mod tests {
         assert_eq!(launch.replacement(), None, "the running binary itself");
 
         std::fs::remove_file(&exe).expect("mid-swap");
-        assert_eq!(launch.replacement(), None, "a missing binary is not a new one");
+        assert_eq!(
+            launch.replacement(),
+            None,
+            "a missing binary is not a new one"
+        );
 
         std::fs::write(&exe, b"the new build").expect("new binary");
         assert_eq!(launch.replacement(), BinaryIdentity::at(&exe));
@@ -2700,7 +2752,10 @@ mod tests {
         ensure_dir(&dir).expect("an owned directory is accepted");
 
         let mode = fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
-        assert_eq!(mode, 0o755, "the daemon rewrote a directory it did not create");
+        assert_eq!(
+            mode, 0o755,
+            "the daemon rewrote a directory it did not create"
+        );
     }
 
     /// A new directory is still created owner-only: the socket is an entry point
@@ -2843,12 +2898,8 @@ mod tests {
     /// with the same settings must still meet in one daemon.
     #[test]
     fn key_ignores_the_order_the_environment_arrives_in() {
-        let forward = keyed_env_pairs(
-            pairs(&[("RMC_A", "1"), ("RMC_B", "2")]).into_iter(),
-        );
-        let backward = keyed_env_pairs(
-            pairs(&[("RMC_B", "2"), ("RMC_A", "1")]).into_iter(),
-        );
+        let forward = keyed_env_pairs(pairs(&[("RMC_A", "1"), ("RMC_B", "2")]).into_iter());
+        let backward = keyed_env_pairs(pairs(&[("RMC_B", "2"), ("RMC_A", "1")]).into_iter());
         assert_eq!(forward, backward);
     }
 
@@ -3046,11 +3097,19 @@ mod tests {
     fn a_default_socket_logs_into_the_state_directory() {
         let socket = Path::new("/run/user/1000/rust-code-mcp/c27a480be53c5b37.sock");
         assert_eq!(
-            resolve_log_path(socket, true, Some(Path::new("/home/u/.local/state/rust-code-mcp"))),
+            resolve_log_path(
+                socket,
+                true,
+                Some(Path::new("/home/u/.local/state/rust-code-mcp"))
+            ),
             PathBuf::from("/home/u/.local/state/rust-code-mcp/c27a480be53c5b37.log"),
         );
         assert_eq!(
-            resolve_log_path(socket, false, Some(Path::new("/home/u/.local/state/rust-code-mcp"))),
+            resolve_log_path(
+                socket,
+                false,
+                Some(Path::new("/home/u/.local/state/rust-code-mcp"))
+            ),
             PathBuf::from("/run/user/1000/rust-code-mcp/c27a480be53c5b37.log"),
             "a socket the user placed keeps its log beside it"
         );
@@ -3097,7 +3156,10 @@ mod tests {
 
         prune_old_logs(dir.path(), LOG_KEEP);
 
-        assert!(!old.exists() && !old_rolled.exists(), "stale logs must be removed");
+        assert!(
+            !old.exists() && !old_rolled.exists(),
+            "stale logs must be removed"
+        );
         assert!(fresh.exists(), "a fresh log must stay");
         assert!(other.exists(), "only logs are pruned");
     }
