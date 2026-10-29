@@ -15,6 +15,8 @@ embeddings = [
   "dep:futures",
   "dep:toml",
   "dep:fs2",
+  # The VRAM ledger and the fastembed model cache find their directories with it.
+  "dep:directories",
   "fastembed/hf-hub-native-tls",
   # Use ORT at build/link time instead of dlopening libonnxruntime.so at runtime.
   # Plain Cargo builds download the CPU ORT archive; Nix builds override this
