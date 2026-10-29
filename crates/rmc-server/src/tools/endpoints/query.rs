@@ -111,37 +111,12 @@ fn clean_stale_index(paths: &ProjectPaths) {
     }
 }
 
-fn vector_metadata_exists(paths: &ProjectPaths) -> bool {
-    paths.vector_path.join("metadata.json").exists()
-}
-
-fn backend_matches_request(indexed: &EmbeddingBackend, requested: &EmbeddingBackend) -> bool {
-    indexed.runtime == requested.runtime
-        && indexed.model_id() == requested.model_id()
-        && indexed.dim() == requested.dim()
-        && indexed.max_len == requested.max_len
-        && indexed.profile.query_policy == requested.profile.query_policy
-}
-
 fn select_index_paths(
     dir_path: &Path,
     requested_backend: &EmbeddingBackend,
 ) -> Result<ProjectPaths, McpError> {
-    let requested_paths = ProjectPaths::from_directory(dir_path, requested_backend);
-    if vector_metadata_exists(&requested_paths) {
-        return Ok(requested_paths);
-    }
-
-    let existing = ProjectPaths::indexed_profiles(dir_path)
-        .map_err(|msg| McpError::invalid_params(msg, None))?;
-    if let Some(indexed) = existing
-        .into_iter()
-        .find(|indexed| backend_matches_request(&indexed.backend, requested_backend))
-    {
-        return Ok(indexed.paths);
-    }
-
-    Ok(requested_paths)
+    ProjectPaths::in_use(dir_path, requested_backend)
+        .map_err(|msg| McpError::invalid_params(msg, None))
 }
 
 /// Initialize indexer and run incremental indexing, returning stats.
@@ -413,7 +388,7 @@ pub(crate) async fn search(
     let paths = select_index_paths(dir_path, &requested_backend)?;
 
     // Try existing index; if corrupt or missing, rebuild
-    let vector_index_exists = vector_metadata_exists(&paths);
+    let vector_index_exists = paths.vector_metadata_exists();
     let mut bm25 = try_open_bm25(&paths);
 
     // A BM25 index that does not exist yet next to an existing vector store

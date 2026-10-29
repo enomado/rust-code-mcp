@@ -144,6 +144,31 @@ impl ProjectPaths {
             .collect())
     }
 
+    /// The index of `dir` that tools working with `backend` actually use:
+    /// the computed paths when that collection exists, else an existing
+    /// collection built by a matching embedder (another identity string, or
+    /// another chunking identity that background sync rewrites in place),
+    /// else the computed paths for a first index.
+    ///
+    /// Search, `health_check` and `runtime_status` all ask this, so they
+    /// report on the index search reads — the BM25 directory belongs to the
+    /// collection, and the computed collection may not be the one on disk.
+    pub fn in_use(dir: &Path, backend: &EmbeddingBackend) -> Result<Self, String> {
+        let computed = Self::from_directory(dir, backend);
+        if computed.vector_metadata_exists() {
+            return Ok(computed);
+        }
+        Ok(Self::indexed_profiles(dir)?
+            .into_iter()
+            .find(|indexed| backend_matches_request(&indexed.backend, backend))
+            .map_or(computed, |indexed| indexed.paths))
+    }
+
+    /// Whether the vector collection has been created (its `metadata.json`).
+    pub fn vector_metadata_exists(&self) -> bool {
+        self.vector_path.join("metadata.json").exists()
+    }
+
     #[cfg(test)]
     fn indexed_profiles_in_root(
         dir: &Path,
@@ -158,6 +183,15 @@ impl ProjectPaths {
     pub fn vectors_root() -> PathBuf {
         IndexingProjectPaths::vectors_root(&data_dir())
     }
+}
+
+/// Whether vectors made by `indexed` answer queries embedded by `requested`.
+fn backend_matches_request(indexed: &EmbeddingBackend, requested: &EmbeddingBackend) -> bool {
+    indexed.runtime == requested.runtime
+        && indexed.model_id() == requested.model_id()
+        && indexed.dim() == requested.dim()
+        && indexed.max_len == requested.max_len
+        && indexed.profile.query_policy == requested.profile.query_policy
 }
 
 pub(crate) fn dir_hash(dir: &Path) -> String {

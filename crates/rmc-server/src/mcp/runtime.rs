@@ -533,16 +533,19 @@ fn bm25_status(tracked: &[PathBuf]) -> Bm25Status {
     let indexes = tracked
         .iter()
         .map(|dir| {
-            // The index directory depends on the project only, not on the
-            // embedding profile, so any profile's paths name it.
-            let paths = super::project_paths::ProjectPaths::from_directory(
+            // The BM25 directory belongs to a collection: probe the one
+            // search and background sync use for the automatic profile.
+            let stats = super::project_paths::ProjectPaths::in_use(
                 dir,
                 &super::defaults::automatic_embedding_backend(),
-            );
+            )
+            .and_then(|paths| {
+                rmc_indexing::indexing::index_stats::probe_bm25_index(&paths.tantivy_path)
+                    .map_err(|e| format!("{e:#}"))
+            });
             Bm25IndexStatus {
                 directory: dir.display().to_string(),
-                stats: rmc_indexing::indexing::index_stats::probe_bm25_index(&paths.tantivy_path)
-                    .map_err(|e| format!("{e:#}")),
+                stats,
             }
         })
         .collect();

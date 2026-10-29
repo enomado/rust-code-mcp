@@ -112,7 +112,11 @@ pub(crate) async fn health_check(
     let (bm25_path, merkle_path, collection_name, coverage_inputs) =
         if let Some(ref dir) = directory {
             let dir_path = std::path::Path::new(dir);
-            let paths = ProjectPaths::from_directory(dir_path, &backend);
+            // The index search reads, not merely the one this identity
+            // would name: they differ while a store built under an earlier
+            // identity is still the one in use.
+            let paths = ProjectPaths::in_use(dir_path, &backend)
+                .map_err(|msg| McpError::invalid_params(msg, None))?;
 
             (
                 paths.tantivy_path,
