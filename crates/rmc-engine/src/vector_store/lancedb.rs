@@ -18,7 +18,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::optimize::Duration as ChronoDuration;
 use lancedb::table::{CompactionOptions, OptimizeAction};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -438,6 +438,47 @@ impl LanceDbBackend {
     }
 }
 
+/// The `(id, chunk)` rows of a batch projected to `id` and `chunk_json`.
+///
+/// The row id is the key the store is written and looked up by, and the
+/// chunk carries its own copy of it; every writer passes the same value for
+/// both (`(chunk.id, embedding, chunk)`). A row where they differ is a store
+/// that contradicts itself, and is refused rather than resolved: an index
+/// rebuilt from the chunk's id would point at a row lookups never find.
+fn decode_chunk_rows(batch: &RecordBatch) -> Result<Vec<(ChunkId, CodeChunk)>, VectorStoreError> {
+    let id_array = batch
+        .column_by_name("id")
+        .ok_or_else(|| VectorStoreError::query("Missing id column"))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| VectorStoreError::query("Invalid id column type"))?;
+    let chunk_json_array = batch
+        .column_by_name("chunk_json")
+        .ok_or_else(|| VectorStoreError::query("Missing chunk_json column"))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| VectorStoreError::query("Invalid chunk_json column type"))?;
+
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        let id_str = id_array.value(i);
+        let chunk_id = ChunkId::from_string(id_str).map_err(|e| {
+            VectorStoreError::serialization(format!("Invalid chunk ID: {:?}", e))
+        })?;
+        let chunk: CodeChunk = serde_json::from_str(chunk_json_array.value(i)).map_err(|e| {
+            VectorStoreError::serialization(format!("Failed to deserialize chunk: {}", e))
+        })?;
+        if chunk.id != chunk_id {
+            return Err(VectorStoreError::serialization(format!(
+                "row {id_str} holds the chunk of {}",
+                chunk.id.to_string()
+            )));
+        }
+        rows.push((chunk_id, chunk));
+    }
+    Ok(rows)
+}
+
 #[async_trait]
 impl VectorStoreBackend for LanceDbBackend {
     async fn upsert_chunks(
@@ -548,6 +589,74 @@ impl VectorStoreBackend for LanceDbBackend {
         }
 
         Ok(search_results)
+    }
+
+    async fn chunks_by_ids(
+        &self,
+        chunk_ids: &[ChunkId],
+    ) -> Result<HashMap<ChunkId, CodeChunk>, VectorStoreError> {
+        if chunk_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let table = self.get_table().await?;
+
+        // Ids are UUIDs: nothing in them needs quoting. The `id` column has a
+        // BTree index (see `ensure_table_exists`), so this is a point lookup
+        // per id, not a scan.
+        let ids: Vec<String> = chunk_ids.iter().map(|id| format!("'{}'", id.to_string())).collect();
+        let stream = table
+            .query()
+            .only_if(format!("id IN ({})", ids.join(", ")))
+            .select(lancedb::query::Select::Columns(vec![
+                "id".to_string(),
+                "chunk_json".to_string(),
+            ]))
+            .execute()
+            .await
+            .map_err(|e| VectorStoreError::query(format!("Failed to look up chunks: {}", e)))?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(|e| {
+            VectorStoreError::query(format!("Failed to collect chunk lookup: {}", e))
+        })?;
+
+        let mut chunks = HashMap::with_capacity(chunk_ids.len());
+        for batch in &batches {
+            chunks.extend(decode_chunk_rows(batch)?);
+        }
+        Ok(chunks)
+    }
+
+    async fn scan_chunks(
+        &self,
+        sink: &mut (dyn FnMut(Vec<CodeChunk>) -> anyhow::Result<()> + Send),
+    ) -> anyhow::Result<usize> {
+        let table = self.get_table().await?;
+
+        // Only the two columns the chunk is made of: the vectors are most of
+        // the table's bytes and none of the answer.
+        let mut stream = table
+            .query()
+            .select(lancedb::query::Select::Columns(vec![
+                "id".to_string(),
+                "chunk_json".to_string(),
+            ]))
+            .execute()
+            .await
+            .map_err(|e| VectorStoreError::query(format!("Failed to scan chunks: {}", e)))?;
+
+        let mut total = 0usize;
+        while let Some(batch) = stream
+            .try_next()
+            .await
+            .map_err(|e| VectorStoreError::query(format!("Failed to read chunk batch: {}", e)))?
+        {
+            let chunks: Vec<CodeChunk> = decode_chunk_rows(&batch)?
+                .into_iter()
+                .map(|(_, chunk)| chunk)
+                .collect();
+            total += chunks.len();
+            sink(chunks)?;
+        }
+        Ok(total)
     }
 
     async fn delete_chunks(&self, chunk_ids: Vec<ChunkId>) -> Result<(), VectorStoreError> {

@@ -144,8 +144,7 @@ pub fn probe_bm25_index(index_dir: &Path) -> Result<Bm25IndexStats> {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("cannot stat {}", entry.path().display()));
+                return Err(e).with_context(|| format!("cannot stat {}", entry.path().display()));
             }
         };
         if !metadata.is_file() {
@@ -216,12 +215,7 @@ mod tests {
     /// Build an index of `files` files with `chunks_per_file` documents each,
     /// committed once, then delete `deleted_files` of the files by term and
     /// commit again — the way the incremental indexer drops a changed file.
-    fn index_with_deletes(
-        dir: &Path,
-        files: usize,
-        chunks_per_file: usize,
-        deleted_files: usize,
-    ) {
+    fn index_with_deletes(dir: &Path, files: usize, chunks_per_file: usize, deleted_files: usize) {
         let mut builder = Schema::builder();
         let file_path = builder.add_text_field("file_path", STRING | STORED);
         let content = builder.add_text_field("content", TEXT | STORED);
@@ -283,7 +277,10 @@ mod tests {
 
         let stats = probe_bm25_index(dir.path()).unwrap();
 
-        assert_eq!((stats.max_doc, stats.deleted_docs, stats.live_docs), (20, 0, 20));
+        assert_eq!(
+            (stats.max_doc, stats.deleted_docs, stats.live_docs),
+            (20, 0, 20)
+        );
         assert_eq!(stats.deleted_ratio, Some(0.0));
         assert!(!stats.referenced_bytes_by_extension.contains_key("del"));
     }

@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 rmc-server = { path = "../rmc-server" }
+# `--bm25-stats`: the index probe. Already linked through rmc-server; named
+# here because the binary calls it directly.
+rmc-indexing = { path = "../rmc-indexing" }
 
 rmcp = { workspace = true }
 # net/time/io-util: shared-daemon transport (unix socket, startup wait, proxy).

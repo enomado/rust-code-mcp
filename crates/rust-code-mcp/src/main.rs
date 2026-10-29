@@ -142,6 +142,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", socket.display());
             return Ok(());
         }
+        daemon::Mode::Bm25Stats { index_dir } => {
+            let stats = rmc_indexing::indexing::index_stats::probe_bm25_index(index_dir)
+                .map_err(|e| format!("{e:#}"))?;
+            println!("{}", serde_json::to_string_pretty(&stats)?);
+            return Ok(());
+        }
         daemon::Mode::Client { .. } | daemon::Mode::Daemon { .. } | daemon::Mode::InProcess => {}
     }
 
@@ -194,7 +200,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         daemon::Mode::Daemon { .. }
         | daemon::Mode::InProcess
         | daemon::Mode::Help
-        | daemon::Mode::PrintSocket { .. } => {}
+        | daemon::Mode::PrintSocket { .. }
+        | daemon::Mode::Bm25Stats { .. } => {}
     }
 
     tracing::info!("Starting MCP Server...");

@@ -136,6 +136,107 @@ fn vector_prune_keep() -> std::time::Duration {
     std::time::Duration::from_secs(secs)
 }
 
+fn indexer_config(
+    cache_path: &Path,
+    tantivy_path: &Path,
+    codebase_loc: Option<usize>,
+) -> IndexerConfig {
+    codebase_loc
+        .map(|loc| IndexerConfig::for_codebase_size(loc, cache_path, tantivy_path))
+        .unwrap_or_else(|| IndexerConfig::default(cache_path, tantivy_path))
+}
+
+/// Where the vector store of `collection_name` lives, next to the project's
+/// metadata cache.
+fn vector_store_path(cache_path: &Path, collection_name: &str) -> PathBuf {
+    cache_path
+        .parent()
+        .unwrap_or(cache_path)
+        .join("vectors")
+        .join(collection_name)
+}
+
+/// [`rebuild_bm25_if_empty`] without a [`UnifiedIndexer`]: the BM25 writer
+/// and the EXISTING vector store only, no embedding generator.
+///
+/// For a sync tick that found no file changes. Bringing up the whole indexer
+/// there would build an embedding session just to rebuild a keyword index
+/// that needs none, on a path promised to stay cheap when nothing changed.
+/// No vector store yet means nothing to rebuild from: `None`, as for an
+/// index that is not empty.
+pub(crate) async fn rebuild_bm25_from_existing_store(
+    cache_path: &Path,
+    tantivy_path: &Path,
+    collection_name: &str,
+    vector_size: usize,
+    embedder_identity: &str,
+    codebase_loc: Option<usize>,
+) -> Result<Option<usize>> {
+    let vector_store = match VectorStore::open_existing_embedded(
+        vector_store_path(cache_path, collection_name),
+        vector_size,
+        embedder_identity,
+    )
+    .await
+    {
+        Ok(store) => store,
+        Err(rmc_engine::vector_store::VectorStoreError::NotFound(_)) => return Ok(None),
+        Err(e) => return Err(anyhow::anyhow!("Failed to open the vector store: {}", e)),
+    };
+    let mut tantivy =
+        TantivyAdapter::new(indexer_config(cache_path, tantivy_path, codebase_loc).tantivy)?;
+    rebuild_bm25_if_empty(&mut tantivy, &vector_store).await
+}
+
+/// Fill an empty BM25 index from the vector store, if the store has chunks.
+/// Returns how many chunks were indexed, `None` when there was nothing to do.
+///
+/// Each BM25 schema version lives in its own directory (see
+/// `rmc_engine::schema::BM25_SCHEMA_VERSION`), so the first run of a new
+/// version finds an empty index next to a full vector store. Without this
+/// the index would stay empty: change detection skips every file the Merkle
+/// snapshot already knows, and nothing would ever reach BM25 again. The store
+/// holds every chunk in full, so this is a rewrite of the keyword index only —
+/// no file is re-read and nothing is re-embedded.
+///
+/// Committed once, at the end. A run that dies halfway leaves an index with
+/// no committed documents, which is exactly the condition that brings the
+/// next run back here; committing per batch would leave a partial index that
+/// no longer looks empty.
+pub(crate) async fn rebuild_bm25_if_empty(
+    tantivy: &mut TantivyAdapter,
+    vector_store: &VectorStore,
+) -> Result<Option<usize>> {
+    if tantivy.committed_doc_count()? > 0 {
+        return Ok(None);
+    }
+    let stored = vector_store
+        .count()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to count vector store rows: {}", e))?;
+    if stored == 0 {
+        return Ok(None);
+    }
+
+    tracing::info!(
+        stored_chunks = stored,
+        "BM25 index is empty while the vector store holds chunks; rebuilding it from the store"
+    );
+    let started = Instant::now();
+    let indexed = vector_store
+        .scan_chunks(&mut |chunks| tantivy.index_chunks(&chunks))
+        .await
+        .context("Failed to rebuild the BM25 index from the vector store")?;
+    tantivy.commit()?;
+    tracing::info!(
+        indexed_chunks = indexed,
+        stored_chunks = stored,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "BM25 index rebuilt from the vector store"
+    );
+    Ok(Some(indexed))
+}
+
 fn nearest_existing_path(path: &Path) -> &Path {
     let mut candidate = path;
     while !candidate.exists() {
@@ -220,9 +321,7 @@ impl UnifiedIndexer {
             backend.identity()
         );
 
-        let indexer_config = codebase_loc
-            .map(|loc| IndexerConfig::for_codebase_size(loc, cache_path, tantivy_path))
-            .unwrap_or_else(|| IndexerConfig::default(cache_path, tantivy_path));
+        let indexer_config = indexer_config(cache_path, tantivy_path, codebase_loc);
 
         // Initialize core with the explicit backend so the embedding
         // generator inside agrees with what we tell the vector store.
@@ -233,11 +332,7 @@ impl UnifiedIndexer {
         let tantivy = TantivyAdapter::new(indexer_config.tantivy)?;
 
         // Initialize embedded vector store
-        let vector_path = cache_path
-            .parent()
-            .unwrap_or(cache_path)
-            .join("vectors")
-            .join(collection_name);
+        let vector_path = vector_store_path(cache_path, collection_name);
         let vector_store =
             VectorStore::new_embedded(vector_path.clone(), vector_size, embedder_identity)
                 .await
@@ -245,14 +340,16 @@ impl UnifiedIndexer {
 
         tracing::info!("UnifiedIndexer initialized successfully with embedded backend");
 
-        Ok(Self {
+        let mut indexer = Self {
             core,
             tantivy,
             vector_store,
             metrics: IndexingMetrics::new(),
             backend,
             storage_root: vector_path,
-        })
+        };
+        rebuild_bm25_if_empty(&mut indexer.tantivy, &indexer.vector_store).await?;
+        Ok(indexer)
     }
 
     /// Borrow the active embedding backend configuration.
@@ -841,6 +938,86 @@ impl Drop for UnifiedIndexer {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn stored_chunk(name: &str, file: &str) -> CodeChunk {
+        CodeChunk {
+            id: ChunkId::new(),
+            content: format!("pub fn {name}() {{ let value = {name}_body(); }}"),
+            context: rmc_engine::chunker::ChunkContext {
+                file_path: PathBuf::from(file),
+                module_path: vec!["crate".to_string()],
+                symbol_name: name.to_string(),
+                symbol_kind: "function".to_string(),
+                docstring: Some(format!("Docs of {name}")),
+                imports: vec![],
+                outgoing_calls: vec![],
+                parent_symbol_name: None,
+                split_part: None,
+                split_total: None,
+                line_start: 1,
+                line_end: 3,
+            },
+            overlap_prev: None,
+            overlap_next: None,
+        }
+    }
+
+    /// The rebuild oracle: an empty BM25 index next to a vector store with
+    /// chunks comes back answering for exactly those chunks — every one
+    /// found by its own symbol, under its own id — and a second pass, now
+    /// that the index has documents, does nothing.
+    #[tokio::test]
+    async fn an_empty_bm25_index_is_rebuilt_from_the_vector_store() {
+        let temp = TempDir::new().unwrap();
+        let store = VectorStore::new_embedded(temp.path().join("vectors"), 4, "test:dim4")
+            .await
+            .unwrap();
+        let chunks: Vec<CodeChunk> = (0..50)
+            .map(|i| stored_chunk(&format!("symbol_{i}_unique"), &format!("src/f{}.rs", i % 7)))
+            .collect();
+        store
+            .upsert_chunks(
+                chunks
+                    .iter()
+                    .map(|chunk| (chunk.id, vec![0.1, 0.2, 0.3, 0.4], chunk.clone()))
+                    .collect(),
+            )
+            .await
+            .unwrap();
+
+        let tantivy_path = temp.path().join("bm25");
+        let mut tantivy =
+            TantivyAdapter::new(rmc_config::config::TantivyConfig::default(&tantivy_path))
+                .unwrap();
+        assert!(TantivyAdapter::is_empty_at(&tantivy_path).unwrap());
+
+        let indexed = rebuild_bm25_if_empty(&mut tantivy, &store).await.unwrap();
+        assert_eq!(indexed, Some(chunks.len()));
+        assert_eq!(tantivy.committed_doc_count().unwrap(), chunks.len() as u64);
+        assert!(!TantivyAdapter::is_empty_at(&tantivy_path).unwrap());
+        assert_eq!(rebuild_bm25_if_empty(&mut tantivy, &store).await.unwrap(), None);
+
+        let mut search = tantivy.create_bm25_search().unwrap();
+        search.reload().unwrap();
+        for chunk in &chunks {
+            let hits = search.search(&chunk.context.symbol_name, 5).unwrap();
+            assert_eq!(
+                hits.first().map(|hit| hit.0),
+                Some(chunk.id),
+                "{} not found under its own id",
+                chunk.context.symbol_name
+            );
+        }
+
+        // And the hits resolve to their chunks through the store, which is
+        // the only place the chunks now live.
+        let ids: Vec<ChunkId> = chunks.iter().map(|chunk| chunk.id).collect();
+        let fetched = store.chunks_by_ids(&ids).await.unwrap();
+        assert_eq!(fetched.len(), chunks.len());
+        for chunk in &chunks {
+            assert_eq!(fetched[&chunk.id].content, chunk.content);
+        }
+    }
 
     #[test]
     fn disk_headroom_guard_is_inclusive_and_can_be_disabled() {

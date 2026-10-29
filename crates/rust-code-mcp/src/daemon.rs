@@ -218,6 +218,9 @@ pub enum Mode {
     },
     /// `--print-socket`: print the resolved socket path and exit (diagnostics).
     PrintSocket { socket: PathBuf },
+    /// `--bm25-stats <DIR>`: print the state of the BM25 index in `DIR` as
+    /// JSON and exit (diagnostics; safe on a live daemon's index).
+    Bm25Stats { index_dir: PathBuf },
     /// `--help`.
     Help,
 }
@@ -232,6 +235,16 @@ pub fn resolve_mode(args: &[String]) -> Result<Mode, BoxError> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--help" | "-h" => return Ok(Mode::Help),
+            // Answers from its argument alone, like `--help`: no socket, no
+            // server, so it neither needs nor combines with the other modes.
+            "--bm25-stats" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| BoxError::from("--bm25-stats requires an index directory"))?;
+                return Ok(Mode::Bm25Stats {
+                    index_dir: PathBuf::from(value),
+                });
+            }
             "--daemon" | "--client" | "--in-process" | "--print-socket" => {
                 if let Some(prev) = explicit {
                     return Err(format!("modes {prev} and {arg} are mutually exclusive").into());
@@ -291,6 +304,9 @@ on demand.
   --daemon            become the daemon: listen on a socket, serve many clients
   --in-process        run the server in this process over stdio (previous behaviour)
   --print-socket      print this configuration's socket path and exit
+  --bm25-stats <DIR>  print the BM25 index in DIR (segments, deleted documents,
+                      bytes per file kind) as JSON and exit; reads meta.json
+                      and file sizes only, safe on a running daemon's index
   --socket <PATH>     use this socket instead of the one derived from the
                       binary and the environment
   --idle-secs <N>     daemon exits after N seconds with no clients (0 = never);

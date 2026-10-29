@@ -13,8 +13,10 @@ use crate::indexing::identity::{
     active_chunking_identity_for_backend, identity_hash, indexing_identity,
 };
 use crate::indexing::merkle::{ChangeSet, FileSystemMerkle};
+use crate::indexing::tantivy_adapter::TantivyAdapter;
 use crate::indexing::unified::{
     IndexFileResult, IndexStats, UnifiedIndexer, ensure_index_disk_headroom,
+    rebuild_bm25_from_existing_store,
 };
 use anyhow::Result;
 use rmc_engine::embeddings::EmbeddingBackend;
@@ -197,6 +199,27 @@ impl IncrementalIndexer {
         tracing::info!("Building Merkle tree from current filesystem...");
         let new_merkle = FileSystemMerkle::from_directory(codebase_path)?;
         tracing::info!("Built Merkle tree with {} files", new_merkle.file_count());
+
+        // An empty BM25 index under an existing snapshot is a new BM25 schema
+        // version (its own directory) or a rebuild that died before its
+        // commit. A `UnifiedIndexer` refills it from the vector store when it
+        // comes up, but a tick without file changes never creates one, and
+        // the index would stay empty until some file changed — so it is
+        // refilled here, without the indexer and its embedding session.
+        if old_merkle.is_some()
+            && self.indexer.is_none()
+            && TantivyAdapter::is_empty_at(&self.config.tantivy_path)?
+        {
+            rebuild_bm25_from_existing_store(
+                &self.config.cache_path,
+                &self.config.tantivy_path,
+                &self.config.collection_name,
+                self.config.vector_size,
+                &self.config.embedder_identity,
+                self.config.codebase_loc,
+            )
+            .await?;
+        }
 
         // Step 3: Determine indexing strategy
         let stats = if let Some(old) = old_merkle.as_ref() {

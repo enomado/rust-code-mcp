@@ -14,7 +14,7 @@ pub use traits::VectorStoreBackend;
 
 use crate::chunker::{ChunkId, CodeChunk};
 use crate::embeddings::{Embedding, EmbeddingBackend};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -155,6 +155,24 @@ impl VectorStore {
         limit: usize,
     ) -> Result<Vec<VectorSearchResult>, VectorStoreError> {
         self.backend.search(query_vector, limit).await
+    }
+
+    /// The stored chunks of `chunk_ids` — see
+    /// [`VectorStoreBackend::chunks_by_ids`].
+    pub async fn chunks_by_ids(
+        &self,
+        chunk_ids: &[ChunkId],
+    ) -> Result<HashMap<ChunkId, CodeChunk>, VectorStoreError> {
+        self.backend.chunks_by_ids(chunk_ids).await
+    }
+
+    /// Every stored chunk, batch by batch — see
+    /// [`VectorStoreBackend::scan_chunks`].
+    pub async fn scan_chunks(
+        &self,
+        sink: &mut (dyn FnMut(Vec<CodeChunk>) -> anyhow::Result<()> + Send),
+    ) -> anyhow::Result<usize> {
+        self.backend.scan_chunks(sink).await
     }
 
     /// Delete chunks by their IDs

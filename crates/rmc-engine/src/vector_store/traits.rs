@@ -3,7 +3,7 @@
 //! Defines the interface that all vector storage backends must implement.
 
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use super::VectorSearchResult;
 use super::VectorStoreMaintenance;
@@ -29,6 +29,27 @@ pub trait VectorStoreBackend: Send + Sync {
         query_vector: Embedding,
         limit: usize,
     ) -> Result<Vec<VectorSearchResult>, VectorStoreError>;
+
+    /// The stored chunks of `chunk_ids`, keyed by id.
+    ///
+    /// An id the store does not hold is simply absent from the map: the
+    /// BM25 index and the store are written one after the other, so an id
+    /// one of them knows and the other does not is a normal moment between
+    /// two writes, and the caller decides what it means.
+    async fn chunks_by_ids(
+        &self,
+        chunk_ids: &[ChunkId],
+    ) -> Result<HashMap<ChunkId, CodeChunk>, VectorStoreError>;
+
+    /// Every stored chunk, handed to `sink` one record batch at a time.
+    ///
+    /// For rebuilding what is derived from the chunks (the BM25 index)
+    /// without holding the whole collection in memory. Returns the number of
+    /// chunks passed to `sink`; stops at the first error, from either side.
+    async fn scan_chunks(
+        &self,
+        sink: &mut (dyn FnMut(Vec<CodeChunk>) -> anyhow::Result<()> + Send),
+    ) -> anyhow::Result<usize>;
 
     /// Delete chunks by their IDs
     async fn delete_chunks(&self, chunk_ids: Vec<ChunkId>) -> Result<(), VectorStoreError>;

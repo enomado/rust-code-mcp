@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use rmc_engine::embeddings::EmbeddingBackend;
+use rmc_engine::schema::bm25_index_dir;
 use sha2::{Digest, Sha256};
 
 use crate::indexing::identity::{
@@ -60,7 +61,7 @@ impl IndexingProjectPaths {
         Self {
             cache_path: data_root.join("cache").join(&dir_hash),
             metadata_cache_salt: metadata_cache_salt(backend, &chunking_identity),
-            tantivy_path: data_root.join("index").join(&dir_hash),
+            tantivy_path: bm25_index_dir(&data_root.join("index").join(&dir_hash)),
             vector_path: data_root.join("cache").join("vectors").join(&collection_name),
             collection_name,
             snapshot_path,
@@ -102,7 +103,7 @@ impl IndexingProjectPaths {
         Self {
             cache_path: data_root.join("cache").join(&dir_hash),
             metadata_cache_salt: metadata_cache_salt(backend, &chunking_identity),
-            tantivy_path: data_root.join("index").join(&dir_hash),
+            tantivy_path: bm25_index_dir(&data_root.join("index").join(&dir_hash)),
             vector_path: vectors_root.join(&collection_name),
             collection_name,
             snapshot_path,
@@ -326,7 +327,7 @@ mod tests {
         );
         assert_eq!(
             paths.tantivy_path,
-            data_root.path().join("index").join(&paths.dir_hash)
+            bm25_index_dir(&data_root.path().join("index").join(&paths.dir_hash))
         );
         assert_eq!(
             paths.vector_path,
@@ -370,7 +371,7 @@ mod tests {
         );
         assert_eq!(
             paths.tantivy_path,
-            data_root.path().join("index").join(&paths.dir_hash)
+            bm25_index_dir(&data_root.path().join("index").join(&paths.dir_hash))
         );
     }
 
