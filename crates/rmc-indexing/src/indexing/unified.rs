@@ -14,8 +14,8 @@ use crate::indexing::unified_parallel::{
 use crate::metrics::IndexingMetrics;
 use anyhow::{Context, Result};
 use rmc_config::config::IndexerConfig;
-use rmc_engine::chunker::{ChunkId, CodeChunk};
-use rmc_engine::embeddings::{EmbeddingBackend, EmbeddingGenerator};
+use rmc_engine::chunker::CodeChunk;
+use rmc_engine::embeddings::{Embedding, EmbeddingBackend, EmbeddingGenerator};
 use rmc_engine::search::Bm25Search;
 use rmc_engine::vector_store::VectorStore;
 use std::path::{Path, PathBuf};
@@ -71,6 +71,27 @@ pub enum IndexFileResult {
     /// File was unchanged, no reindexing needed
     Unchanged,
     /// File was skipped (error or no chunks)
+    Skipped,
+}
+
+/// A file read, chunked and embedded, and not written anywhere yet — see
+/// [`UnifiedIndexer::prepare_file`] and [`UnifiedIndexer::write_files`].
+pub(crate) struct PreparedFile {
+    pub(crate) path: PathBuf,
+    /// The text the chunks were cut from: the metadata cache records its
+    /// hash once the chunks are in the store.
+    pub(crate) content: String,
+    pub(crate) chunks: Vec<CodeChunk>,
+    /// One per chunk, in chunk order.
+    pub(crate) embeddings: Vec<Embedding>,
+}
+
+/// What [`UnifiedIndexer::prepare_file`] made of a file.
+pub(crate) enum Preparation {
+    Ready(PreparedFile),
+    /// The metadata cache says the stores already hold this content.
+    Unchanged,
+    /// Not a file this indexer processes.
     Skipped,
 }
 
@@ -377,19 +398,44 @@ impl UnifiedIndexer {
         file_path: &Path,
         consult_metadata_cache: bool,
     ) -> Result<IndexFileResult> {
+        let file = match self.prepare_file(file_path, consult_metadata_cache).await? {
+            Preparation::Ready(file) => file,
+            Preparation::Unchanged => return Ok(IndexFileResult::Unchanged),
+            Preparation::Skipped => return Ok(IndexFileResult::Skipped),
+        };
+        let chunks_count = file.chunks.len();
+        self.write_files(vec![file], &[]).await?;
+        Ok(if chunks_count == 0 {
+            IndexFileResult::Skipped
+        } else {
+            IndexFileResult::Indexed { chunks_count }
+        })
+    }
+
+    /// Read, chunk and embed one file, writing nothing.
+    ///
+    /// The expensive half of indexing a file, split from the write so that a
+    /// sync can prepare every changed file first and then write them all in
+    /// one go ([`Self::write_files`]). A file with no chunks is still
+    /// `Ready`: writing it removes the chunks it used to have.
+    pub(crate) async fn prepare_file(
+        &mut self,
+        file_path: &Path,
+        consult_metadata_cache: bool,
+    ) -> Result<Preparation> {
         ensure_index_disk_headroom(&self.storage_root)?;
         let file_start = Instant::now();
 
         // Check if file should be processed
         if !self.core.should_process_file(file_path)? {
-            return Ok(IndexFileResult::Skipped);
+            return Ok(Preparation::Skipped);
         }
 
         // Fast stat-based change detection (avoids reading file content)
         if consult_metadata_cache {
             if !self.core.has_stat_changed(file_path)? {
                 tracing::debug!("File unchanged (stat): {}", file_path.display());
-                return Ok(IndexFileResult::Unchanged);
+                return Ok(Preparation::Unchanged);
             }
         }
 
@@ -400,69 +446,108 @@ impl UnifiedIndexer {
         // Content hash check (confirms stat-based detection)
         if consult_metadata_cache && !self.core.has_file_changed(file_path, &content)? {
             tracing::debug!("File unchanged (hash): {}", file_path.display());
-            return Ok(IndexFileResult::Unchanged);
+            return Ok(Preparation::Unchanged);
         }
-
-        tracing::debug!("Indexing changed file: {}", file_path.display());
 
         // Process file (parse and chunk)
         let processed = self.core.process_file_sync(file_path)?;
-
-        // A file indexed through the metadata cache may already have chunks in
-        // both stores: the cache only says the file changed (or was never seen
-        // by THIS cache — after a wipe it has seen nothing), not that the
-        // stores are empty for it. Chunk ids are random, so writing without
-        // deleting first leaves the old chunks next to the new ones for good.
-        // (`reindex_file` callers delete before calling and pass `false`.)
-        if consult_metadata_cache {
-            self.delete_file_chunks(file_path).await?;
-        }
-
         if processed.chunks.is_empty() {
             tracing::warn!("No chunks generated for {}", file_path.display());
-            return Ok(IndexFileResult::Skipped);
         }
+        let embeddings = if processed.chunks.is_empty() {
+            Vec::new()
+        } else {
+            self.core
+                .generate_embeddings_batched(&processed.chunks)
+                .await?
+        };
 
+        let file_duration = file_start.elapsed();
+        self.metrics.file_latencies.push(file_duration);
         tracing::debug!(
-            "Generated {} chunks from {}",
+            "Prepared {} chunks from {} in {:?}",
             processed.chunks.len(),
-            file_path.display()
+            file_path.display(),
+            file_duration
         );
+        Ok(Preparation::Ready(PreparedFile {
+            path: processed.path,
+            content: processed.content,
+            chunks: processed.chunks,
+            embeddings,
+        }))
+    }
 
-        // Generate embeddings
-        let embeddings = self
-            .core
-            .generate_embeddings_batched(&processed.chunks)
-            .await?;
-
-        tracing::debug!("Generated {} embeddings", embeddings.len());
-
-        // Index to both stores
-        let chunks_count = processed.chunks.len();
-        self.tantivy.index_chunks(&processed.chunks)?;
-
-        // Index to vector store
-        let chunk_data: Vec<(ChunkId, Vec<f32>, CodeChunk)> = processed
-            .chunks
-            .into_iter()
-            .zip(embeddings.into_iter())
-            .map(|(chunk, embedding)| (chunk.id, embedding, chunk))
+    /// Replace the chunks of `files` and drop those of `removed`, in both
+    /// stores: ONE delete and ONE append in the vector store, whatever the
+    /// number of files.
+    ///
+    /// Every write publishes a vector-store version, and the append a
+    /// fragment, so writing file by file made a 36-file sync publish 72
+    /// versions and 36 fragments (measured 2026-10-29) — and pay a scan of
+    /// the table for each delete. Here it is two versions and one fragment.
+    ///
+    /// The chunks of every written file are deleted first, whether or not
+    /// the caller thinks the stores hold any: chunk ids are random, so a
+    /// write without the delete leaves the old chunks beside the new ones
+    /// for good, and "the cache did not know the file" (a wipe, a renamed
+    /// cache) does not mean the stores do not.
+    ///
+    /// The metadata cache records a file only after its chunks are in the
+    /// store; a failure anywhere leaves every file here unrecorded, so the
+    /// caller retries all of them. BM25 is written in between and committed
+    /// by the caller.
+    pub(crate) async fn write_files(
+        &mut self,
+        files: Vec<PreparedFile>,
+        removed: &[PathBuf],
+    ) -> Result<()> {
+        if files.is_empty() && removed.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let paths: Vec<&Path> = removed
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(files.iter().map(|file| file.path.as_path()))
             .collect();
+        self.delete_files_chunks(&paths).await?;
+
+        let mut rows = Vec::with_capacity(files.iter().map(|file| file.chunks.len()).sum());
+        let mut written = Vec::with_capacity(files.len());
+        for file in files {
+            assert_eq!(
+                file.chunks.len(),
+                file.embeddings.len(),
+                "one embedding per chunk of {}",
+                file.path.display()
+            );
+            self.tantivy.index_chunks(&file.chunks)?;
+            let chunk_count = file.chunks.len();
+            rows.extend(
+                file.chunks
+                    .into_iter()
+                    .zip(file.embeddings)
+                    .map(|(chunk, embedding)| (chunk.id, embedding, chunk)),
+            );
+            written.push((file.path, file.content, chunk_count));
+        }
+        let row_count = rows.len();
         self.vector_store
-            .upsert_chunks(chunk_data)
+            .insert_chunks(rows)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to index chunks to vector store: {}", e))?;
 
-        // Update metadata cache
-        self.core.update_file_metadata(file_path, &content)?;
-
-        // Track metrics
-        let file_duration = file_start.elapsed();
-        self.metrics.file_latencies.push(file_duration);
+        // A file with no chunks is not recorded: the next run looks at it
+        // again, as it always has.
+        for (path, content, chunk_count) in &written {
+            if *chunk_count > 0 {
+                self.core.update_file_metadata(path, content)?;
+            }
+        }
 
         // Persistence is complete at this point. A best-effort metrics probe
-        // must not turn that success into an indexing failure: a retry of a
-        // modification deletes its chunks before consulting the metadata cache.
+        // must not turn that success into an indexing failure.
         if let Err(error) = self.core.refresh_memory_monitor() {
             tracing::warn!("Could not refresh indexing memory metrics: {error}");
         } else if let Ok(memory_used) = self.core.memory_used_bytes() {
@@ -470,13 +555,13 @@ impl UnifiedIndexer {
         }
 
         tracing::info!(
-            "✓ Indexed {} chunks from {} in {:?}",
-            chunks_count,
-            file_path.display(),
-            file_duration
+            "✓ Wrote {} file(s), {} chunks, removed {} file(s) in {:?}",
+            written.len(),
+            row_count,
+            removed.len(),
+            started.elapsed()
         );
-
-        Ok(IndexFileResult::Indexed { chunks_count })
+        Ok(())
     }
 
     /// Index an entire directory
@@ -637,7 +722,7 @@ impl UnifiedIndexer {
 
             // PHASE 2: Batch embedding for all files
             if !processed.is_empty() {
-                self.process_and_index_batch(&processed, &mut stats).await?;
+                self.process_and_index_batch(processed, &mut stats).await?;
             }
 
             // Commit after each batch
@@ -662,15 +747,21 @@ impl UnifiedIndexer {
         Ok(stats)
     }
 
-    /// Delete all chunks for a specific file from both Tantivy and vector store
-    pub async fn delete_file_chunks(&mut self, file_path: &Path) -> Result<()> {
-        self.tantivy.delete_file_chunks(file_path)?;
-        let file_path_str = file_path.to_string_lossy().to_string();
+    /// Delete all chunks of these files from both Tantivy and the vector
+    /// store — one vector-store write for all of them.
+    pub async fn delete_files_chunks(&mut self, file_paths: &[&Path]) -> Result<()> {
+        for path in file_paths {
+            self.tantivy.delete_file_chunks(path)?;
+        }
+        let paths: Vec<String> = file_paths
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
         self.vector_store
-            .delete_by_file_path(&file_path_str)
+            .delete_by_file_paths(&paths)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to delete chunks from vector store: {}", e))?;
-        tracing::debug!("Deleted chunks for file: {}", file_path.display());
+        tracing::debug!("Deleted chunks of {} file(s)", paths.len());
         Ok(())
     }
 
@@ -837,10 +928,11 @@ impl UnifiedIndexer {
 
     async fn process_and_index_batch(
         &mut self,
-        processed: &[crate::indexing::indexer_core::ProcessedFile],
+        processed: Vec<crate::indexing::indexer_core::ProcessedFile>,
         stats: &mut IndexStats,
     ) -> Result<()> {
         let embed_start = Instant::now();
+        let file_count = processed.len();
 
         // Collect all chunks from all files for batch processing
         let all_chunks: Vec<CodeChunk> = processed
@@ -869,58 +961,39 @@ impl UnifiedIndexer {
             all_embeddings.len() as f64 / embed_duration.as_secs_f64()
         );
 
-        // PHASE 3: Batched indexing (Tantivy + LanceDB)
-        // Instead of N file-by-file calls, make single batched calls to each store
+        // PHASE 3: one write for the whole batch (Tantivy + LanceDB).
         let index_start = Instant::now();
-
-        // Drop whatever the stores hold for these files first — see the same
-        // step in `index_file_impl`: random chunk ids make a write without it
-        // a second copy of the file.
-        for processed_file in processed {
-            self.delete_file_chunks(&processed_file.path).await?;
-        }
-
-        // Batch all chunks for Tantivy (single call instead of N calls)
-        tracing::debug!("Indexing {} chunks to Tantivy...", all_chunks.len());
-        self.tantivy.index_chunks(&all_chunks)?;
-
-        // Prepare all chunk data for vector store (single batch)
-        let all_chunk_data: Vec<(ChunkId, Vec<f32>, CodeChunk)> = all_chunks
+        let mut embeddings = all_embeddings.into_iter();
+        let files: Vec<PreparedFile> = processed
             .into_iter()
-            .zip(all_embeddings.into_iter())
-            .map(|(chunk, embedding)| (chunk.id, embedding, chunk))
+            .map(|file| PreparedFile {
+                embeddings: embeddings.by_ref().take(file.chunks.len()).collect(),
+                path: file.path,
+                content: file.content,
+                chunks: file.chunks,
+            })
             .collect();
-
-        // Single batched upsert to vector store (instead of N calls)
-        tracing::debug!(
-            "Upserting {} chunks to vector store...",
-            all_chunk_data.len()
+        assert!(
+            embeddings.next().is_none(),
+            "one embedding per chunk of the batch"
         );
-        self.vector_store
-            .upsert_chunks(all_chunk_data)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to batch index chunks to vector store: {}", e))?;
+        self.write_files(files, &[]).await?;
 
         let index_duration = index_start.elapsed();
         self.metrics.index_duration += index_duration;
 
-        // Update metadata for all files after successful indexing
-        for processed_file in processed {
-            self.core
-                .update_file_metadata(&processed_file.path, &processed_file.content)?;
-
-            stats.indexed_files += 1;
-            stats.total_chunks += processed_file.chunks.len();
-
-            // Track per-file latency (approximated as batch time / num files)
-            let approx_file_duration = index_duration / processed.len() as u32;
-            self.metrics.file_latencies.push(approx_file_duration);
-        }
+        stats.indexed_files += file_count;
+        stats.total_chunks += total_chunks;
+        // Per-file latency, approximated as batch time / number of files.
+        let approx_file_duration = index_duration / file_count as u32;
+        self.metrics
+            .file_latencies
+            .extend(std::iter::repeat_n(approx_file_duration, file_count));
 
         tracing::info!(
             "Indexed {} chunks ({} files) in {:.2}s ({:.1} chunks/sec)",
             total_chunks,
-            processed.len(),
+            file_count,
             index_duration.as_secs_f64(),
             total_chunks as f64 / index_duration.as_secs_f64()
         );
@@ -954,6 +1027,7 @@ impl Drop for UnifiedIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmc_engine::chunker::ChunkId;
     use tempfile::TempDir;
 
     fn stored_chunk(name: &str, file: &str) -> CodeChunk {
@@ -993,7 +1067,7 @@ mod tests {
             .map(|i| stored_chunk(&format!("symbol_{i}_unique"), &format!("src/f{}.rs", i % 7)))
             .collect();
         store
-            .upsert_chunks(
+            .insert_chunks(
                 chunks
                     .iter()
                     .map(|chunk| (chunk.id, vec![0.1, 0.2, 0.3, 0.4], chunk.clone()))

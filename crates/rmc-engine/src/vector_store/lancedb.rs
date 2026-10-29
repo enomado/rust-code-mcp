@@ -16,7 +16,7 @@ use lancedb::index::Index;
 use lancedb::index::scalar::BTreeIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::table::optimize::Duration as ChronoDuration;
-use lancedb::table::{CompactionOptions, OptimizeAction};
+use lancedb::table::{CompactionOptions, OptimizeAction, OptimizeOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -26,6 +26,7 @@ use super::VectorSearchResult;
 use super::VectorStoreMaintenance;
 use super::error::VectorStoreError;
 use super::traits::VectorStoreBackend;
+use super::{VectorIndexCoverage, VectorStoreLayout};
 use crate::chunker::{ChunkId, CodeChunk};
 use crate::embeddings::Embedding;
 
@@ -50,10 +51,21 @@ const COMPACT_TARGET_ROWS: usize = 100_000;
 
 /// How many small fragments must pile up before maintenance compacts.
 ///
-/// Each background-sync write adds one, so this is roughly "compact every
-/// eighth changed sync" instead of every one. Search reads every fragment,
-/// so the pile is not free either; eight keeps that cost small.
+/// Every `add` writes one fragment (deletes write none: they mark rows in
+/// deletion files). A changed background sync appends once, so this is
+/// "compact every eighth changed sync". It was not, while the sync wrote
+/// file by file: 36 changed files were 36 fragments and a compaction on
+/// every such sync (measured 2026-10-29). Search reads every fragment, so
+/// the pile is not free either; eight keeps that cost small.
 const COMPACT_MIN_SMALL_FRAGMENTS: usize = 8;
+
+/// The scalar indices a table is created with: the columns lookups and
+/// deletes filter on. `id` — `chunks_by_ids` and `delete_chunks`;
+/// `file_path` — the per-sync delete. Nothing filters on `symbol_kind`, and
+/// an index nothing reads is still one every maintenance pass extends, so
+/// tables that have one lose it (see `maintain`).
+const SCALAR_INDEX_COLUMNS: [&str; 2] = ["id", "file_path"];
+const DROPPED_INDEX_COLUMNS: [&str; 1] = ["symbol_kind"];
 
 fn compaction_options() -> CompactionOptions {
     CompactionOptions {
@@ -331,30 +343,22 @@ impl LanceDbBackend {
 
             tracing::info!("Created LanceDB table: {}", self.table_name);
 
-            // Create BTree indices for fast lookups
-            table
-                .create_index(&["id"], Index::BTree(BTreeIndexBuilder::default()))
-                .execute()
-                .await
-                .map_err(|e| {
-                    VectorStoreError::backend(format!("Failed to create id index: {}", e))
-                })?;
-            table
-                .create_index(&["file_path"], Index::BTree(BTreeIndexBuilder::default()))
-                .execute()
-                .await
-                .map_err(|e| {
-                    VectorStoreError::backend(format!("Failed to create file_path index: {}", e))
-                })?;
-            table
-                .create_index(&["symbol_kind"], Index::BTree(BTreeIndexBuilder::default()))
-                .execute()
-                .await
-                .map_err(|e| {
-                    VectorStoreError::backend(format!("Failed to create symbol_kind index: {}", e))
-                })?;
+            // Created on the empty table, so they cover nothing yet: lance
+            // never extends an index on write. `maintain` does, with
+            // `OptimizeAction::Index` — without that these stayed at zero
+            // indexed rows for the store's whole life (all three on a
+            // 0.93M-row store, 2026-10-29), and every lookup was a scan.
+            for column in SCALAR_INDEX_COLUMNS {
+                table
+                    .create_index(&[column], Index::BTree(BTreeIndexBuilder::default()))
+                    .execute()
+                    .await
+                    .map_err(|e| {
+                        VectorStoreError::backend(format!("Failed to create {column} index: {e}"))
+                    })?;
+            }
 
-            tracing::info!("Created BTree indices on id, file_path, symbol_kind columns");
+            tracing::info!("Created BTree indices on {:?}", SCALAR_INDEX_COLUMNS);
         }
 
         Ok(())
@@ -481,7 +485,7 @@ fn decode_chunk_rows(batch: &RecordBatch) -> Result<Vec<(ChunkId, CodeChunk)>, V
 
 #[async_trait]
 impl VectorStoreBackend for LanceDbBackend {
-    async fn upsert_chunks(
+    async fn insert_chunks(
         &self,
         chunks_with_embeddings: Vec<(ChunkId, Embedding, CodeChunk)>,
     ) -> Result<(), VectorStoreError> {
@@ -492,24 +496,17 @@ impl VectorStoreBackend for LanceDbBackend {
         let num_chunks = chunks_with_embeddings.len();
         let table = self.get_table().await?;
         let batch = self.chunks_to_batch(&chunks_with_embeddings)?;
-        let schema = batch.schema();
-        let batches: Box<dyn RecordBatchReader + Send> =
-            Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema));
 
-        // Use native merge_insert for atomic upsert (replaces delete-then-add pattern)
-        // - when_matched_update_all: update existing rows with matching id
-        // - when_not_matched_insert_all: insert new rows
-        // This is a single atomic operation vs. two separate delete + add operations
-        let mut merge_builder = table.merge_insert(&["id"]);
-        merge_builder
-            .when_matched_update_all(None)
-            .when_not_matched_insert_all();
-        merge_builder
-            .execute(batches)
+        // A plain append — the ids are fresh (see the trait). `merge_insert`
+        // keyed on `id` joined every write against the whole table to match
+        // nothing.
+        table
+            .add(batch)
+            .execute()
             .await
-            .map_err(|e| VectorStoreError::backend(format!("Failed to upsert chunks: {}", e)))?;
+            .map_err(|e| VectorStoreError::backend(format!("Failed to insert chunks: {}", e)))?;
 
-        tracing::debug!("Upserted {} chunks to LanceDB via merge_insert", num_chunks);
+        tracing::debug!("Inserted {} chunks into LanceDB", num_chunks);
         Ok(())
     }
 
@@ -682,20 +679,62 @@ impl VectorStoreBackend for LanceDbBackend {
         Ok(())
     }
 
-    async fn delete_by_file_path(&self, file_path: &str) -> Result<(), VectorStoreError> {
+    async fn delete_by_file_paths(&self, file_paths: &[String]) -> Result<(), VectorStoreError> {
+        if file_paths.is_empty() {
+            return Ok(());
+        }
         let table = self.get_table().await?;
 
-        // Escape single quotes in file path
-        let escaped_path = file_path.replace('\'', "''");
-        let filter = format!("file_path = '{}'", escaped_path);
+        // SQL string literals: a single quote is escaped by doubling it.
+        let literals: Vec<String> = file_paths
+            .iter()
+            .map(|path| format!("'{}'", path.replace('\'', "''")))
+            .collect();
+        let filter = format!("file_path IN ({})", literals.join(", "));
 
         table
             .delete(&filter)
             .await
             .map_err(|e| VectorStoreError::backend(format!("Failed to delete by path: {}", e)))?;
 
-        tracing::debug!("Deleted chunks for file: {}", file_path);
+        tracing::debug!("Deleted chunks of {} file(s)", file_paths.len());
         Ok(())
+    }
+
+    async fn layout(&self) -> Result<VectorStoreLayout, VectorStoreError> {
+        let table = self.get_table().await?;
+        let backend = |what: &str, e: lancedb::Error| {
+            VectorStoreError::backend(format!("Failed to read {what}: {e}"))
+        };
+        let version = table
+            .version()
+            .await
+            .map_err(|e| backend("table version", e))?;
+        let stats = table.stats().await.map_err(|e| backend("table stats", e))?;
+        let mut indices = Vec::new();
+        for config in table.list_indices().await.map_err(|e| backend("indices", e))? {
+            // `None`: the index was dropped since the listing — `maintain`
+            // of another daemon on the same table can do that. Gone is gone.
+            let Some(coverage) = table
+                .index_stats(&config.name)
+                .await
+                .map_err(|e| backend("index stats", e))?
+            else {
+                continue;
+            };
+            indices.push(VectorIndexCoverage {
+                name: config.name,
+                columns: config.columns,
+                indexed_rows: coverage.num_indexed_rows,
+                unindexed_rows: coverage.num_unindexed_rows,
+            });
+        }
+        Ok(VectorStoreLayout {
+            version,
+            fragments: stats.fragment_stats.num_fragments,
+            rows: stats.num_rows,
+            indices,
+        })
     }
 
     async fn count(&self) -> Result<usize, VectorStoreError> {
@@ -769,6 +808,25 @@ impl VectorStoreBackend for LanceDbBackend {
     ) -> Result<VectorStoreMaintenance, VectorStoreError> {
         let table = self.get_table().await?;
 
+        // Indices nothing reads. Dropped here rather than left in place:
+        // the index pass below would otherwise extend them every time.
+        let indices = table
+            .list_indices()
+            .await
+            .map_err(|e| VectorStoreError::backend(format!("Failed to list indices: {}", e)))?;
+        for config in indices {
+            if config
+                .columns
+                .iter()
+                .any(|column| DROPPED_INDEX_COLUMNS.contains(&column.as_str()))
+            {
+                table.drop_index(&config.name).await.map_err(|e| {
+                    VectorStoreError::backend(format!("Failed to drop index {}: {}", config.name, e))
+                })?;
+                tracing::info!("Dropped unused vector-store index {}", config.name);
+            }
+        }
+
         // Compact only once enough small fragments piled up. Every write of
         // the background sync appends one small fragment, so compacting on
         // every pass means compacting every five minutes — and with lance's
@@ -802,6 +860,21 @@ impl VectorStoreBackend for LanceDbBackend {
         } else {
             None
         };
+
+        // Extend every index over the rows written since the last pass.
+        // After compaction, which moves rows and remaps the indices to their
+        // new addresses: indexing first would index rows about to move.
+        // Lance does not do this on write, so without it an index covers
+        // what existed when it was created — for ours, an empty table — and
+        // every delete by `file_path` and lookup by `id` scans the column.
+        // Measured on a 0.93M-row copy (2026-10-29): the pass takes 0.7 s;
+        // the per-file delete drops from 20 to 5 ms.
+        table
+            .optimize(OptimizeAction::Index(OptimizeOptions::default()))
+            .await
+            .map_err(|e| {
+                VectorStoreError::backend(format!("Failed to update vector-store indices: {}", e))
+            })?;
 
         // `older_than` is the load-bearing argument, and it must be passed:
         // lance defaults it to SEVEN DAYS, and on a store written every few
@@ -971,7 +1044,7 @@ mod tests {
         let embedding = vec![0.1, 0.2, 0.3, 0.4];
 
         backend
-            .upsert_chunks(vec![(chunk_id, embedding, chunk)])
+            .insert_chunks(vec![(chunk_id, embedding, chunk)])
             .await
             .unwrap();
 
@@ -991,7 +1064,7 @@ mod tests {
         let embedding = vec![0.1, 0.2, 0.3, 0.4];
 
         backend
-            .upsert_chunks(vec![(chunk_id, embedding, chunk)])
+            .insert_chunks(vec![(chunk_id, embedding, chunk)])
             .await
             .unwrap();
 
@@ -1016,7 +1089,7 @@ mod tests {
         let chunk2 = create_test_chunk(chunk2_id, "fn test2() {}", "file2.rs");
 
         backend
-            .upsert_chunks(vec![
+            .insert_chunks(vec![
                 (chunk1_id, vec![0.1, 0.2, 0.3, 0.4], chunk1),
                 (chunk2_id, vec![0.5, 0.6, 0.7, 0.8], chunk2),
             ])
@@ -1025,9 +1098,96 @@ mod tests {
 
         assert_eq!(backend.count().await.unwrap(), 2);
 
-        backend.delete_by_file_path("file1.rs").await.unwrap();
+        backend
+            .delete_by_file_paths(&["file1.rs".to_string()])
+            .await
+            .unwrap();
 
         assert_eq!(backend.count().await.unwrap(), 1);
+    }
+
+    /// Several files go in ONE write — one version — and a quote in a path
+    /// is a literal, not the end of the string. An empty list writes nothing.
+    #[tokio::test]
+    async fn deleting_several_files_is_one_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LanceDbBackend::new(temp_dir.path().to_path_buf(), 4, "test-embedder:v1")
+            .await
+            .unwrap();
+        let files = ["a.rs", "b's.rs", "c.rs", "kept.rs"];
+        let rows = files
+            .iter()
+            .map(|file| {
+                let id = ChunkId::new();
+                (id, vec![0.1, 0.2, 0.3, 0.4], create_test_chunk(id, "fn f() {}", file))
+            })
+            .collect();
+        backend.insert_chunks(rows).await.unwrap();
+
+        let before = backend.layout().await.unwrap().version;
+        backend.delete_by_file_paths(&[]).await.unwrap();
+        assert_eq!(backend.layout().await.unwrap().version, before);
+
+        let gone: Vec<String> = files[..3].iter().map(|f| f.to_string()).collect();
+        backend.delete_by_file_paths(&gone).await.unwrap();
+        assert_eq!(backend.layout().await.unwrap().version, before + 1);
+        assert_eq!(
+            backend.indexed_file_paths().await.unwrap(),
+            HashSet::from(["kept.rs".to_string()])
+        );
+    }
+
+    /// The oracle for the index pass in `maintain`: indices created on the
+    /// empty table end up covering every row, and the unused `symbol_kind`
+    /// index of a table created before it was dropped is gone. The mutant
+    /// (no `OptimizeAction::Index`) leaves `id` and `file_path` covering 0.
+    #[tokio::test]
+    async fn maintain_extends_the_indices_over_every_row() {
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LanceDbBackend::new(temp_dir.path().to_path_buf(), 4, "test-embedder:v1")
+            .await
+            .unwrap();
+        // A table as older builds created it.
+        backend
+            .get_table()
+            .await
+            .unwrap()
+            .create_index(&["symbol_kind"], Index::BTree(BTreeIndexBuilder::default()))
+            .execute()
+            .await
+            .unwrap();
+        for i in 0..3 {
+            let rows = (0..20)
+                .map(|j| {
+                    let id = ChunkId::new();
+                    let chunk = create_test_chunk(id, "fn f() {}", &format!("f{i}_{j}.rs"));
+                    (id, vec![0.1, 0.2, 0.3, j as f32], chunk)
+                })
+                .collect();
+            backend.insert_chunks(rows).await.unwrap();
+        }
+        let before = backend.layout().await.unwrap();
+        assert!(
+            before.indices.iter().all(|index| index.indexed_rows == 0),
+            "{before:#?}"
+        );
+
+        backend.maintain(std::time::Duration::from_secs(3600)).await.unwrap();
+
+        let after = backend.layout().await.unwrap();
+        assert_eq!(after.rows, 60);
+        let mut columns: Vec<&str> = after
+            .indices
+            .iter()
+            .flat_map(|index| index.columns.iter().map(String::as_str))
+            .collect();
+        columns.sort();
+        let mut expected = SCALAR_INDEX_COLUMNS.to_vec();
+        expected.sort();
+        assert_eq!(columns, expected, "{after:#?}");
+        for index in &after.indices {
+            assert_eq!((index.indexed_rows, index.unindexed_rows), (60, 0), "{index:#?}");
+        }
     }
 
     #[tokio::test]
@@ -1042,7 +1202,7 @@ mod tests {
         let embedding = vec![0.1, 0.2, 0.3, 0.4];
 
         backend
-            .upsert_chunks(vec![(chunk_id, embedding, chunk)])
+            .insert_chunks(vec![(chunk_id, embedding, chunk)])
             .await
             .unwrap();
 
@@ -1073,7 +1233,7 @@ mod tests {
             let id = ChunkId::new();
             let chunk = create_test_chunk(id, "fn test() {}", &format!("f{}.rs", i));
             backend
-                .upsert_chunks(vec![(id, vec![0.1, 0.2, 0.3, i as f32], chunk)])
+                .insert_chunks(vec![(id, vec![0.1, 0.2, 0.3, i as f32], chunk)])
                 .await
                 .unwrap();
         }
@@ -1180,7 +1340,7 @@ mod tests {
                     create_test_chunk(id, "fn probe() {}", &format!("probe_{round}_{i}.rs"));
                 batch.push((id, vec![0.01 * i as f32; 384], chunk));
             }
-            backend.upsert_chunks(batch).await.unwrap();
+            backend.insert_chunks(batch).await.unwrap();
             let (before, _) = rss_and_peak_mib();
             let started = std::time::Instant::now();
             let stats = backend

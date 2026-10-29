@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use std::collections::{HashMap, HashSet};
 
 use super::VectorSearchResult;
+use super::VectorStoreLayout;
 use super::VectorStoreMaintenance;
 use super::error::VectorStoreError;
 use crate::chunker::{ChunkId, CodeChunk};
@@ -17,8 +18,15 @@ use crate::embeddings::Embedding;
 /// All operations are async to support both embedded and remote backends.
 #[async_trait]
 pub trait VectorStoreBackend: Send + Sync {
-    /// Insert or update chunks with their embeddings
-    async fn upsert_chunks(
+    /// Append chunks with their embeddings, as one write.
+    ///
+    /// An append, not an upsert: the ids must not be in the store already.
+    /// They never are — `ChunkId` is a fresh random UUID per chunking — and
+    /// replacing a file's chunks is a delete by file path followed by this.
+    /// An upsert keyed on such ids only ever paid for a join that matched
+    /// nothing (60 ms per file against 4 for an append, measured 2026-10-29
+    /// on a 0.93M-row store).
+    async fn insert_chunks(
         &self,
         chunks_with_embeddings: Vec<(ChunkId, Embedding, CodeChunk)>,
     ) -> Result<(), VectorStoreError>;
@@ -54,8 +62,16 @@ pub trait VectorStoreBackend: Send + Sync {
     /// Delete chunks by their IDs
     async fn delete_chunks(&self, chunk_ids: Vec<ChunkId>) -> Result<(), VectorStoreError>;
 
-    /// Delete all chunks from a specific file path
-    async fn delete_by_file_path(&self, file_path: &str) -> Result<(), VectorStoreError>;
+    /// Delete all chunks of these files as ONE write; an empty slice is no
+    /// write at all.
+    ///
+    /// One write per sync instead of one per file: each write publishes a
+    /// dataset version, and a per-file delete made a 36-file sync publish 36
+    /// of them only for deletions.
+    async fn delete_by_file_paths(&self, file_paths: &[String]) -> Result<(), VectorStoreError>;
+
+    /// Version, fragments and index coverage of the table.
+    async fn layout(&self) -> Result<VectorStoreLayout, VectorStoreError>;
 
     /// Get the total number of vectors in the store
     async fn count(&self) -> Result<usize, VectorStoreError>;
@@ -80,6 +96,10 @@ pub trait VectorStoreBackend: Send + Sync {
     /// unreferenced once its rows have been rewritten elsewhere — so it is
     /// a separate pass, and without it on-disk size grows without bound
     /// against a row count that does not.
+    ///
+    /// The same pass extends the table's indices over the rows written
+    /// since the last one: lance never does that on write, so an index that
+    /// is not extended here covers only what existed when it was created.
     ///
     /// `prune_keep` is the age below which versions are left alone: it is
     /// the margin for a reader that opened the table before this pass

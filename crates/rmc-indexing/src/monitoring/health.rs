@@ -780,9 +780,9 @@ mod tests {
             overlap_next: None,
         };
         store
-            .upsert_chunks(vec![(chunk.id, vec![0.1, 0.2, 0.3, 0.4], chunk.clone())])
+            .insert_chunks(vec![(chunk.id, vec![0.1, 0.2, 0.3, 0.4], chunk.clone())])
             .await
-            .expect("upsert");
+            .expect("insert");
 
         let cache_path = temp.path().join("cache");
         let cache = MetadataCache::new(&cache_path).expect("cache");

@@ -38,6 +38,32 @@ pub struct VectorStoreMaintenance {
     pub bytes_removed: u64,
 }
 
+/// How the store's table is laid out on disk right now — the numbers the
+/// write path is supposed to keep small.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VectorStoreLayout {
+    /// Current dataset version: every write (add, delete, compaction,
+    /// index optimisation) publishes one.
+    pub version: u64,
+    /// Data fragments in the current version. Every `add` writes one.
+    pub fragments: usize,
+    /// Rows in the current version.
+    pub rows: usize,
+    /// Every index on the table.
+    pub indices: Vec<VectorIndexCoverage>,
+}
+
+/// One index and how much of the table it actually covers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct VectorIndexCoverage {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub indexed_rows: usize,
+    /// Rows a lookup through this index still has to scan for. An index
+    /// that covers nothing is a full scan with extra steps.
+    pub unindexed_rows: usize,
+}
+
 /// A search result from vector search
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorSearchResult {
@@ -140,12 +166,13 @@ impl VectorStore {
 
     // Delegate all methods to backend
 
-    /// Insert or update chunks with their embeddings
-    pub async fn upsert_chunks(
+    /// Append chunks with their embeddings — see
+    /// [`VectorStoreBackend::insert_chunks`] for the contract on ids.
+    pub async fn insert_chunks(
         &self,
         chunks_with_embeddings: Vec<(ChunkId, Embedding, CodeChunk)>,
     ) -> Result<(), VectorStoreError> {
-        self.backend.upsert_chunks(chunks_with_embeddings).await
+        self.backend.insert_chunks(chunks_with_embeddings).await
     }
 
     /// Search for similar chunks using a query vector
@@ -180,9 +207,19 @@ impl VectorStore {
         self.backend.delete_chunks(chunk_ids).await
     }
 
-    /// Delete all chunks from a specific file path
-    pub async fn delete_by_file_path(&self, file_path: &str) -> Result<(), VectorStoreError> {
-        self.backend.delete_by_file_path(file_path).await
+    /// Delete all chunks of these files, in one write — see
+    /// [`VectorStoreBackend::delete_by_file_paths`].
+    pub async fn delete_by_file_paths(
+        &self,
+        file_paths: &[String],
+    ) -> Result<(), VectorStoreError> {
+        self.backend.delete_by_file_paths(file_paths).await
+    }
+
+    /// Version, fragments and index coverage of the table — see
+    /// [`VectorStoreBackend::layout`].
+    pub async fn layout(&self) -> Result<VectorStoreLayout, VectorStoreError> {
+        self.backend.layout().await
     }
 
     /// Get the total number of vectors in the store
@@ -268,7 +305,7 @@ mod tests {
         let embedding = vec![0.1, 0.2, 0.3, 0.4];
 
         store
-            .upsert_chunks(vec![(chunk_id, embedding.clone(), chunk)])
+            .insert_chunks(vec![(chunk_id, embedding.clone(), chunk)])
             .await
             .unwrap();
 

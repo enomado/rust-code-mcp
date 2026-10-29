@@ -66,6 +66,7 @@ embeddings-directml = [
 ]
 vector-store = [
   "embeddings",
+  "dep:anyhow",
   "dep:lancedb",
   "dep:arrow-array",
   "dep:arrow-schema",

@@ -15,13 +15,98 @@ use crate::indexing::identity::{
 use crate::indexing::merkle::{ChangeSet, FileSystemMerkle};
 use crate::indexing::tantivy_adapter::TantivyAdapter;
 use crate::indexing::unified::{
-    IndexFileResult, IndexStats, UnifiedIndexer, ensure_index_disk_headroom,
+    IndexStats, Preparation, PreparedFile, UnifiedIndexer, ensure_index_disk_headroom,
     rebuild_bm25_from_existing_store,
 };
 use anyhow::Result;
 use rmc_engine::embeddings::EmbeddingBackend;
 use std::path::{Path, PathBuf};
 use tracing;
+
+/// Prepared rows a sync holds before writing them out.
+///
+/// A memory bound, not a tuning knob: an ordinary sync (tens of files, a few
+/// thousand rows) is far below it and writes once. A branch switch that
+/// changes thousands of files would otherwise hold every vector and chunk of
+/// the tree at once; at roughly 4 KB a row (vector plus chunk JSON) this
+/// caps the pending batch near 80 MB, and costs one more delete+append pair
+/// per 20 000 rows.
+const WRITE_BATCH_ROWS: usize = 20_000;
+
+/// The writes a sync has prepared and not yet made.
+#[derive(Default)]
+struct PendingWrite {
+    files: Vec<PreparedFile>,
+    rows: usize,
+    /// Files gone from the tree: their chunks and their cache entry go.
+    gone: Vec<PathBuf>,
+    /// Modified files the indexer no longer processes: their chunks go.
+    cleared: Vec<PathBuf>,
+}
+
+impl PendingWrite {
+    /// Write everything pending in one [`UnifiedIndexer::write_files`] and
+    /// account for it. On failure every file of the write goes to the retry
+    /// list: nothing of it was recorded, so the next tick redoes all of it.
+    async fn flush(&mut self, indexer: &mut UnifiedIndexer, stats: &mut IndexStats) {
+        let pending = std::mem::take(self);
+        let written: Vec<(PathBuf, usize)> = pending
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.chunks.len()))
+            .collect();
+        let removed: Vec<PathBuf> = pending
+            .gone
+            .iter()
+            .chain(&pending.cleared)
+            .cloned()
+            .collect();
+
+        if let Err(error) = indexer.write_files(pending.files, &removed).await {
+            tracing::warn!(
+                "Failed to write {} file(s) and remove {} (will retry): {}",
+                written.len(),
+                removed.len(),
+                error
+            );
+            for path in written.into_iter().map(|(path, _)| path).chain(removed) {
+                stats.failed_files += 1;
+                stats.retry_files.push(path);
+            }
+            return;
+        }
+
+        stats.skipped_files += pending.cleared.len();
+        for (_, chunks) in written {
+            if chunks == 0 {
+                stats.skipped_files += 1;
+            } else {
+                stats.indexed_files += 1;
+                stats.total_chunks += chunks;
+            }
+        }
+        for path in pending.gone {
+            // The metadata cache has to forget it too, or the entry outlives
+            // the file forever: `monitoring::health` compares cache entries
+            // against vectors in the store, so a ghost entry for a file that
+            // no longer exists reads as "indexed but missing vectors" and
+            // holds coverage at `degraded` permanently. Measured on the live
+            // index of a large workspace (2026-08-25): 38 of 39 `stale_skips`
+            // were renamed-away files, not lost vectors.
+            if let Err(error) = indexer.forget_file(&path) {
+                tracing::warn!(
+                    "Failed to forget metadata for {} (will retry): {}",
+                    path.display(),
+                    error
+                );
+                stats.failed_files += 1;
+                stats.retry_files.push(path);
+                continue;
+            }
+            stats.skipped_files += 1;
+        }
+    }
+}
 
 /// Get snapshot storage path for a codebase with the default backend.
 ///
@@ -319,87 +404,52 @@ impl IncrementalIndexer {
             deleted_count
         ));
 
-        // Handle deletions
+        // Prepare every changed file first, then write them together: one
+        // vector-store delete and one append per sync instead of two writes
+        // per file (see `UnifiedIndexer::write_files`). Removed files ride
+        // along in the same delete.
+        ensure_index_disk_headroom(&storage_path)?;
+        let mut pending = PendingWrite {
+            gone: changes.deleted.clone(),
+            ..PendingWrite::default()
+        };
         for deleted_path in &changes.deleted {
-            ensure_index_disk_headroom(&storage_path)?;
             tracing::info!(
-                "Deleting chunks for removed file: {}",
+                "Removing chunks of deleted file: {}",
                 deleted_path.display()
             );
-            if let Err(error) = indexer.delete_file_chunks(deleted_path).await {
-                stats.failed_files += 1;
-                stats.retry_files.push(deleted_path.clone());
-                tracing::warn!(
-                    "Failed to delete {} from the index (will retry): {}",
-                    deleted_path.display(),
-                    error
-                );
-                continue;
-            }
-
-            // The metadata cache has to forget it too, or the entry outlives
-            // the file forever: `monitoring::health` compares cache entries
-            // against vectors in the store, so a ghost entry for a file that
-            // no longer exists reads as "indexed but missing vectors" and
-            // holds coverage at `degraded` permanently. Measured on the live
-            // index of a large workspace (2026-08-25): 38 of 39 `stale_skips` were
-            // renamed-away files, not lost vectors.
-            if let Err(error) = indexer.forget_file(deleted_path) {
-                stats.failed_files += 1;
-                stats.retry_files.push(deleted_path.clone());
-                tracing::warn!(
-                    "Failed to forget metadata for {} (will retry): {}",
-                    deleted_path.display(),
-                    error
-                );
-                continue;
-            }
-
-            stats.skipped_files += 1;
         }
 
-        // Handle modifications (delete old + reindex)
-        for modified_path in &changes.modified {
-            tracing::info!("Reindexing modified file: {}", modified_path.display());
-            // Delete old chunks first
-            if let Err(error) = indexer.delete_file_chunks(modified_path).await {
-                stats.failed_files += 1;
-                stats.retry_files.push(modified_path.clone());
-                tracing::warn!(
-                    "Failed to clear old chunks for {} (will retry): {}",
-                    modified_path.display(),
-                    error
-                );
-                continue;
+        // Modified files are prepared without the metadata cache: the Merkle
+        // tree proved they changed, and a cache already describing the new
+        // bytes (a run that wrote them but died before its snapshot) must not
+        // turn the rewrite into a skip. Added files consult it.
+        let to_prepare = changes
+            .modified
+            .iter()
+            .map(|path| (path, false))
+            .chain(changes.added.iter().map(|path| (path, true)));
+        for (path, consult_metadata_cache) in to_prepare {
+            tracing::info!("Indexing changed file: {}", path.display());
+            match indexer.prepare_file(path, consult_metadata_cache).await {
+                Ok(Preparation::Ready(file)) => {
+                    pending.rows += file.chunks.len();
+                    pending.files.push(file);
+                }
+                // A modified file this indexer no longer processes keeps no
+                // chunks; an added one never had any to drop.
+                Ok(Preparation::Skipped) if !consult_metadata_cache => {
+                    pending.cleared.push(path.clone());
+                }
+                Ok(Preparation::Skipped | Preparation::Unchanged) => stats.skipped_files += 1,
+                // Its old chunks stay until the retry: stale results beat none.
+                Err(e) => stats.record_error(path, &e),
             }
-
-            match indexer.reindex_file(modified_path).await {
-                Ok(IndexFileResult::Indexed { chunks_count }) => {
-                    stats.indexed_files += 1;
-                    stats.total_chunks += chunks_count;
-                }
-                Ok(_) => stats.skipped_files += 1,
-                Err(e) => {
-                    stats.record_error(modified_path, &e);
-                }
-            }
-        }
-
-        // Handle additions
-        for added_path in &changes.added {
-            tracing::info!("Indexing new file: {}", added_path.display());
-
-            match indexer.index_file(added_path).await {
-                Ok(IndexFileResult::Indexed { chunks_count }) => {
-                    stats.indexed_files += 1;
-                    stats.total_chunks += chunks_count;
-                }
-                Ok(_) => stats.skipped_files += 1,
-                Err(e) => {
-                    stats.record_error(added_path, &e);
-                }
+            if pending.rows >= WRITE_BATCH_ROWS {
+                pending.flush(indexer, &mut stats).await;
             }
         }
+        pending.flush(indexer, &mut stats).await;
 
         // Commit changes to Tantivy
         indexer.commit()?;
@@ -531,6 +581,100 @@ mod tests {
         assert_eq!(stats.unchanged_files, 1);
         assert_eq!(stats.indexed_files, 0);
         assert!(indexer.indexer().is_err());
+
+        let _ = std::fs::remove_file(snapshot_path);
+    }
+
+    /// The write shape of one background sync: three files modified, one
+    /// added, one deleted. All of it lands as ONE append — one new fragment;
+    /// the per-file writes this replaced made four (one per written file).
+    /// Then the stores agree with the tree (no second copy of a rewritten
+    /// file, nothing left of the deleted one, BM25 and vectors the same
+    /// size), and maintenance left every index covering every row.
+    #[tokio::test]
+    #[ignore] // Requires the CPU embedding model files
+    async fn a_sync_writes_its_files_as_one_append_and_keeps_the_indices_covering() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_path = temp_dir.path().join("cache");
+        let tantivy_path = temp_dir.path().join("tantivy");
+        let codebase = temp_dir.path().join("codebase");
+        std::fs::create_dir(&codebase).unwrap();
+        let write = |name: &str, generation: usize| {
+            std::fs::write(
+                codebase.join(name),
+                format!(
+                    "pub fn {}_a() {{ {generation} }}\n\npub fn {}_b() {{}}\n",
+                    &name[..2],
+                    &name[..2]
+                ),
+            )
+            .unwrap();
+        };
+        for name in ["f0.rs", "f1.rs", "f2.rs", "f3.rs", "f4.rs"] {
+            write(name, 0);
+        }
+
+        let backend = EmbeddingBackend::from_profile_name("local-cpu-small").unwrap();
+        let snapshot_path = get_snapshot_path_for_backend(&codebase, &backend);
+        let mut indexer = IncrementalIndexer::with_backend(
+            &cache_path,
+            &tantivy_path,
+            "sync_write_shape",
+            backend.dim(),
+            &backend.identity(),
+            None,
+            backend,
+        )
+        .await
+        .unwrap();
+        indexer
+            .index_with_change_detection(&codebase)
+            .await
+            .unwrap();
+        let store = indexer.indexer().unwrap().vector_store_cloned();
+        let before = store.layout().await.unwrap();
+
+        for name in ["f0.rs", "f1.rs", "f2.rs"] {
+            write(name, 1);
+        }
+        write("f5.rs", 0);
+        std::fs::remove_file(codebase.join("f4.rs")).unwrap();
+        let stats = indexer
+            .index_with_change_detection(&codebase)
+            .await
+            .unwrap();
+        assert_eq!(
+            (stats.indexed_files, stats.failed_files),
+            (4, 0),
+            "{stats:?}"
+        );
+
+        let after = store.layout().await.unwrap();
+        assert_eq!(
+            after.fragments,
+            before.fragments + 1,
+            "{before:#?}\n{after:#?}"
+        );
+        let files: std::collections::BTreeSet<String> = store
+            .indexed_file_paths()
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        let expected: std::collections::BTreeSet<String> =
+            ["f0.rs", "f1.rs", "f2.rs", "f3.rs", "f5.rs"]
+                .iter()
+                .map(|name| codebase.join(name).to_string_lossy().to_string())
+                .collect();
+        assert_eq!(files, expected);
+        // Same chunks per file as the first pass: five files where it had five.
+        assert_eq!(after.rows, before.rows, "{before:#?}\n{after:#?}");
+        let bm25 = crate::indexing::index_stats::probe_bm25_index(&tantivy_path).unwrap();
+        assert_eq!(bm25.live_docs, after.rows as u64);
+        assert!(!after.indices.is_empty());
+        for index in &after.indices {
+            assert_eq!(index.unindexed_rows, 0, "{index:#?}");
+        }
 
         let _ = std::fs::remove_file(snapshot_path);
     }
