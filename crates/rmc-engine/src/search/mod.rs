@@ -4,6 +4,8 @@
 
 mod bm25;
 mod error;
+#[cfg(all(test, feature = "vector-store", target_os = "linux"))]
+mod fts_eval;
 mod relevance;
 #[cfg(feature = "hybrid-search")]
 mod resilient;
