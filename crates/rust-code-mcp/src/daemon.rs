@@ -450,6 +450,29 @@ pub fn retire_grace_expired(retiring_for: Option<Duration>, grace: Duration) -> 
     retiring_for.is_some_and(|elapsed| elapsed >= grace)
 }
 
+/// How long a shared GPU session may sit unused before this tick hands it
+/// back to the card; `None` keeps every session.
+///
+/// A retired daemon lets go of every idle session at once — its successor is
+/// building its own on the same card — but only once its background sync has
+/// stopped. Retiring asks the sync to stop, and a pass already in flight runs
+/// to its end: between two files of that pass the session is idle for a tick,
+/// and dropping it there rebuilt it for the next file. Seen live 2026-10-29:
+/// a retired daemon finishing a full re-embed created 78 sessions in 30 min,
+/// each a MIGraphX program load, while holding the same VRAM almost all the
+/// time. `gpu_idle` of zero means keep, as it does outside retirement.
+pub fn gpu_session_max_idle(
+    retiring: bool,
+    background_sync_running: bool,
+    gpu_idle: Duration,
+) -> Option<Duration> {
+    if retiring && !background_sync_running {
+        Some(Duration::ZERO)
+    } else {
+        (!gpu_idle.is_zero()).then_some(gpu_idle)
+    }
+}
+
 /// Thresholds for [`decide_watchdog_action`], in MB. `0` disables a threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchdogLimits {
@@ -1828,14 +1851,14 @@ pub async fn run_daemon(
         }
 
         // Shared GPU sessions nobody has run for `gpu_idle` go back to the card.
-        // A retired daemon lets go of every idle one at once: its successor is
-        // building its own on the same card, and the two together are what the
-        // budget's default half-card split is about.
-        let gpu_max_idle = if retiring {
-            Some(Duration::ZERO)
-        } else {
-            (!gpu_idle.is_zero()).then_some(gpu_idle)
-        };
+        // A retired daemon whose sync has stopped lets go of every idle one at
+        // once: its successor is building its own on the same card, and the
+        // two together are what the budget's default half-card split is about.
+        let gpu_max_idle = gpu_session_max_idle(
+            retiring,
+            runtime.state().background_sync_running(),
+            gpu_idle,
+        );
         if let Some(max_idle) = gpu_max_idle {
             // Blocking pool: dropping a session frees device memory and reads
             // the VRAM meters.
@@ -2205,6 +2228,25 @@ mod watchdog_tests {
             decide_watchdog_action(11000, ROOMY, LIMITS, Some(Duration::from_secs(600)), true),
             WatchdogAction::Unload
         );
+    }
+
+    /// A retired daemon finishing its last sync pass keeps the GPU session
+    /// between files; once the sync stops, every idle session goes at once.
+    #[test]
+    fn a_retired_daemon_keeps_its_gpu_session_until_the_sync_stops() {
+        let idle = Duration::from_secs(900);
+        assert_eq!(gpu_session_max_idle(true, true, idle), Some(idle));
+        assert_eq!(gpu_session_max_idle(true, true, Duration::ZERO), None);
+        assert_eq!(
+            gpu_session_max_idle(true, false, idle),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            gpu_session_max_idle(true, false, Duration::ZERO),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(gpu_session_max_idle(false, true, idle), Some(idle));
+        assert_eq!(gpu_session_max_idle(false, false, Duration::ZERO), None);
     }
 
     /// Retiring is not itself a reason to unload — the thresholds still decide.
