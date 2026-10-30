@@ -14,6 +14,7 @@ use crate::indexing::identity::{
 };
 use crate::indexing::merkle::{ChangeSet, FileSystemMerkle};
 use crate::indexing::tantivy_adapter::TantivyAdapter;
+use crate::indexing::traversal::collect_project_rust_files;
 use crate::indexing::unified::{
     IndexStats, Preparation, PreparedFile, UnifiedIndexer, ensure_index_disk_headroom,
     rebuild_bm25_from_existing_store,
@@ -503,6 +504,27 @@ impl IncrementalIndexer {
             .forget_files_without_vectors()
             .await
     }
+
+    /// Drop the files the stores hold but the tree under `codebase_path` no
+    /// longer has; see [`UnifiedIndexer::drop_files_outside`]. A walk with
+    /// errors drops nothing — it may have missed live files.
+    pub async fn drop_files_outside_tree(&mut self, codebase_path: &Path) -> Result<Vec<String>> {
+        let (tree, walk_errors) = collect_project_rust_files(codebase_path);
+        if walk_errors > 0 {
+            tracing::warn!(
+                "Not dropping files outside {}: the walk hit {} error(s) and may be incomplete",
+                codebase_path.display(),
+                walk_errors
+            );
+            return Ok(Vec::new());
+        }
+        let indexer = self.ensure_indexer().await?;
+        let dropped = indexer.drop_files_outside(&tree).await?;
+        if !dropped.is_empty() {
+            indexer.maintain_vector_store().await;
+        }
+        Ok(dropped)
+    }
 }
 
 #[cfg(test)]
@@ -675,6 +697,98 @@ mod tests {
         for index in &after.indices {
             assert_eq!(index.unindexed_rows, 0, "{index:#?}");
         }
+
+        let _ = std::fs::remove_file(snapshot_path);
+    }
+
+    /// A file deleted while the snapshot was gone has no change detection
+    /// to see it go: the next pass is a full one, and only a full pass (or a
+    /// coverage repair) can drop its chunks. Without `drop_files_outside`
+    /// (the mutant) f2.rs stays in both stores for good — 41 such files sat
+    /// in a live store. The repair also forgets the cache entry: a file that
+    /// comes back with the same bytes is embedded again, not waved through.
+    #[tokio::test]
+    #[ignore] // Requires the CPU embedding model files
+    async fn full_passes_and_repairs_drop_files_that_left_the_tree() {
+        let temp_dir = TempDir::new().unwrap();
+        let codebase = temp_dir.path().join("codebase");
+        std::fs::create_dir(&codebase).unwrap();
+        for name in ["f0.rs", "f1.rs", "f2.rs"] {
+            std::fs::write(
+                codebase.join(name),
+                format!("pub fn {}() {{}}\n", &name[..2]),
+            )
+            .unwrap();
+        }
+        let path_of = |name: &str| codebase.join(name).to_string_lossy().to_string();
+        let backend = EmbeddingBackend::from_profile_name("local-cpu-small").unwrap();
+        let snapshot_path = get_snapshot_path_for_backend(&codebase, &backend);
+        let mut indexer = IncrementalIndexer::with_backend(
+            &temp_dir.path().join("cache"),
+            &temp_dir.path().join("tantivy"),
+            "drop_outside_tree",
+            backend.dim(),
+            &backend.identity(),
+            None,
+            backend,
+        )
+        .await
+        .unwrap();
+        indexer
+            .index_with_change_detection(&codebase)
+            .await
+            .unwrap();
+        let store = indexer.indexer().unwrap().vector_store_cloned();
+        let files = || async {
+            let mut files: Vec<String> = store
+                .indexed_file_paths()
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+            files.sort();
+            files
+        };
+        assert_eq!(
+            files().await,
+            [path_of("f0.rs"), path_of("f1.rs"), path_of("f2.rs")]
+        );
+        let rows_per_file = store.count().await.unwrap() / 3;
+
+        // f2.rs goes while there is no snapshot; the next pass is a full one.
+        std::fs::remove_file(&snapshot_path).unwrap();
+        std::fs::remove_file(codebase.join("f2.rs")).unwrap();
+        indexer
+            .index_with_change_detection(&codebase)
+            .await
+            .unwrap();
+        assert_eq!(files().await, [path_of("f0.rs"), path_of("f1.rs")]);
+        let bm25 = || {
+            crate::indexing::index_stats::probe_bm25_index(&temp_dir.path().join("tantivy"))
+                .unwrap()
+                .live_docs
+        };
+        assert_eq!(bm25(), store.count().await.unwrap() as u64);
+
+        // The repair drops what the snapshot cannot see either: f1.rs moved
+        // out of the tree and back is the shape of a file removed by hand.
+        let f1 = std::fs::read(codebase.join("f1.rs")).unwrap();
+        std::fs::remove_file(codebase.join("f1.rs")).unwrap();
+        assert_eq!(
+            indexer.drop_files_outside_tree(&codebase).await.unwrap(),
+            [path_of("f1.rs")]
+        );
+        assert_eq!(files().await, [path_of("f0.rs")]);
+        assert_eq!(bm25(), store.count().await.unwrap() as u64);
+
+        std::fs::write(codebase.join("f1.rs"), f1).unwrap();
+        std::fs::remove_file(&snapshot_path).unwrap();
+        indexer
+            .index_with_change_detection(&codebase)
+            .await
+            .unwrap();
+        assert_eq!(files().await, [path_of("f0.rs"), path_of("f1.rs")]);
+        assert_eq!(store.count().await.unwrap(), 2 * rows_per_file);
 
         let _ = std::fs::remove_file(snapshot_path);
     }

@@ -18,7 +18,7 @@ pub struct IndexCodebaseParams {
     #[schemars(description = "Force full reindex even if already indexed (default: false)")]
     pub force_reindex: Option<bool>,
     #[schemars(
-        description = "Re-embed only health_check's `stale_skips` (cached as indexed, no vectors) — minutes instead of a full force_reindex. Ignored with force_reindex."
+        description = "Re-embed only health_check's `stale_skips` (cached as indexed, no vectors) and drop the chunks of files no longer in the tree — minutes instead of a full force_reindex. Ignored with force_reindex."
     )]
     pub repair_coverage: Option<bool>,
     #[schemars(
@@ -183,26 +183,41 @@ fn format_index_codebase_result(
 /// An empty repair is worth saying out loud: it is the difference between
 /// "there was nothing to fix" and "the fix silently did nothing", and only the
 /// former is good news.
-fn format_repair_note(repaired: &[String]) -> String {
-    if repaired.is_empty() {
-        return "\n\nCoverage repair: nothing to repair — every cached file has vectors."
+fn format_repair_note(repaired: &[String], dropped: &[String]) -> String {
+    if repaired.is_empty() && dropped.is_empty() {
+        return "\n\nCoverage repair: nothing to repair — every cached file has vectors, \
+                and every file in the store is in the tree."
             .to_string();
     }
 
-    let sample: Vec<&str> = repaired.iter().take(5).map(String::as_str).collect();
-    let more = repaired.len().saturating_sub(sample.len());
+    let mut note = String::new();
+    if !repaired.is_empty() {
+        note.push_str(&format!(
+            "\n\nCoverage repair: dropped {} stale cache entries and re-embedded those files:{}",
+            repaired.len(),
+            format_path_sample(repaired)
+        ));
+    }
+    if !dropped.is_empty() {
+        note.push_str(&format!(
+            "\n\nCoverage repair: removed the chunks of {} file(s) no longer in the tree:{}",
+            dropped.len(),
+            format_path_sample(dropped)
+        ));
+    }
+    note
+}
+
+/// The first five paths, one per line, and a count of the rest.
+fn format_path_sample(paths: &[String]) -> String {
+    let sample: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
+    let more = paths.len().saturating_sub(sample.len());
     let tail = if more > 0 {
         format!("\n  … and {} more", more)
     } else {
         String::new()
     };
-
-    format!(
-        "\n\nCoverage repair: dropped {} stale cache entries and re-embedded those files:\n  {}{}",
-        repaired.len(),
-        sample.join("\n  "),
-        tail
-    )
+    format!("\n  {}{}", sample.join("\n  "), tail)
 }
 
 fn indexing_error_to_mcp(error: anyhow::Error, dir: &std::path::Path) -> McpError {
@@ -341,7 +356,10 @@ pub async fn index_codebase(
     );
 
     if repair && !force {
-        result_text.push_str(&format_repair_note(&outcome.repaired_files));
+        result_text.push_str(&format_repair_note(
+            &outcome.repaired_files,
+            &outcome.dropped_files,
+        ));
     }
 
     Ok(CallToolResult::success(vec![Content::text(result_text)]))
@@ -574,7 +592,7 @@ mod tests {
 
     #[test]
     fn repair_note_distinguishes_nothing_to_fix_from_a_silent_no_op() {
-        let text = format_repair_note(&[]);
+        let text = format_repair_note(&[], &[]);
 
         assert!(text.contains("nothing to repair"));
         assert!(text.contains("every cached file has vectors"));
@@ -585,7 +603,7 @@ mod tests {
     fn repair_note_lists_repaired_files_and_counts_the_rest() {
         let repaired: Vec<String> = (0..7).map(|i| format!("/repo/file{i}.rs")).collect();
 
-        let text = format_repair_note(&repaired);
+        let text = format_repair_note(&repaired, &[]);
 
         assert!(text.contains("dropped 7 stale cache entries"));
         assert!(text.contains("/repo/file0.rs"));
@@ -593,6 +611,16 @@ mod tests {
         // Only the first five are spelled out; the rest are counted.
         assert!(!text.contains("/repo/file5.rs"));
         assert!(text.contains("… and 2 more"));
+        assert!(!text.contains("no longer in the tree"));
+    }
+
+    #[test]
+    fn repair_note_lists_files_dropped_outside_the_tree() {
+        let text = format_repair_note(&[], &["/repo/gone.rs".to_string()]);
+
+        assert!(text.contains("removed the chunks of 1 file(s) no longer in the tree"));
+        assert!(text.contains("/repo/gone.rs"));
+        assert!(!text.contains("stale cache entries"));
     }
 
     #[test]

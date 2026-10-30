@@ -21,8 +21,9 @@ pub struct IncrementalIndexRequest<'a> {
     pub codebase_loc: Option<usize>,
     pub force_reindex: bool,
     /// Repair `stale_skips` before indexing: forget the cache entries of files
-    /// that have no vectors, so the run rebuilds exactly those. Ignored when
-    /// `force_reindex` is set — that path clears everything anyway.
+    /// that have no vectors, so the run rebuilds exactly those, and drop the
+    /// chunks of files the tree no longer has. Ignored when `force_reindex` is
+    /// set — that path clears everything anyway.
     pub repair_coverage: bool,
 }
 
@@ -34,6 +35,9 @@ pub struct IncrementalIndexOutcome {
     pub elapsed: Duration,
     /// Files whose cache entry was dropped by the coverage repair, if requested.
     pub repaired_files: Vec<String>,
+    /// Files the coverage repair found in the stores but not in the tree, and
+    /// dropped from both.
+    pub dropped_files: Vec<String>,
 }
 
 /// Index a project through the indexing-owned incremental service boundary.
@@ -47,6 +51,7 @@ pub async fn index_project_incrementally(
 trait IncrementalIndexRunner {
     async fn clear_all_data(&mut self) -> Result<()>;
     async fn forget_files_without_vectors(&mut self) -> Result<Vec<String>>;
+    async fn drop_files_outside_tree(&mut self, codebase_path: &Path) -> Result<Vec<String>>;
     async fn index_with_change_detection(&mut self, codebase_path: &Path) -> Result<IndexStats>;
 }
 
@@ -57,6 +62,10 @@ impl IncrementalIndexRunner for IncrementalIndexer {
 
     async fn forget_files_without_vectors(&mut self) -> Result<Vec<String>> {
         IncrementalIndexer::forget_files_without_vectors(self).await
+    }
+
+    async fn drop_files_outside_tree(&mut self, codebase_path: &Path) -> Result<Vec<String>> {
+        IncrementalIndexer::drop_files_outside_tree(self, codebase_path).await
     }
 
     async fn index_with_change_detection(&mut self, codebase_path: &Path) -> Result<IndexStats> {
@@ -112,8 +121,16 @@ where
     // Coverage repair runs BEFORE change detection and only without force,
     // which would clear the same data wholesale a moment later.
     let mut repaired_files = Vec::new();
+    let mut dropped_files = Vec::new();
     if request.repair_coverage && !request.force_reindex {
         repaired_files = indexer.forget_files_without_vectors().await?;
+        // The other direction: chunks of files no longer in the tree. Only a
+        // full pass drops them on its own, and the snapshot rules one out
+        // here. Their paths are not in the tree, so not in the snapshot
+        // either — dropping them needs no walk of the rest.
+        dropped_files = indexer
+            .drop_files_outside_tree(request.codebase_path)
+            .await?;
 
         // Dropping cache entries is not enough on its own: change detection
         // never looks at a file the Merkle snapshot considers unchanged, so
@@ -133,6 +150,7 @@ where
         stats,
         elapsed: start.elapsed(),
         repaired_files,
+        dropped_files,
     })
 }
 
@@ -144,7 +162,11 @@ fn remove_snapshot(snapshot_path: Option<&Path>, reason: &str) -> Result<()> {
     if !snapshot_path.exists() {
         return Ok(());
     }
-    tracing::info!("{}: deleting snapshot at {}", reason, snapshot_path.display());
+    tracing::info!(
+        "{}: deleting snapshot at {}",
+        reason,
+        snapshot_path.display()
+    );
     std::fs::remove_file(snapshot_path)
         .with_context(|| format!("Failed to delete snapshot at {}", snapshot_path.display()))
 }
@@ -168,6 +190,8 @@ mod tests {
         stats: IndexStats,
         /// Paths the fake reports as cached-but-vectorless.
         stale_files: Vec<String>,
+        /// Paths the fake reports as stored but outside the tree.
+        outside_files: Vec<String>,
     }
 
     struct BuildRecord {
@@ -242,7 +266,16 @@ mod tests {
             Ok(state.stale_files.clone())
         }
 
-        async fn index_with_change_detection(&mut self, codebase_path: &Path) -> Result<IndexStats> {
+        async fn drop_files_outside_tree(&mut self, _codebase_path: &Path) -> Result<Vec<String>> {
+            let mut state = self.state.lock().unwrap();
+            state.events.push("drop".to_string());
+            Ok(state.outside_files.clone())
+        }
+
+        async fn index_with_change_detection(
+            &mut self,
+            codebase_path: &Path,
+        ) -> Result<IndexStats> {
             let mut state = self.state.lock().unwrap();
             state
                 .events
@@ -377,6 +410,7 @@ mod tests {
             vec![
                 "create".to_string(),
                 "forget".to_string(),
+                "drop".to_string(),
                 format!("index:{}", codebase_path.display())
             ]
         );
@@ -420,6 +454,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repair_drops_files_outside_the_tree_and_keeps_the_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let codebase_path = temp_dir.path().join("codebase");
+        let cache_path = temp_dir.path().join("cache");
+        let tantivy_path = temp_dir.path().join("tantivy");
+        let snapshot_path = temp_dir.path().join("snapshot");
+        std::fs::create_dir(&codebase_path).unwrap();
+        std::fs::write(&snapshot_path, "old snapshot").unwrap();
+
+        let backend = test_backend();
+        let embedder_identity = backend.identity();
+        let factory = FakeFactory::default();
+        {
+            let mut state = factory.state.lock().unwrap();
+            state.outside_files = vec!["/repo/gone.rs".to_string()];
+        }
+
+        let outcome = index_project_incrementally_with_factory(
+            repair_request(
+                &codebase_path,
+                &cache_path,
+                &tantivy_path,
+                &snapshot_path,
+                backend,
+                &embedder_identity,
+                false,
+            ),
+            &factory,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.repaired_files.is_empty());
+        assert_eq!(outcome.dropped_files, vec!["/repo/gone.rs"]);
+        // A dropped file is not in the tree, so not in the snapshot: there is
+        // nothing for a full walk to find, and the run stays a quick check.
+        assert!(snapshot_path.exists());
+        let state = factory.state.lock().unwrap();
+        assert!(!state.events.contains(&"clear".to_string()));
+    }
+
+    #[tokio::test]
     async fn force_reindex_skips_repair_entirely() {
         let temp_dir = TempDir::new().unwrap();
         let codebase_path = temp_dir.path().join("codebase");
@@ -456,6 +532,7 @@ mod tests {
 
         let state = factory.state.lock().unwrap();
         assert!(!state.events.contains(&"forget".to_string()));
+        assert!(!state.events.contains(&"drop".to_string()));
         assert_eq!(
             state.events,
             vec![
@@ -506,7 +583,10 @@ mod tests {
         assert_eq!(build.collection_name, "construction_inputs");
         assert_eq!(build.backend_dim, backend_dim);
         assert_eq!(build.embedder_identity, embedder_identity);
-        assert_eq!(build.snapshot_path.as_deref(), Some(snapshot_path.as_path()));
+        assert_eq!(
+            build.snapshot_path.as_deref(),
+            Some(snapshot_path.as_path())
+        );
         assert_eq!(build.codebase_loc, Some(42));
         assert!(!build.force_reindex);
     }

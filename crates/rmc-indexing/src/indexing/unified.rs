@@ -18,6 +18,7 @@ use rmc_engine::chunker::CodeChunk;
 use rmc_engine::embeddings::{Embedding, EmbeddingBackend, EmbeddingGenerator};
 use rmc_engine::search::Bm25Search;
 use rmc_engine::vector_store::VectorStore;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tantivy::Index;
@@ -573,7 +574,7 @@ impl UnifiedIndexer {
         self.metrics = IndexingMetrics::new();
 
         // Find all Rust files
-        let rust_files = collect_rust_files(dir_path, &mut stats)?;
+        let (rust_files, walk_errors) = collect_rust_files(dir_path, &mut stats)?;
 
         if rust_files.is_empty() {
             return Ok(stats);
@@ -586,8 +587,8 @@ impl UnifiedIndexer {
         );
 
         // Index each file
-        for file in rust_files {
-            match self.index_file(&file).await {
+        for file in &rust_files {
+            match self.index_file(file).await {
                 Ok(IndexFileResult::Indexed { chunks_count }) => {
                     stats.indexed_files += 1;
                     stats.total_chunks += chunks_count;
@@ -599,7 +600,7 @@ impl UnifiedIndexer {
                     stats.skipped_files += 1;
                 }
                 Err(e) => {
-                    stats.record_error(&file, &e);
+                    stats.record_error(file, &e);
                 }
             }
         }
@@ -608,6 +609,10 @@ impl UnifiedIndexer {
         self.tantivy
             .commit()
             .context("Failed to commit Tantivy index")?;
+
+        let dropped = self
+            .drop_files_outside_walk(&rust_files, walk_errors)
+            .await?;
 
         // Finalize metrics
         self.finalize_metrics(&stats, total_start.elapsed());
@@ -621,7 +626,7 @@ impl UnifiedIndexer {
             stats.failed_files
         );
 
-        if stats.indexed_files > 0 {
+        if stats.indexed_files > 0 || dropped > 0 {
             self.maintain_vector_store().await;
         }
 
@@ -668,7 +673,7 @@ impl UnifiedIndexer {
         self.metrics = IndexingMetrics::new();
 
         // Find all Rust files
-        let rust_files = collect_rust_files(dir_path, &mut stats)?;
+        let (rust_files, walk_errors) = collect_rust_files(dir_path, &mut stats)?;
 
         if rust_files.is_empty() {
             return Ok(stats);
@@ -729,6 +734,10 @@ impl UnifiedIndexer {
             self.tantivy.commit()?;
         }
 
+        let dropped = self
+            .drop_files_outside_walk(&rust_files, walk_errors)
+            .await?;
+
         // Finalize metrics
         self.finalize_metrics(&stats, total_start.elapsed());
 
@@ -740,11 +749,80 @@ impl UnifiedIndexer {
             stats.failed_files
         );
 
-        if stats.indexed_files > 0 {
+        if stats.indexed_files > 0 || dropped > 0 {
             self.maintain_vector_store().await;
         }
 
         Ok(stats)
+    }
+
+    /// The end of a full pass: drop the files the stores hold but the walk
+    /// did not find (see [`Self::drop_files_outside`]), unless the walk hit
+    /// errors and so may have missed live files. Returns how many went.
+    async fn drop_files_outside_walk(
+        &mut self,
+        walked: &[PathBuf],
+        walk_errors: usize,
+    ) -> Result<usize> {
+        if walk_errors > 0 {
+            tracing::warn!(
+                "Not dropping files outside the tree: the walk hit {} error(s) and may be incomplete",
+                walk_errors
+            );
+            return Ok(0);
+        }
+        Ok(self.drop_files_outside(walked).await?.len())
+    }
+
+    /// Drop from both stores, and from the metadata cache, every file the
+    /// vector store holds that `tree` does not list.
+    ///
+    /// The stores learn that a file left the tree only from change
+    /// detection, which compares the tree with the previous Merkle snapshot.
+    /// A full pass has no previous snapshot, so a file deleted while the
+    /// snapshot was gone (a wipe, a new chunking identity over an existing
+    /// collection) kept its chunks for good, and search kept answering with
+    /// code that no longer exists — 41 such files of 6510 in a live store
+    /// (2026-10-30). Every full pass therefore ends here, and so does a
+    /// coverage repair.
+    ///
+    /// `tree` must be a COMPLETE walk of the project with the indexer's own
+    /// walker (`traversal::collect_project_rust_files`): a live file missing
+    /// from it loses its chunks. Returns the dropped paths, sorted.
+    pub async fn drop_files_outside(&mut self, tree: &[PathBuf]) -> Result<Vec<String>> {
+        // The stores key files by `to_string_lossy` of the walked path, as
+        // every write and delete does.
+        let tree: HashSet<String> = tree
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect();
+        let indexed = self
+            .vector_store
+            .indexed_file_paths()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list indexed files: {}", e))?;
+        let mut gone: Vec<String> = indexed
+            .into_iter()
+            .filter(|path| !tree.contains(path))
+            .collect();
+        if gone.is_empty() {
+            return Ok(gone);
+        }
+        gone.sort();
+
+        let paths: Vec<&Path> = gone.iter().map(Path::new).collect();
+        self.delete_files_chunks(&paths).await?;
+        self.tantivy.commit()?;
+        // A walk that comes upon one of these files again must embed it,
+        // not wave it through as cached.
+        for path in &paths {
+            self.core.forget_file(path)?;
+        }
+        tracing::info!(
+            "Dropped the chunks of {} file(s) no longer in the tree",
+            gone.len()
+        );
+        Ok(gone)
     }
 
     /// Delete all chunks of these files from both Tantivy and the vector
@@ -1076,15 +1154,17 @@ mod tests {
 
         let tantivy_path = temp.path().join("bm25");
         let mut tantivy =
-            TantivyAdapter::new(rmc_config::config::TantivyConfig::default(&tantivy_path))
-                .unwrap();
+            TantivyAdapter::new(rmc_config::config::TantivyConfig::default(&tantivy_path)).unwrap();
         assert!(TantivyAdapter::is_empty_at(&tantivy_path).unwrap());
 
         let indexed = rebuild_bm25_if_empty(&mut tantivy, &store).await.unwrap();
         assert_eq!(indexed, Some(chunks.len()));
         assert_eq!(tantivy.committed_doc_count().unwrap(), chunks.len() as u64);
         assert!(!TantivyAdapter::is_empty_at(&tantivy_path).unwrap());
-        assert_eq!(rebuild_bm25_if_empty(&mut tantivy, &store).await.unwrap(), None);
+        assert_eq!(
+            rebuild_bm25_if_empty(&mut tantivy, &store).await.unwrap(),
+            None
+        );
 
         let mut search = tantivy.create_bm25_search().unwrap();
         search.reload().unwrap();

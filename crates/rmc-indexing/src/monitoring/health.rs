@@ -7,7 +7,7 @@
 //!
 //! Health states: Healthy, Degraded, Unhealthy
 
-use crate::indexing::FileSystemMerkle;
+use crate::indexing::{FileSystemMerkle, collect_project_rust_files};
 use crate::metadata_cache::MetadataCache;
 use rmc_engine::search::Bm25Search;
 use rmc_engine::vector_store::VectorStore;
@@ -136,6 +136,15 @@ pub struct CoverageHealth {
     /// A few example paths from `stale_skips`, for triage
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stale_skip_examples: Vec<String>,
+    /// Files with chunks in the store that are in neither the working tree
+    /// nor the snapshot: search can answer with deleted code, and no sync
+    /// removes them. `None` without a project root or after a walk with
+    /// errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_outside_tree: Option<usize>,
+    /// A few example paths from `files_outside_tree`, for triage
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub outside_tree_examples: Vec<String>,
 }
 
 impl CoverageHealth {
@@ -152,6 +161,8 @@ impl CoverageHealth {
             files_with_vectors: None,
             stale_skips: None,
             stale_skip_examples: Vec::new(),
+            files_outside_tree: None,
+            outside_tree_examples: Vec::new(),
         }
     }
 }
@@ -413,10 +424,39 @@ impl HealthMonitor {
         // What the project actually contains, for context. Absent
         // snapshot is not fatal for the verdict — the verdict does not
         // depend on it.
-        let files_tracked = FileSystemMerkle::load_snapshot(&self.merkle_path)
+        let snapshot = FileSystemMerkle::load_snapshot(&self.merkle_path)
             .ok()
-            .flatten()
-            .map(|merkle| merkle.file_count());
+            .flatten();
+        let files_tracked = snapshot.as_ref().map(FileSystemMerkle::file_count);
+
+        // Files the store holds that the project no longer has: search
+        // answers with code that is gone, and no sync removes them (see
+        // `UnifiedIndexer::drop_files_outside`). A file counts only if it is
+        // in neither the working tree nor the snapshot — a file deleted since
+        // the last sync is in the snapshot (the next sync drops it), and one
+        // written by a sync whose snapshot is not saved yet is in the tree.
+        // A walk with errors proves nothing about a file it did not see.
+        let mut outside: Vec<String> = Vec::new();
+        let files_outside_tree = match &self.project_root {
+            Some(root) => {
+                let (walked, walk_errors) = collect_project_rust_files(root);
+                (walk_errors == 0).then(|| {
+                    let known: HashSet<String> = walked
+                        .iter()
+                        .chain(snapshot.iter().flat_map(FileSystemMerkle::file_paths))
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect();
+                    outside = indexed_files
+                        .iter()
+                        .filter(|path| !known.contains(*path))
+                        .cloned()
+                        .collect();
+                    outside.sort();
+                    outside.len()
+                })
+            }
+            None => None,
+        };
 
         let mut stale: Vec<String> = cached_files
             .iter()
@@ -473,9 +513,14 @@ impl HealthMonitor {
             return unknown;
         }
 
-        let (status, message) = if stale_skips == 0 {
+        let outside_count = files_outside_tree.unwrap_or(0);
+        let (status, mut message) = if stale_skips == 0 {
             (
-                Status::Healthy,
+                if outside_count == 0 {
+                    Status::Healthy
+                } else {
+                    Status::Degraded
+                },
                 format!(
                     "Coverage verified: all {} cached files have vectors ({} distinct files in store)",
                     files_cached, files_with_vectors
@@ -491,6 +536,13 @@ impl HealthMonitor {
                 ),
             )
         };
+        if outside_count > 0 {
+            message.push_str(&format!(
+                "; the store still holds chunks of {} file(s) no longer in the tree, and search \
+                 can answer with them. Fix: index_codebase with repair_coverage: true",
+                outside_count
+            ));
+        }
 
         CoverageHealth {
             status,
@@ -500,6 +552,8 @@ impl HealthMonitor {
             files_with_vectors: Some(files_with_vectors),
             stale_skips: Some(stale_skips),
             stale_skip_examples: examples,
+            files_outside_tree,
+            outside_tree_examples: outside.into_iter().take(10).collect(),
         }
     }
 
@@ -557,7 +611,12 @@ impl HealthMonitor {
             .modified
             .iter()
             .map(|p| format!("modified: {}", p.display()))
-            .chain(changes.added.iter().map(|p| format!("added: {}", p.display())))
+            .chain(
+                changes
+                    .added
+                    .iter()
+                    .map(|p| format!("added: {}", p.display())),
+            )
             .chain(
                 changes
                     .deleted
@@ -665,6 +724,8 @@ mod tests {
             files_with_vectors: Some(3),
             stale_skips: Some(0),
             stale_skip_examples: Vec::new(),
+            files_outside_tree: Some(0),
+            outside_tree_examples: Vec::new(),
         }
     }
 
@@ -848,6 +909,81 @@ mod tests {
         assert_eq!(coverage.status, Status::Healthy);
     }
 
+    /// The store holds kept.rs and gone.rs, the tree only kept.rs: gone.rs
+    /// is counted outside the tree and turns coverage degraded with the
+    /// repair as the fix; kept.rs, in the same store, is the control.
+    #[tokio::test]
+    async fn coverage_counts_stored_files_that_left_the_tree() {
+        use rmc_engine::chunker::{ChunkContext, ChunkId, CodeChunk};
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("kept.rs"), "fn kept() {}\n").unwrap();
+        let salt = "chunk-split:v1:target300:hard900";
+
+        let store = VectorStore::new_embedded(temp.path().join("vectors"), 4, "test-embedder")
+            .await
+            .expect("open store");
+        let cache_path = temp.path().join("cache");
+        let cache = MetadataCache::new(&cache_path).expect("cache");
+        for name in ["kept", "gone"] {
+            let path = root.join(format!("{name}.rs"));
+            let chunk = CodeChunk {
+                id: ChunkId::new(),
+                content: format!("fn {name}() {{}}"),
+                context: ChunkContext {
+                    file_path: path.clone(),
+                    module_path: vec!["crate".to_string()],
+                    symbol_name: name.to_string(),
+                    symbol_kind: "function".to_string(),
+                    docstring: None,
+                    imports: vec![],
+                    outgoing_calls: vec![],
+                    parent_symbol_name: None,
+                    split_part: None,
+                    split_total: None,
+                    line_start: 1,
+                    line_end: 1,
+                },
+            };
+            store
+                .insert_chunks(vec![(chunk.id, vec![0.1, 0.2, 0.3, 0.4], chunk.clone())])
+                .await
+                .expect("insert");
+            cache
+                .set(
+                    &format!("{}::{}", salt, path.display()),
+                    &crate::metadata_cache::FileMetadata::from_content("x", 1, 1),
+                )
+                .expect("set metadata");
+        }
+        drop(cache);
+
+        let monitor = HealthMonitor::new(
+            None,
+            Some(Arc::new(store)),
+            temp.path().join("missing.snapshot"),
+        )
+        .with_metadata_cache(cache_path, salt.to_string())
+        .with_project_root(root.clone());
+        let coverage = monitor.check_coverage().await;
+
+        assert_eq!(coverage.stale_skips, Some(0));
+        assert_eq!(coverage.files_with_vectors, Some(2));
+        assert_eq!(coverage.files_outside_tree, Some(1));
+        assert_eq!(
+            coverage.outside_tree_examples,
+            vec![root.join("gone.rs").to_string_lossy().to_string()]
+        );
+        assert_eq!(coverage.status, Status::Degraded);
+        assert!(
+            coverage.message.contains("repair_coverage"),
+            "{}",
+            coverage.message
+        );
+    }
+
     #[tokio::test]
     async fn coverage_with_wrong_salt_is_not_reported_as_verified() {
         let temp = TempDir::new().unwrap();
@@ -963,8 +1099,11 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let (root, snapshot_path) = indexed_project(&temp);
 
-        std::fs::write(root.join("src/lib.rs"), "pub fn one() {}\npub fn two() {}\n")
-            .expect("edit");
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn one() {}\npub fn two() {}\n",
+        )
+        .expect("edit");
         std::fs::write(root.join("src/extra.rs"), "pub fn three() {}\n").expect("add");
 
         let freshness = HealthMonitor::new(None, None, snapshot_path)
@@ -976,7 +1115,10 @@ mod tests {
         assert_eq!(freshness.files_modified, Some(1));
         assert_eq!(freshness.files_added, Some(1));
         assert!(
-            freshness.examples.iter().any(|e| e.starts_with("modified: ")),
+            freshness
+                .examples
+                .iter()
+                .any(|e| e.starts_with("modified: ")),
             "examples must say what happened to each file: {:?}",
             freshness.examples
         );

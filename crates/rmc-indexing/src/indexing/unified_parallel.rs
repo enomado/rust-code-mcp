@@ -24,8 +24,13 @@ use std::path::{Path, PathBuf};
 /// `monitoring::health`).
 ///
 /// Pure traversal: does not touch `UnifiedIndexer` state. The caller passes
-/// in `stats` so we can populate `total_files` in one place.
-pub(super) fn collect_rust_files(dir_path: &Path, stats: &mut IndexStats) -> Result<Vec<PathBuf>> {
+/// in `stats` so we can populate `total_files` in one place. Also returns the
+/// number of walk errors: a walk with errors is not the whole tree, and
+/// `UnifiedIndexer::drop_files_outside` must not take it for one.
+pub(super) fn collect_rust_files(
+    dir_path: &Path,
+    stats: &mut IndexStats,
+) -> Result<(Vec<PathBuf>, usize)> {
     let (rust_files, walk_errors) = collect_project_rust_files(dir_path);
 
     if walk_errors > 0 {
@@ -36,7 +41,7 @@ pub(super) fn collect_rust_files(dir_path: &Path, stats: &mut IndexStats) -> Res
     }
 
     stats.total_files = rust_files.len();
-    Ok(rust_files)
+    Ok((rust_files, walk_errors))
 }
 
 #[cfg(test)]
@@ -58,7 +63,7 @@ mod tests {
             .expect("write generated source");
 
         let mut stats = IndexStats::default();
-        let files = collect_rust_files(root, &mut stats).expect("collect rust files");
+        let (files, _) = collect_rust_files(root, &mut stats).expect("collect rust files");
 
         assert_eq!(stats.total_files, 1);
         assert_eq!(files, vec![src.join("lib.rs")]);
