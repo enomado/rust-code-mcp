@@ -295,7 +295,16 @@ pub async fn index_codebase(
         &dir,
     )?;
     let embedder_identity = backend.identity();
-    let paths = ProjectPaths::from_directory(&dir, &backend);
+    // The collection search, health_check and the background sync use — an
+    // existing one made by the same embedder — not the name the current
+    // chunking identity would give a new one. With `from_directory` a project
+    // indexed before a chunking change got a second, empty collection here:
+    // the coverage repair then found none of the shared cache entries in it,
+    // forgot them all and dropped the shared snapshot, and the run turned
+    // into a full re-embed into a collection search switched to while it was
+    // still filling (seen 2026-10-30 on a 6469-file project).
+    let paths = ProjectPaths::in_use(&dir, &backend)
+        .map_err(|message| McpError::invalid_params(message, None))?;
 
     tracing::debug!(
         "Using collection: {}, cache: {}, index: {}, embedder: {}",
