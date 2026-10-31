@@ -282,7 +282,7 @@ pub(crate) fn symbol_search(
     symbol_name: &str,
     limit: usize,
 ) -> Result<Vec<Location>> {
-    symbol_search_with_exact(host, vfs, project_root, symbol_name, limit, false)
+    symbol_search_with_exact(&host.analysis(), vfs, project_root, symbol_name, limit, false)
 }
 
 /// Search for symbols by name, optionally retaining only full-name matches.
@@ -310,15 +310,13 @@ pub(crate) fn symbol_search(
 /// no identifier to ask about — it is named `0` — so it is outside the question
 /// rather than an answer to it.
 pub(crate) fn symbol_search_with_exact(
-    host: &AnalysisHost,
+    analysis: &Analysis,
     vfs: &Vfs,
     project_root: &Path,
     symbol_name: &str,
     limit: usize,
     exact_only: bool,
 ) -> Result<Vec<Location>> {
-    let analysis = host.analysis();
-
     let mut locations = index_matches(&analysis, vfs, symbol_name, limit)?;
 
     if !locations.iter().any(|location| location.exact) {
@@ -374,12 +372,11 @@ fn index_matches(
 /// by hand to a working tree each time the question comes up.
 #[cfg(test)]
 pub(crate) fn index_only_search(
-    host: &AnalysisHost,
+    analysis: &Analysis,
     vfs: &Vfs,
     symbol_name: &str,
     limit: usize,
 ) -> Result<Vec<Location>> {
-    let analysis = host.analysis();
     let matches = index_matches(&analysis, vfs, symbol_name, limit)?;
     Ok(rank_and_filter_exact(matches, true))
 }
@@ -406,20 +403,18 @@ pub(crate) fn find_references_by_name(
     project_root: &Path,
     symbol_name: &str,
 ) -> Result<Vec<Location>> {
-    find_references_by_name_with_exact(host, vfs, project_root, symbol_name, false)
+    find_references_by_name_with_exact(&host.analysis(), vfs, project_root, symbol_name, false)
 }
 
 /// Find all references to symbols matching a name, optionally retaining only
 /// full-name symbol matches before resolving references.
 pub(crate) fn find_references_by_name_with_exact(
-    host: &AnalysisHost,
+    analysis: &Analysis,
     vfs: &Vfs,
     project_root: &Path,
     symbol_name: &str,
     exact_only: bool,
 ) -> Result<Vec<Location>> {
-    let analysis = host.analysis();
-
     // First, find all symbols matching the name
     let query = Query::new(symbol_name.to_string());
     let mut symbols = analysis

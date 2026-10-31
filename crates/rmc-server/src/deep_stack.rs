@@ -706,6 +706,121 @@ mod tests {
         assert_eq!(status.project_count, 2, "status while A is busy: {status:?}");
     }
 
+    /// The defect of 2026-10-31, inside one project: a `find_definition`
+    /// waited 470 s for a `find_references` of the same project, because the
+    /// query held the project's slot for its whole run.
+    ///
+    /// A query on A blocks until released; another query on A must answer
+    /// within a bound — it takes its own snapshot while the first runs on its
+    /// own.
+    ///
+    /// Mutant (checked 2026-10-31): `with_project` keeping the slot on every
+    /// attempt (as on the last) → the second query times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queries_on_one_project_do_not_wait_for_each_other() {
+        use std::time::Duration;
+
+        let semantic = test_semantic();
+        let (_dir, a, _b) = two_loaded_projects(&semantic);
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = Arc::clone(&semantic);
+        let held_a = a.clone();
+        let holder = tokio::spawn(async move {
+            with_semantic(&held, "find_references", move |service| {
+                let entered = std::sync::Mutex::new(Some(entered_tx));
+                let release = std::sync::Mutex::new(release_rx);
+                service
+                    .query_project_for_test(&held_a, || {
+                        entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                        release.lock().unwrap().recv().unwrap();
+                        Ok(())
+                    })
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))
+            })
+            .await
+        });
+        entered_rx.await.expect("a query on A is running");
+
+        let answered = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_semantic(&semantic, "find_definition", {
+                let a = a.clone();
+                move |service| {
+                    service
+                        .symbol_search_with_exact(&a, "anything", 10, false)
+                        .map_err(|error| McpError::internal_error(error.to_string(), None))
+                }
+            }),
+        )
+        .await;
+        release_tx.send(()).expect("release the first query");
+        holder.await.expect("holder task").expect("holder work");
+
+        answered
+            .expect("a query on project A waited for another query on A")
+            .expect("find_definition on A");
+    }
+
+    /// A query cancelled by a refresh (salsa's `Cancelled`, as an unwind or as
+    /// an error through `?`) is asked again, and the last attempt keeps the
+    /// slot so no refresh can cancel it: a project edited faster than a long
+    /// query runs still gets an answer. Mutant: treating `Cancelled` as the
+    /// answer (no retry) → the first attempt's cancellation is returned.
+    #[tokio::test]
+    async fn a_cancelled_query_is_asked_again_and_the_last_attempt_holds_the_slot() {
+        use ra_ap_ide_db::base_db::salsa::Cancelled;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let semantic = test_semantic();
+        let (_dir, a, _b) = two_loaded_projects(&semantic);
+
+        let answer = with_semantic(&semantic, "find_references", move |service| {
+            let attempts = AtomicUsize::new(0);
+            service
+                .query_project_for_test(&a, || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    let slot_held = service.slot_is_held_for_test(&a);
+                    match attempt {
+                        1 => std::panic::resume_unwind(Box::new(Cancelled::PendingWrite)),
+                        2 => Err(anyhow::Error::new(Cancelled::PendingWrite)
+                            .context(format!("slot held: {slot_held}"))),
+                        _ => Ok((attempt, slot_held)),
+                    }
+                })
+                .map_err(|error| McpError::internal_error(error.to_string(), None))
+        })
+        .await
+        .expect("the third attempt answers");
+        assert_eq!(answer, (3, true), "attempts, and whether the last held the slot");
+    }
+
+    /// A panic inside a query — on a snapshot, with the slot let go, so no
+    /// lock is poisoned — still unloads exactly the project it happened on.
+    /// Mutant: no `SpoilOnPanic` in `with_project` → the panic is "outside
+    /// every context" and both projects are dropped.
+    #[tokio::test]
+    async fn a_panic_inside_a_query_unloads_only_its_project() {
+        let semantic = test_semantic();
+        let (_dir, a, b) = two_loaded_projects(&semantic);
+
+        let outcome: Result<(), McpError> = with_semantic(&semantic, "find_references", {
+            let a = a.clone();
+            move |service| {
+                service
+                    .query_project_for_test(&a, || -> anyhow::Result<()> {
+                        panic!("boom in a query")
+                    })
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))
+            }
+        })
+        .await;
+        let error = outcome.expect_err("a panic must surface as an error");
+        assert!(error.message.contains("1 loaded"), "{}", error.message);
+        assert_eq!(semantic.loaded_paths_for_test(), vec![b]);
+    }
+
     /// The same two projects, one of them in a call that panics: the panicking
     /// project is unloaded, the other stays loaded and keeps answering. Before
     /// contexts had locks of their own, every panic cost every project its

@@ -10,12 +10,15 @@ mod rename;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{
+    Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, TryLockError,
+};
 use std::time::SystemTime;
 
-use ra_ap_ide::AnalysisHost;
+use ra_ap_ide::{Analysis, AnalysisHost};
 use ra_ap_ide_db::ChangeWithProcMacros;
+use ra_ap_ide_db::base_db::salsa::Cancelled;
 use ra_ap_vfs::{FileExcluded, Vfs, VfsPath};
 use anyhow::{Context as _, Result};
 use rmc_indexing::indexing::collect_project_rust_files;
@@ -49,7 +52,10 @@ enum Staleness {
 /// Cached project context
 struct ProjectContext {
     host: AnalysisHost,
-    vfs: Vfs,
+    /// Shared with the queries running on snapshots of `host`, which read it
+    /// (file ids ↔ paths) with the slot let go; a refresh writes it after
+    /// `apply_change` has cancelled them. See [`SemanticService::with_project`].
+    vfs: Arc<RwLock<Vfs>>,
     load_kind: LoadKind,
     /// The working tree as it was when this context was built or last
     /// refreshed. Without it the cache has no way to notice that the code
@@ -475,31 +481,51 @@ fn ingredient_rows(host: &mut AnalysisHost) -> Vec<IngredientMemory> {
 /// caller turns that into a full reload. Silently leaving one file at its old
 /// revision would reproduce the very defect this module now guards against,
 /// only harder to notice.
+/// A context's `Vfs` for reading. A poisoned lock is stepped over: the writer
+/// is a refresh, which writes path by path a table that stays consistent at
+/// every step.
+fn read_vfs(vfs: &RwLock<Vfs>) -> RwLockReadGuard<'_, Vfs> {
+    vfs.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn shared_vfs(vfs: Vfs) -> Arc<RwLock<Vfs>> {
+    Arc::new(RwLock::new(vfs))
+}
+
 fn apply_edits(ctx: &mut ProjectContext, paths: &[PathBuf]) -> Result<()> {
     let mut updates = Vec::with_capacity(paths.len());
 
     // Read everything before mutating anything: a change applied halfway
     // would leave the database describing a mixture of two revisions.
-    for path in paths {
-        let vfs_path = VfsPath::new_real_path(path.to_string_lossy().into_owned());
-        let (file_id, excluded) = ctx.vfs.file_id(&vfs_path).ok_or_else(|| {
-            anyhow::anyhow!("{} is not part of the loaded analysis", path.display())
-        })?;
-        if excluded == FileExcluded::Yes {
-            anyhow::bail!("{} is excluded from the loaded analysis", path.display());
+    {
+        let vfs = read_vfs(&ctx.vfs);
+        for path in paths {
+            let vfs_path = VfsPath::new_real_path(path.to_string_lossy().into_owned());
+            let (file_id, excluded) = vfs.file_id(&vfs_path).ok_or_else(|| {
+                anyhow::anyhow!("{} is not part of the loaded analysis", path.display())
+            })?;
+            if excluded == FileExcluded::Yes {
+                anyhow::bail!("{} is excluded from the loaded analysis", path.display());
+            }
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            updates.push((vfs_path, file_id, text));
         }
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        updates.push((vfs_path, file_id, text));
     }
 
     let mut change = ChangeWithProcMacros::default();
-    for (vfs_path, file_id, text) in updates {
-        ctx.vfs
-            .set_file_contents(vfs_path, Some(text.clone().into_bytes()));
-        change.change_file(file_id, Some(text));
+    for (_, file_id, text) in &updates {
+        change.change_file(*file_id, Some(text.clone()));
     }
+    // The database first: `apply_change` cancels the queries still running on
+    // snapshots of this project and waits for them to drop, so the `Vfs`
+    // they read beside their snapshot is free to write a moment later (the
+    // slot is held, no new query starts in between).
     ctx.host.apply_change(change);
+    let mut vfs = ctx.vfs.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (vfs_path, _, text) in updates {
+        vfs.set_file_contents(vfs_path, Some(text.into_bytes()));
+    }
 
     Ok(())
 }
@@ -554,17 +580,32 @@ fn max_projects_from_env() -> usize {
 ///
 /// # Locks — two levels, taken in this order only
 ///
-/// 1. **A project's slot** ([`ProjectSlot::context`]): held for the whole of a
-///    load, a refresh and the query on that one project. Two calls on the same
-///    project are serialized on it — the second waits for the first one's
-///    load and then finds the context ready, rather than loading it again.
+/// 1. **A project's slot** ([`ProjectSlot::context`]): held for a load, a
+///    refresh, and to take a snapshot (`AnalysisHost::analysis`) — NOT for the
+///    query, which runs on the snapshot with the slot let go, so queries on
+///    one project run side by side: measured 2026-10-31, a `find_definition`
+///    waited 470 s for a `find_references` of the same project when the query
+///    held the slot. Two calls that find the project missing are serialized
+///    on it — the second waits for the first one's load and then finds the
+///    context ready, rather than loading it again.
 /// 2. **The registry** ([`Self::registry`]): the map of slots, the use clock and
 ///    the cap. Held only to look up, insert, touch or remove an entry — never
 ///    across rust-analyzer work, never while waiting for a slot.
 ///
 /// A slot holder may take the registry; a registry holder never *waits* for a
 /// slot (eviction only `try_lock`s one), and no code waits for a second slot
-/// while holding one. So the order cannot cycle.
+/// while holding one. So the order cannot cycle. The context's `Vfs` sits
+/// behind a lock of its own, taken by a query for read beside its snapshot and
+/// for write only by a refresh, under the slot, after `apply_change`.
+///
+/// # A refresh cancels the queries in flight
+///
+/// A refresh (`apply_change`) or a reload under the slot cancels every
+/// snapshot of the project still in use and waits for them to drop (salsa's
+/// `Cancelled`): a query that began on files since edited stops and is asked
+/// again on the current ones. To keep a project edited faster than a long
+/// query runs from starving it, the last of [`QUERY_ATTEMPTS`] keeps the slot
+/// for the whole query — no refresh can land under it.
 ///
 /// What is unchanged lives outside: `crate::deep_stack`'s analysis gate still
 /// keeps a garbage collection apart from every analysis in flight, since the
@@ -608,12 +649,31 @@ struct Entry {
 /// and its database goes when the last call on it ends.
 struct ProjectSlot {
     /// `None` until the first load finishes, and again after a failed load or a
-    /// panic inside one.
+    /// panic inside one. Held to load, refresh and snapshot the context — not
+    /// for the query on the snapshot (see [`SemanticService::with_project`]).
     context: Mutex<Option<ProjectContext>>,
     /// What `context` holds, readable without its lock — so `runtime_status`
     /// can say "loading" rather than wait for the load to end. Written only by
     /// the holder of `context`.
     loaded: AtomicU8,
+    /// A panic unwound through a call working on this context. A query runs
+    /// on a snapshot with the slot's lock released, so its panic poisons
+    /// nothing; this is how [`SemanticService::unload_after_panic`] knows
+    /// which contexts a panic interrupted. Set by [`SpoilOnPanic`], never
+    /// cleared: a spoiled slot leaves the registry.
+    spoiled: AtomicBool,
+}
+
+/// Marks its slot spoiled if a panic unwinds past it; see
+/// [`ProjectSlot::spoiled`].
+struct SpoilOnPanic<'a>(&'a ProjectSlot);
+
+impl Drop for SpoilOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.spoiled.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 const SLOT_EMPTY: u8 = 0;
@@ -625,6 +685,7 @@ impl ProjectSlot {
         Self {
             context: Mutex::new(None),
             loaded: AtomicU8::new(SLOT_EMPTY),
+            spoiled: AtomicBool::new(false),
         }
     }
 
@@ -722,13 +783,24 @@ impl Registry {
 
     /// Remove `path` only if it still maps to `slot`: a clear and a fresh call
     /// may have replaced it while the caller worked.
-    fn remove_if_same(&mut self, path: &Path, slot: &Arc<ProjectSlot>) -> Option<Entry> {
+    fn remove_if_same(&mut self, path: &Path, slot: &ProjectSlot) -> Option<Entry> {
         let same = self
             .projects
             .get(path)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.slot, slot));
+            .is_some_and(|entry| std::ptr::eq(Arc::as_ptr(&entry.slot), slot));
         if same { self.projects.remove(path) } else { None }
     }
+}
+
+/// How many times a query is asked before it keeps the slot for its whole run;
+/// see "A refresh cancels the queries in flight" on [`SemanticService`].
+const QUERY_ATTEMPTS: usize = 3;
+
+/// Whether a query's failure is salsa's cancellation — a refresh landed under
+/// its snapshot — carried as an error (`Cancellable` through `?`), not as the
+/// unwind [`Cancelled::catch`] stops.
+fn is_cancellation(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<Cancelled>())
 }
 
 /// Load `canonical` into its slot, or refresh what is there. The caller holds
@@ -780,8 +852,13 @@ fn load_into(
     // of the threads that built it, and the load allocates from the arenas
     // of its own priming threads, so glibc does not reuse it (+597 MiB
     // instead of +797 on salsa-bur). The release hands it back first.
+    //
+    // Queries may still run on snapshots of the old database, with the slot
+    // let go: a snapshot keeps the database alive. Cancelling them first (and
+    // waiting for their snapshots to drop) is what makes the drop free it.
     slot.publish(None);
-    if let Some(previous) = context.take() {
+    if let Some(mut previous) = context.take() {
+        previous.host.trigger_cancellation();
         drop(previous);
         crate::mcp::memory::release_free_memory();
     }
@@ -791,7 +868,7 @@ fn load_into(
     };
     *context = Some(ProjectContext {
         host,
-        vfs,
+        vfs: shared_vfs(vfs),
         load_kind: requested,
         stamps,
     });
@@ -948,11 +1025,13 @@ impl SemanticService {
 
     /// Clean up after a panic inside semantic work; see `deep_stack::with_semantic`.
     ///
-    /// The panic unwound through the slot it happened under and poisoned it, so
-    /// the poisoned slots are exactly the contexts the panic interrupted — and
-    /// only those are dropped: a panic on one project no longer costs every
-    /// other project its load. A slot another call holds right now is busy, not
-    /// poisoned, and is left alone.
+    /// The panic unwound through the slot it happened under and spoiled it
+    /// ([`ProjectSlot::spoiled`]; a query on a snapshot holds no lock to
+    /// poison) or poisoned it (a load or refresh), so those slots are exactly the
+    /// contexts the panic interrupted — and only those are dropped: a panic on
+    /// one project no longer costs every other project its load. A slot
+    /// another call holds right now is busy, not spoiled, and is left alone;
+    /// calls still on a dropped one keep it until they answer.
     ///
     /// A dropped context whose database read a dependency's source back from
     /// disk and found it changed since the load (see `loader::file_text_store`)
@@ -968,14 +1047,19 @@ impl SemanticService {
         let slots = self.registry().slots();
         let mut drifted = Vec::new();
         let mut poisoned = Vec::new();
+        let drift_of = |context: &Option<ProjectContext>| {
+            context
+                .as_ref()
+                .and_then(|ctx| ctx.host.raw_database().file_text_drift())
+        };
         for (path, slot) in slots {
+            let spoiled = slot.spoiled.load(Ordering::SeqCst);
             let drift = match slot.context.try_lock() {
-                Err(TryLockError::Poisoned(guard)) => Some(
-                    guard
-                        .get_ref()
-                        .as_ref()
-                        .and_then(|ctx| ctx.host.raw_database().file_text_drift()),
-                ),
+                Err(TryLockError::Poisoned(guard)) => Some(drift_of(guard.get_ref())),
+                Ok(guard) if spoiled => Some(drift_of(&guard)),
+                // Spoiled, and a load is under way on it: what drifted is
+                // unknown, the slot goes all the same.
+                Err(TryLockError::WouldBlock) if spoiled => Some(None),
                 _ => None,
             };
             if let Some(drift) = drift {
@@ -1013,7 +1097,7 @@ impl SemanticService {
             path,
             ProjectContext {
                 host,
-                vfs: Vfs::default(),
+                vfs: shared_vfs(Vfs::default()),
                 load_kind: LoadKind::Full,
                 stamps: HashMap::new(),
             },
@@ -1050,6 +1134,7 @@ impl SemanticService {
                 .unwrap_or_else(|| panic!("no context is loaded for {}", path.display()))
                 .slot,
         );
+        let _spoil = SpoilOnPanic(&slot);
         let mut guard = slot.lock();
         work(guard.as_mut().expect("the context is loaded"))
     }
@@ -1064,16 +1149,38 @@ impl SemanticService {
         self.with_context_for_test(path, |ctx| work(&mut ctx.host))
     }
 
-    /// Hold `path`'s slot for as long as `work` runs, the way a load or a query
-    /// holds it — for the tests that judge who waits for whom. The project
-    /// must be loaded and unchanged on disk, so nothing is loaded here.
+    /// Hold `path`'s slot for as long as `work` runs, the way a load or a
+    /// refresh holds it — for the tests that judge who waits for whom. The
+    /// project must be loaded and unchanged on disk, so nothing is loaded here.
     #[cfg(test)]
     pub(crate) fn hold_project_for_test<T>(
         &self,
         path: &Path,
         work: impl FnOnce() -> T,
     ) -> Result<T> {
-        self.with_project(path, LoadKind::Full, |_, _| Ok(work()))
+        let canonical = path.canonicalize()?;
+        let slot = self.slot_for(&canonical);
+        let _context = self.up_to_date(&canonical, &slot, LoadKind::Full)?;
+        Ok(work())
+    }
+
+    /// Run `work` the way a query runs — through [`Self::with_project`], on a
+    /// snapshot, asked again when cancelled — for the tests that judge who
+    /// waits for whom.
+    #[cfg(test)]
+    pub(crate) fn query_project_for_test<T>(
+        &self,
+        path: &Path,
+        work: impl Fn() -> Result<T>,
+    ) -> Result<T> {
+        self.with_project(path, LoadKind::Full, |_, _, _| work())
+    }
+
+    /// Whether some call holds `path`'s slot right now.
+    #[cfg(test)]
+    pub(crate) fn slot_is_held_for_test(&self, path: &Path) -> bool {
+        let slot = Arc::clone(&self.registry().projects.get(path).expect("loaded").slot);
+        matches!(slot.context.try_lock(), Err(TryLockError::WouldBlock))
     }
 
     /// Projects in the registry, sorted.
@@ -1259,9 +1366,16 @@ impl SemanticService {
         Arc::clone(&entry.slot)
     }
 
-    /// Load or refresh `project_path` to `requested`, then run `work` on its
-    /// context — all under that project's slot lock and nothing else, so the
-    /// load and the query of one project never hold up another's.
+    /// Load or refresh `project_path` to `requested`, then run `work` on a
+    /// snapshot of it — under that project's slot lock and nothing else, so
+    /// the load and the query of one project never hold up another's.
+    ///
+    /// The slot is held to bring the context up to date and take the snapshot
+    /// (`AnalysisHost::analysis`), then let go: `work` runs on the snapshot
+    /// beside the other queries of the project. A refresh that lands meanwhile
+    /// cancels it (salsa's `Cancelled`, as a panic or as an error); it is asked
+    /// again on the refreshed context, and the last of [`QUERY_ATTEMPTS`]
+    /// keeps the slot for its whole run.
     ///
     /// The one door every served path and every probe goes through: the lock
     /// order in [`SemanticService`]'s header holds because nothing else takes
@@ -1270,13 +1384,55 @@ impl SemanticService {
         &self,
         project_path: &Path,
         requested: LoadKind,
-        work: impl FnOnce(&Path, &mut ProjectContext) -> Result<T>,
+        work: impl Fn(&Path, &Analysis, &Vfs) -> Result<T>,
     ) -> Result<T> {
         let canonical = project_path.canonicalize()?;
         let slot = self.slot_for(&canonical);
-        let mut context = slot.lock();
+        let _spoil = SpoilOnPanic(&slot);
+        for attempt in 1..=QUERY_ATTEMPTS {
+            let context = self.up_to_date(&canonical, &slot, requested)?;
+            let ctx = context.as_ref().unwrap();
+            let analysis = ctx.host.analysis();
+            let vfs = Arc::clone(&ctx.vfs);
+            let last = attempt == QUERY_ATTEMPTS;
+            // Kept only on the last attempt: then no refresh can cancel it.
+            let _held = if last {
+                Some(context)
+            } else {
+                drop(context);
+                None
+            };
+            let outcome = {
+                let vfs = read_vfs(&vfs);
+                Cancelled::catch(std::panic::AssertUnwindSafe(|| {
+                    work(&canonical, &analysis, &vfs)
+                }))
+            };
+            match outcome {
+                Ok(Err(error)) if !last && is_cancellation(&error) => {}
+                Ok(answer) => return answer,
+                Err(_) if !last => {}
+                Err(cancelled) => return Err(cancelled.into()),
+            }
+            tracing::info!(
+                "a refresh of {} cancelled a query on it (attempt {attempt} of {QUERY_ATTEMPTS}); asking again",
+                canonical.display()
+            );
+        }
+        unreachable!("the last attempt returns")
+    }
 
-        let outcome = bring_up_to_date(&slot, &mut context, &canonical, requested);
+    /// The slot of `canonical`, locked, holding a context loaded to
+    /// `requested` and current with the tree — loaded or refreshed here if it
+    /// was not. Orders the use against the cap and evicts.
+    fn up_to_date<'s>(
+        &self,
+        canonical: &Path,
+        slot: &'s ProjectSlot,
+        requested: LoadKind,
+    ) -> Result<MutexGuard<'s, Option<ProjectContext>>> {
+        let mut context = slot.lock();
+        let outcome = bring_up_to_date(slot, &mut context, canonical, requested);
         let evicted = {
             let mut registry = self.registry();
             match outcome {
@@ -1285,10 +1441,10 @@ impl SemanticService {
                 Ok(()) => {
                     registry.clock += 1;
                     let clock = registry.clock;
-                    match registry.projects.get_mut(&canonical) {
-                        Some(entry) if Arc::ptr_eq(&entry.slot, &slot) => {
+                    match registry.projects.get_mut(canonical) {
+                        Some(entry) if std::ptr::eq(Arc::as_ptr(&entry.slot), slot) => {
                             entry.last_used = clock;
-                            registry.evict_to_capacity(&canonical)
+                            registry.evict_to_capacity(canonical)
                         }
                         // Cleared while this call worked: it still answers, but
                         // the context goes with it rather than back in the map.
@@ -1299,7 +1455,7 @@ impl SemanticService {
                 // and out of the map, so `status` does not show it loading.
                 Err(_) => {
                     if context.is_none() {
-                        registry.remove_if_same(&canonical, &slot);
+                        registry.remove_if_same(canonical, slot);
                     }
                     Vec::new()
                 }
@@ -1308,8 +1464,7 @@ impl SemanticService {
         // After the registry is let go: freeing a large database takes seconds.
         drop(evicted);
         outcome?;
-
-        work(&canonical, context.as_mut().unwrap())
+        Ok(context)
     }
 
     /// Get or load project with full workspace dependency edges.
@@ -1321,7 +1476,7 @@ impl SemanticService {
     /// half of — nothing requests it any more.
     #[cfg(test)]
     fn get_or_load_full(&self, project_path: &Path) -> Result<()> {
-        self.with_project(project_path, LoadKind::Full, |_, _| Ok(()))
+        self.with_project(project_path, LoadKind::Full, |_, _, _| Ok(()))
     }
 
     /// Search for symbols by name (for find_definition)
@@ -1361,10 +1516,10 @@ impl SemanticService {
         limit: usize,
         exact: bool,
     ) -> Result<Vec<Location>> {
-        self.with_project(project_path, LoadKind::Full, |canonical, ctx| {
+        self.with_project(project_path, LoadKind::Full, |canonical, analysis, vfs| {
             position::symbol_search_with_exact(
-                &ctx.host,
-                &ctx.vfs,
+                analysis,
+                vfs,
                 canonical,
                 symbol_name,
                 limit,
@@ -1386,8 +1541,8 @@ impl SemanticService {
         symbol_name: &str,
         limit: usize,
     ) -> Result<Vec<Location>> {
-        self.with_project(project_path, LoadKind::Full, |_, ctx| {
-            position::index_only_search(&ctx.host, &ctx.vfs, symbol_name, limit)
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs| {
+            position::index_only_search(analysis, vfs, symbol_name, limit)
         })
     }
 
@@ -1427,10 +1582,10 @@ impl SemanticService {
         symbol_name: &str,
         exact: bool,
     ) -> Result<Vec<Location>> {
-        self.with_project(project_path, LoadKind::Full, |canonical, ctx| {
+        self.with_project(project_path, LoadKind::Full, |canonical, analysis, vfs| {
             position::find_references_by_name_with_exact(
-                &ctx.host,
-                &ctx.vfs,
+                analysis,
+                vfs,
                 canonical,
                 symbol_name,
                 exact,
@@ -1445,8 +1600,8 @@ impl SemanticService {
         symbol_name: &str,
         new_name: &str,
     ) -> Result<RenamePreview> {
-        self.with_project(project_path, LoadKind::Full, |_, ctx| {
-            rename::rename_by_name(&ctx.host, &ctx.vfs, symbol_name, new_name)
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs| {
+            rename::rename_by_name(analysis, vfs, symbol_name, new_name)
         })
     }
 
@@ -1460,10 +1615,10 @@ impl SemanticService {
         symbol_name: &str,
         new_name: &str,
     ) -> Result<RenamePreview> {
-        self.with_project(project_path, LoadKind::Full, |_, ctx| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs| {
             rename::rename_by_position(
-                &ctx.host,
-                &ctx.vfs,
+                analysis,
+                vfs,
                 file_path,
                 line,
                 column,
@@ -1481,7 +1636,7 @@ impl SemanticService {
             canonical,
             ProjectContext {
                 host: AnalysisHost::new(None),
-                vfs: Vfs::default(),
+                vfs: shared_vfs(Vfs::default()),
                 load_kind: LoadKind::Fast,
                 stamps: HashMap::new(),
             },
@@ -3588,7 +3743,7 @@ pub fn a_local_of_the_same_name() -> u32 {
         service.with_context_for_test(&canonical, |ctx| {
             let db = ctx.host.raw_database();
             let sema = ra_ap_ide::Semantics::new(db);
-            for (file, _path) in ctx.vfs.iter() {
+            for (file, _path) in read_vfs(&ctx.vfs).iter() {
                 let root = db.file_source_root(file).source_root_id(db);
                 let library = db.source_root(root).source_root(db).is_library;
                 let bytes = db.file_text(file).text(db).len();
