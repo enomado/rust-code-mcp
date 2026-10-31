@@ -101,6 +101,26 @@ const DEFAULT_ANN_MIN_ROWS: usize = 100_000;
 //   below the scan. IVF training is randomised: recall moved by ~0.01 and
 //   the worst query by tens of ranks between builds of the same table.
 
+/// Deltas of the ANN index above which maintenance merges them into one.
+///
+/// lance's index pass (`OptimizeOptions::default()`) writes the rows added
+/// since the last pass as a NEW delta of the IVF_PQ index and merges nothing
+/// until a partition splits, so every changed sync added one: 197 deltas on a
+/// 249k-row store (2026-10-31). Two costs grow with them. Compaction bins
+/// only neighbouring fragments covered by the same set of index deltas
+/// (`DefaultCompactionPlanner::plan` in lance), so with a delta per fragment
+/// nothing compacted — 198 of 200 fragments small, "2 merged into 2" per
+/// pass. And `list_indices` reads every delta: 66–80 s per call at 199
+/// entries, which is where the minutes of a maintenance pass went (the
+/// optimize passes themselves took under a second each, measured on a copy
+/// with `examples/maintain_probe.rs`). Merging is cheap — 0.13–0.27 s for all
+/// 197–198 deltas on that copy, and
+/// the compaction it unblocked took the store from 200 fragments to 4 in
+/// 0.58 s — so the bound is the compaction gate: by the time eight small
+/// fragments pile up, they share one delta.
+const ANN_MAX_DELTAS_ENV: &str = "RMC_ANN_MAX_DELTAS";
+const DEFAULT_ANN_MAX_DELTAS: usize = COMPACT_MIN_SMALL_FRAGMENTS;
+
 /// PQ sub-vectors of the ANN index: an eighth of the dimension (see above).
 /// lance needs them to divide the dimension; for a dimension that is not a
 /// multiple of 8 lance's own default is used.
@@ -846,11 +866,22 @@ impl VectorStoreBackend for LanceDbBackend {
             .map_err(|e| backend("table version", e))?;
         let stats = table.stats().await.map_err(|e| backend("table stats", e))?;
         let mut indices = Vec::new();
-        for config in table
+        // One entry per DELTA of an index, all under the index's name, and
+        // `index_stats` answers for the whole index (and costs per delta):
+        // once per name, with the entries counted as its deltas.
+        let configs = table
             .list_indices()
             .await
-            .map_err(|e| backend("indices", e))?
-        {
+            .map_err(|e| backend("indices", e))?;
+        let mut deltas: HashMap<String, usize> = HashMap::new();
+        for config in &configs {
+            *deltas.entry(config.name.clone()).or_default() += 1;
+        }
+        let mut seen = HashSet::new();
+        for config in configs {
+            if !seen.insert(config.name.clone()) {
+                continue;
+            }
             // `None`: the index was dropped since the listing — `maintain`
             // of another daemon on the same table can do that. Gone is gone.
             let Some(coverage) = table
@@ -861,6 +892,7 @@ impl VectorStoreBackend for LanceDbBackend {
                 continue;
             };
             indices.push(VectorIndexCoverage {
+                deltas: deltas[&config.name],
                 name: config.name,
                 columns: config.columns,
                 indexed_rows: coverage.num_indexed_rows,
@@ -952,6 +984,13 @@ impl VectorStoreBackend for LanceDbBackend {
             .list_indices()
             .await
             .map_err(|e| VectorStoreError::backend(format!("Failed to list indices: {}", e)))?;
+        // `list_indices` has one entry per delta, all under the index's
+        // name: counting them is the cheap delta count (`index_stats` costs
+        // per delta, minutes on a store that piled them up).
+        let ann_deltas = indices
+            .iter()
+            .filter(|config| config.name == VECTOR_INDEX_NAME)
+            .count();
         for config in indices {
             if config
                 .columns
@@ -967,6 +1006,37 @@ impl VectorStoreBackend for LanceDbBackend {
                 tracing::info!("Dropped unused vector-store index {}", config.name);
             }
         }
+
+        // Extend every index over the rows written since the last pass —
+        // BEFORE compaction, which can only bin fragments covered by the
+        // same index deltas: a fragment left unindexed (or in a delta of its
+        // own) here stays a bin of one there. Compaction then moves rows and
+        // remaps the indices to their new addresses. Lance does not index on
+        // write, so without this pass an index covers what existed when it
+        // was created — for ours, an empty table — and every delete by
+        // `file_path` and lookup by `id` scans the column. Measured on a
+        // 0.93M-row copy (2026-10-29): the pass takes 0.7 s; the per-file
+        // delete drops from 20 to 5 ms.
+        //
+        // Past `RMC_ANN_MAX_DELTAS` the pass merges the ANN deltas into one
+        // instead of adding another (see the knob).
+        let max_deltas = knob(ANN_MAX_DELTAS_ENV, DEFAULT_ANN_MAX_DELTAS)?;
+        let index_options = if ann_deltas > max_deltas {
+            tracing::info!(
+                "Merging {} deltas of the ANN index (more than {})",
+                ann_deltas,
+                max_deltas
+            );
+            OptimizeOptions::merge(ann_deltas)
+        } else {
+            OptimizeOptions::default()
+        };
+        table
+            .optimize(OptimizeAction::Index(index_options))
+            .await
+            .map_err(|e| {
+                VectorStoreError::backend(format!("Failed to update vector-store indices: {}", e))
+            })?;
 
         // Compact only once enough small fragments piled up. Every write of
         // the background sync appends one small fragment, so compacting on
@@ -1002,27 +1072,19 @@ impl VectorStoreBackend for LanceDbBackend {
             None
         };
 
-        // Extend every index over the rows written since the last pass.
-        // After compaction, which moves rows and remaps the indices to their
-        // new addresses: indexing first would index rows about to move.
-        // Lance does not do this on write, so without it an index covers
-        // what existed when it was created — for ours, an empty table — and
-        // every delete by `file_path` and lookup by `id` scans the column.
-        // Measured on a 0.93M-row copy (2026-10-29): the pass takes 0.7 s;
-        // the per-file delete drops from 20 to 5 ms.
-        table
-            .optimize(OptimizeAction::Index(OptimizeOptions::default()))
-            .await
-            .map_err(|e| {
-                VectorStoreError::backend(format!("Failed to update vector-store indices: {}", e))
-            })?;
-
-        ensure_ann_index(
-            &table,
-            self.vector_dim,
-            knob(ANN_MIN_ROWS_ENV, DEFAULT_ANN_MIN_ROWS)?,
-        )
-        .await?;
+        // Only a table without the ANN index can need one built, and the
+        // listing above already said whether it has one. Not listed again:
+        // `list_indices` reads every delta's metadata — 66–80 s per call at
+        // 199 entries on a 249k-row copy (2026-10-31), 0.00 s after the
+        // merge — and with the drop step it was two such calls per pass.
+        if ann_deltas == 0 {
+            ensure_ann_index(
+                &table,
+                self.vector_dim,
+                knob(ANN_MIN_ROWS_ENV, DEFAULT_ANN_MIN_ROWS)?,
+            )
+            .await?;
+        }
 
         // `older_than` is the load-bearing argument, and it must be passed:
         // lance defaults it to SEVEN DAYS, and on a store written every few
@@ -1391,6 +1453,72 @@ mod tests {
         assert_eq!(hits.first().map(|hit| hit.chunk_id), Some(fresh_id));
     }
 
+    /// The ANN delta policy, over the sync's own shape: each changed sync
+    /// appends one fragment and runs `maintain`. The ANN index stays within
+    /// `DEFAULT_ANN_MAX_DELTAS` deltas, and because the merged fragments share
+    /// one delta, compaction bins them: the small fragments do not pile up.
+    /// Mutant `OptimizeOptions::default()` on every pass: one delta per sync
+    /// (rounds + 1 at the end) and no fragment ever compacted — both red.
+    #[tokio::test]
+    async fn maintain_merges_ann_deltas_so_compaction_can_bin_the_fragments() {
+        const DIM: usize = 32;
+        let temp_dir = TempDir::new().unwrap();
+        let backend = LanceDbBackend::new(temp_dir.path().to_path_buf(), DIM, "test-embedder:v1")
+            .await
+            .unwrap();
+        let insert = |from: usize, count: usize| {
+            (from..from + count)
+                .map(|i| {
+                    let id = ChunkId::new();
+                    (
+                        id,
+                        spread_vector(i, DIM),
+                        create_test_chunk(id, "fn f() {}", &format!("f{i}.rs")),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        backend.insert_chunks(insert(0, 2000)).await.unwrap();
+        let table = backend.get_table().await.unwrap();
+        assert!(ensure_ann_index(&table, DIM, 2000).await.unwrap());
+
+        let ann = |layout: &VectorStoreLayout| {
+            layout
+                .indices
+                .iter()
+                .find(|index| index.name == VECTOR_INDEX_NAME)
+                .cloned()
+                .expect("the ANN index exists")
+        };
+        let rounds = 2 * DEFAULT_ANN_MAX_DELTAS + 3;
+        let mut most_deltas = 0;
+        for round in 0..rounds {
+            backend
+                .insert_chunks(insert(10_000 + 10 * round, 10))
+                .await
+                .unwrap();
+            backend
+                .maintain(std::time::Duration::from_secs(3600))
+                .await
+                .unwrap();
+            let layout = backend.layout().await.unwrap();
+            let index = ann(&layout);
+            assert_eq!(index.unindexed_rows, 0, "round {round}: {layout:#?}");
+            most_deltas = most_deltas.max(index.deltas);
+        }
+        assert!(
+            most_deltas <= DEFAULT_ANN_MAX_DELTAS + 1,
+            "the ANN index grew to {most_deltas} deltas over {rounds} syncs"
+        );
+        let after = backend.layout().await.unwrap();
+        assert!(
+            after.fragments <= COMPACT_MIN_SMALL_FRAGMENTS + 1,
+            "{} fragments after {rounds} syncs: compaction binned nothing ({after:#?})",
+            after.fragments
+        );
+        assert_eq!(after.rows, 2000 + 10 * rounds);
+    }
+
     /// The oracle for the index pass in `maintain`: indices created on the
     /// empty table end up covering every row, and the unused `symbol_kind`
     /// index of a table created before it was dropped is gone. The mutant
@@ -1695,24 +1823,35 @@ mod tests {
             .ok()
             .map(|v| v.parse().unwrap())
             .or(ann_sub_vectors(384));
-        let cpu0 = cpu_secs();
-        let started = std::time::Instant::now();
-        let mut builder = IvfPqIndexBuilder::default().distance_type(DistanceType::Cosine);
-        if let Some(n) = sub_vectors {
-            builder = builder.num_sub_vectors(n);
+        // `RMC_LANCE_PROBE_KEEP_INDEX=1`: measure the index the copy already
+        // has — its deltas as the syncs left them, or as a merge left them —
+        // instead of building a fresh one.
+        if std::env::var("RMC_LANCE_PROBE_KEEP_INDEX").as_deref() == Ok("1") {
+            let index = table.index_stats(VECTOR_INDEX_NAME).await.unwrap().unwrap();
+            eprintln!(
+                "existing IVF_PQ kept: {:?} delta(s), {} unindexed rows",
+                index.num_indices, index.num_unindexed_rows
+            );
+        } else {
+            let cpu0 = cpu_secs();
+            let started = std::time::Instant::now();
+            let mut builder = IvfPqIndexBuilder::default().distance_type(DistanceType::Cosine);
+            if let Some(n) = sub_vectors {
+                builder = builder.num_sub_vectors(n);
+            }
+            table
+                .create_index(&[VECTOR_COLUMN], Index::IvfPq(builder))
+                .name(VECTOR_INDEX_NAME.to_string())
+                .replace(true)
+                .execute()
+                .await
+                .unwrap();
+            eprintln!(
+                "IVF_PQ sub_vectors={sub_vectors:?} built in {:.1}s, {:.0} CPU-s",
+                started.elapsed().as_secs_f64(),
+                cpu_secs() - cpu0
+            );
         }
-        table
-            .create_index(&[VECTOR_COLUMN], Index::IvfPq(builder))
-            .name(VECTOR_INDEX_NAME.to_string())
-            .replace(true)
-            .execute()
-            .await
-            .unwrap();
-        eprintln!(
-            "IVF_PQ sub_vectors={sub_vectors:?} built in {:.1}s, {:.0} CPU-s",
-            started.elapsed().as_secs_f64(),
-            cpu_secs() - cpu0
-        );
 
         // The defaults `search` runs with first, then neighbours of them.
         let defaults = (

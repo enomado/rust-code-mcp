@@ -62,6 +62,9 @@ pub struct VectorIndexCoverage {
     /// Rows a lookup through this index still has to scan for. An index
     /// that covers nothing is a full scan with extra steps.
     pub unindexed_rows: usize,
+    /// Deltas the index is stored as: each index pass that found new rows
+    /// adds one until maintenance merges them (`RMC_ANN_MAX_DELTAS`).
+    pub deltas: usize,
 }
 
 /// A search result from vector search
