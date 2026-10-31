@@ -85,7 +85,11 @@ impl GpuLock {
         let mut announced = false;
         while file.try_lock_exclusive().is_err() {
             if !announced {
+                // On the VRAM target, which the daemon's default filter keeps:
+                // a `search` waiting here for another daemon's indexing batch
+                // was otherwise invisible in its log.
                 tracing::info!(
+                    target: super::VRAM_LOG_TARGET,
                     "waiting for the GPU: another process is embedding ({}), lock {}",
                     holder(&mut file),
                     path.display()
@@ -102,7 +106,11 @@ impl GpuLock {
             std::thread::sleep(GPU_LOCK_POLL);
         }
         if announced {
-            tracing::info!("got the GPU after {:.1}s", started.elapsed().as_secs_f64());
+            tracing::info!(
+                target: super::VRAM_LOG_TARGET,
+                "got the GPU after {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
         }
         // Who holds it, for the next waiter's log line. Best effort: the lock
         // is what matters, not the note.
