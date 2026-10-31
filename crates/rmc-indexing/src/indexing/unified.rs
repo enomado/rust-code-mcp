@@ -88,7 +88,11 @@ impl VectorMaintenance {
     /// maintenance failure is a disk-space problem rather than an indexing
     /// one. Failing the run over it would mean a full disk also destroys
     /// the record of the work that did complete.
-    pub async fn run(&self) {
+    ///
+    /// `workspace` only names the pass in its `mem:` line: the line used to
+    /// say just "vector store maintenance", and a log of several projects'
+    /// syncs left `--tool-latency` to guess whose pass it was.
+    pub async fn run(&self, workspace: &Path) {
         if !vector_maintenance_enabled() {
             tracing::debug!(
                 "Vector store maintenance disabled by {}",
@@ -97,7 +101,10 @@ impl VectorMaintenance {
             return;
         }
         let started = std::time::Instant::now();
-        let mem = rmc_engine::mem_trace::MemSpan::start("vector store maintenance");
+        let mem = rmc_engine::mem_trace::MemSpan::start(format!(
+            "vector store maintenance of {}",
+            workspace.display()
+        ));
         let result = self.vector_store.maintain(vector_prune_keep()).await;
         mem.finish();
         match result {

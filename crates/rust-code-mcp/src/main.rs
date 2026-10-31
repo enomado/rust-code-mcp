@@ -8,6 +8,9 @@
 // the transport is a unix socket, other platforms keep the stdio server.
 #[cfg(unix)]
 mod daemon;
+// `--tool-latency`: the no-blocking oracle over daemon logs.
+#[cfg(unix)]
+mod tool_latency;
 
 // Every Rust allocation is counted by the heap census, which is how the memory
 // portrait (`analysis_memory`) tells the allocator's own overhead and C/C++
@@ -148,6 +151,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&stats)?);
             return Ok(());
         }
+        daemon::Mode::ToolLatency { logs, since, until } => {
+            let blocked = tool_latency::run(logs, *since, *until)?;
+            if blocked > 0 {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         daemon::Mode::Client { .. } | daemon::Mode::Daemon { .. } | daemon::Mode::InProcess => {}
     }
 
@@ -201,7 +211,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         | daemon::Mode::InProcess
         | daemon::Mode::Help
         | daemon::Mode::PrintSocket { .. }
-        | daemon::Mode::Bm25Stats { .. } => {}
+        | daemon::Mode::Bm25Stats { .. }
+        | daemon::Mode::ToolLatency { .. } => {}
     }
 
     tracing::info!("Starting MCP Server...");

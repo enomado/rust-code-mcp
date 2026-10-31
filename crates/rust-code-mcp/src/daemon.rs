@@ -194,7 +194,7 @@ const MOVE_RETRY: Duration = Duration::from_secs(60);
 
 /// How this process was started. Resolved *before* the expensive startup: a
 /// client needs neither a `ServerRuntime` nor a background sync task — it is a pipe.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     /// Server inside this process over stdio — the behaviour before the daemon.
     InProcess,
@@ -221,6 +221,14 @@ pub enum Mode {
     /// `--bm25-stats <DIR>`: print the state of the BM25 index in `DIR` as
     /// JSON and exit (diagnostics; safe on a live daemon's index).
     Bm25Stats { index_dir: PathBuf },
+    /// `--tool-latency <LOG>... [--since T] [--until T]`: judge every reading
+    /// tool call in daemon logs against the work that overlapped it, print
+    /// the report and exit 1 when a call was blocked (see `tool_latency`).
+    ToolLatency {
+        logs: Vec<PathBuf>,
+        since: Option<f64>,
+        until: Option<f64>,
+    },
     /// `--help`.
     Help,
 }
@@ -245,6 +253,9 @@ pub fn resolve_mode(args: &[String]) -> Result<Mode, BoxError> {
                     index_dir: PathBuf::from(value),
                 });
             }
+            // Reads log files only, like `--bm25-stats`; everything after it
+            // is its own: log paths and the window bounds.
+            "--tool-latency" => return parse_tool_latency(it.as_slice()),
             "--daemon" | "--client" | "--in-process" | "--print-socket" => {
                 if let Some(prev) = explicit {
                     return Err(format!("modes {prev} and {arg} are mutually exclusive").into());
@@ -294,6 +305,42 @@ pub fn resolve_mode(args: &[String]) -> Result<Mode, BoxError> {
     })
 }
 
+/// The arguments after `--tool-latency`: one or more logs, `--since T` and
+/// `--until T` (UTC, `2026-10-31T15:27:00Z`) bounding the calls judged.
+fn parse_tool_latency(args: &[String]) -> Result<Mode, BoxError> {
+    let mut logs = Vec::new();
+    let mut since = None;
+    let mut until = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--since" | "--until" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| BoxError::from(format!("{arg} requires a UTC time")))?;
+                let at = crate::tool_latency::parse_timestamp(value).ok_or_else(|| {
+                    BoxError::from(format!(
+                        "{arg} {value}: expected a UTC time like 2026-10-31T15:27:00Z"
+                    ))
+                })?;
+                if arg == "--since" {
+                    since = Some(at);
+                } else {
+                    until = Some(at);
+                }
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("--tool-latency: unknown argument {other}").into());
+            }
+            log => logs.push(PathBuf::from(log)),
+        }
+    }
+    if logs.is_empty() {
+        return Err("--tool-latency requires at least one daemon log".into());
+    }
+    Ok(Mode::ToolLatency { logs, since, until })
+}
+
 pub const USAGE: &str = "\
 rust-code-mcp — an MCP server for Rust codebases.
 
@@ -307,6 +354,11 @@ on demand.
   --bm25-stats <DIR>  print the BM25 index in DIR (segments, deleted documents,
                       bytes per file kind) as JSON and exit; reads meta.json
                       and file sizes only, safe on a running daemon's index
+  --tool-latency <LOG>... [--since T] [--until T]
+                      judge every reading tool call in daemon logs against the
+                      work that overlapped it (syncs, maintenance, other
+                      projects' loads, other calls); exit 1 when one was
+                      blocked. T is UTC, e.g. 2026-10-31T15:27:00Z
   --socket <PATH>     use this socket instead of the one derived from the
                       binary and the environment
   --idle-secs <N>     daemon exits after N seconds with no clients (0 = never);

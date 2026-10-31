@@ -835,6 +835,16 @@ fn load_into(
         requested,
         canonical.display()
     );
+    // Its own `mem:` line, so a load is an interval with a project in the log:
+    // loads of different projects run side by side since the per-project
+    // slots, and the "Loading …" / "IDE loaded successfully" pair no longer
+    // says which load ended. `--tool-latency` reads it to tell a query's own
+    // load (cost) from another project's (it must not be waited for).
+    let mem = rmc_engine::mem_trace::MemSpan::start(format!(
+        "analysis load {:?} of {}",
+        requested,
+        canonical.display()
+    ));
     // Stamps are taken BEFORE the load, not after: a file edited while
     // rust-analyzer was reading the workspace must come out stale on the
     // next query, not silently accepted as already analysed.
@@ -873,6 +883,7 @@ fn load_into(
         stamps,
     });
     slot.publish(Some(requested));
+    mem.finish();
     tracing::info!("IDE loaded successfully");
     Ok(())
 }

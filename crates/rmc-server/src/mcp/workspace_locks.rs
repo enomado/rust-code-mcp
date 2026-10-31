@@ -296,9 +296,11 @@ pub fn finish_index_writer(guard: MaintenanceGuard, maintenance: Option<VectorMa
     let Some(pass) = maintenance else {
         return;
     };
-    let workspace = guard.workspace().display().to_string();
+    let workspace_path = guard.workspace().to_path_buf();
+    let workspace = workspace_path.display().to_string();
     tokio::spawn(async move {
-        let run = run_outside_operation_lock(guard, async move { pass.run().await });
+        let run =
+            run_outside_operation_lock(guard, async move { pass.run(&workspace_path).await });
         if let Err(message) = crate::panic_boundary::catch_panic(run).await {
             tracing::error!(
                 target: "panic",

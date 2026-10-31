@@ -283,7 +283,7 @@ impl SyncManager {
         // and that keeps at most one pass of this loop running at a time.
         run_outside_operation_lock(writer.into_maintenance(), async {
             for pass in &maintenance {
-                pass.run().await;
+                pass.run(dir).await;
             }
         })
         .await;

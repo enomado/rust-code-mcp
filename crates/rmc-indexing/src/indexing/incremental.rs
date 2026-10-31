@@ -469,7 +469,7 @@ impl IncrementalIndexer {
     /// Process detected changes: add, modify, delete
     async fn process_changes(
         &mut self,
-        _codebase_path: &Path,
+        codebase_path: &Path,
         changes: ChangeSet,
         exclusion: ReaderExclusion<'_>,
     ) -> Result<IndexStats> {
@@ -480,7 +480,8 @@ impl IncrementalIndexer {
         let deleted_count = changes.deleted.len();
         let indexer = self.ensure_indexer().await?;
         let mem = rmc_engine::mem_trace::MemSpan::start(format!(
-            "index changes ({} added, {} modified, {} deleted)",
+            "index changes of {} ({} added, {} modified, {} deleted)",
+            codebase_path.display(),
             changes.added.len(),
             changes.modified.len(),
             deleted_count
@@ -750,7 +751,7 @@ mod tests {
             .index_with_change_detection(&codebase)
             .await
             .unwrap();
-        indexer.vector_maintenance().unwrap().run().await;
+        indexer.vector_maintenance().unwrap().run(&codebase).await;
         let store = indexer.indexer().unwrap().vector_store_cloned();
         let before = store.layout().await.unwrap();
 
@@ -770,7 +771,7 @@ mod tests {
         );
         // The caller's half of the contract, as the sync runs it.
         assert!(stats.needs_maintenance, "{stats:?}");
-        indexer.vector_maintenance().unwrap().run().await;
+        indexer.vector_maintenance().unwrap().run(&codebase).await;
 
         let after = store.layout().await.unwrap();
         assert_eq!(
