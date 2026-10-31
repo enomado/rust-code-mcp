@@ -34,6 +34,68 @@ use tracing;
 /// per 20 000 rows.
 const WRITE_BATCH_ROWS: usize = 20_000;
 
+/// How a run keeps the workspace's readers off the stores while it writes.
+///
+/// # The defect this closes
+///
+/// A background sync used to hold its workspace's operation lock for write
+/// for the whole run: the Merkle walk, the chunking and the embedding of every
+/// changed file, and only then the writes. A `search` of the workspace waited
+/// all of it. Measured on 2026-10-31 (16 changed files of a large workspace):
+/// the run took 23 s — Merkle 1.6 s, preparing and embedding 21 s — and its
+/// writes 0.4 s of that (store 0.1 s, BM25 commit 0.3 s). A reader needs to be
+/// kept off only while the stores change, so that it never sees a file's old
+/// chunks deleted and its new ones not yet appended, or vectors ahead of BM25.
+#[derive(Clone, Copy)]
+pub enum ReaderExclusion<'a> {
+    /// The caller keeps readers out for the whole run (it holds the operation
+    /// lock for write), or there are none (CLI, tests).
+    HeldByCaller,
+    /// The run takes this lock for write itself, only around what readers
+    /// could see half done: from its first store write to the BM25 commit,
+    /// and for the whole of a full pass. Preparation, embedding included, runs
+    /// beside the readers.
+    AroundPublish(&'a tokio::sync::RwLock<()>),
+}
+
+impl<'a> ReaderExclusion<'a> {
+    /// Keep the readers out from now until the returned guard drops. `None`
+    /// when the caller already does.
+    pub async fn exclude(self) -> Option<tokio::sync::RwLockWriteGuard<'a, ()>> {
+        match self {
+            Self::HeldByCaller => None,
+            Self::AroundPublish(lock) => Some(lock.write().await),
+        }
+    }
+}
+
+/// The readers' exclusion of a run that writes in steps: taken at the first
+/// write, held to the end, so a reader sees all of the run or none of it.
+struct Publishing<'a> {
+    exclusion: ReaderExclusion<'a>,
+    entered: bool,
+    guard: Option<tokio::sync::RwLockWriteGuard<'a, ()>>,
+}
+
+impl<'a> Publishing<'a> {
+    fn new(exclusion: ReaderExclusion<'a>) -> Self {
+        Self {
+            exclusion,
+            entered: false,
+            guard: None,
+        }
+    }
+
+    /// Called before every write; waits for the readers inside only the first
+    /// time.
+    async fn before_write(&mut self) {
+        if !self.entered {
+            self.guard = self.exclusion.exclude().await;
+            self.entered = true;
+        }
+    }
+}
+
 /// The writes a sync has prepared and not yet made.
 #[derive(Default)]
 struct PendingWrite {
@@ -256,6 +318,18 @@ impl IncrementalIndexer {
         &mut self,
         codebase_path: &Path,
     ) -> Result<IndexStats> {
+        self.index_with_change_detection_excluding(codebase_path, ReaderExclusion::HeldByCaller)
+            .await
+    }
+
+    /// [`Self::index_with_change_detection`], keeping the readers out as
+    /// `exclusion` says: with [`ReaderExclusion::AroundPublish`] the walk and
+    /// the preparation of changed files run beside them.
+    pub async fn index_with_change_detection_excluding(
+        &mut self,
+        codebase_path: &Path,
+        exclusion: ReaderExclusion<'_>,
+    ) -> Result<IndexStats> {
         tracing::info!(
             "Starting incremental indexing for {}",
             codebase_path.display()
@@ -292,6 +366,9 @@ impl IncrementalIndexer {
         // comes up, but a tick without file changes never creates one, and
         // the index would stay empty until some file changed — so it is
         // refilled here, without the indexer and its embedding session.
+        // Readers are not kept out for it: an empty BM25 index reads as
+        // "vectors only" and the refill appears whole at its commit — the same
+        // refill `search` itself runs under its read lock.
         if old_merkle.is_some()
             && self.indexer.is_none()
             && TantivyAdapter::is_empty_at(&self.config.tantivy_path)?
@@ -310,11 +387,13 @@ impl IncrementalIndexer {
         // Step 3: Determine indexing strategy
         let stats = if let Some(old) = old_merkle.as_ref() {
             // Incremental: compare trees and index only changes
-            self.incremental_update(codebase_path, &old, &new_merkle)
+            self.incremental_update(codebase_path, &old, &new_merkle, exclusion)
                 .await?
         } else {
-            // First time: full index with parallel processing
+            // First time: full index with parallel processing. It writes as it
+            // goes, so the readers stay out for all of it.
             tracing::info!("Performing full index (first time) with parallel processing");
+            let _readers_out = exclusion.exclude().await;
             self.ensure_indexer()
                 .await?
                 .index_directory_parallel(codebase_path)
@@ -348,6 +427,7 @@ impl IncrementalIndexer {
         codebase_path: &Path,
         old_merkle: &FileSystemMerkle,
         new_merkle: &FileSystemMerkle,
+        exclusion: ReaderExclusion<'_>,
     ) -> Result<IndexStats> {
         // Fast path: if trees identical, no work needed!
         if !new_merkle.has_changes(old_merkle) {
@@ -379,7 +459,9 @@ impl IncrementalIndexer {
         );
 
         // Process changes
-        let mut stats = self.process_changes(codebase_path, changes).await?;
+        let mut stats = self
+            .process_changes(codebase_path, changes, exclusion)
+            .await?;
         stats.total_files = new_merkle.file_count();
         Ok(stats)
     }
@@ -389,6 +471,7 @@ impl IncrementalIndexer {
         &mut self,
         _codebase_path: &Path,
         changes: ChangeSet,
+        exclusion: ReaderExclusion<'_>,
     ) -> Result<IndexStats> {
         let mut stats = IndexStats::default();
         let storage_path = self.config.cache_path.clone();
@@ -419,6 +502,11 @@ impl IncrementalIndexer {
             );
         }
 
+        // Readers stay in while files are prepared (chunked and embedded —
+        // nearly all of a run's time) and are kept out from the first write to
+        // the BM25 commit; see `ReaderExclusion`.
+        let mut publishing = Publishing::new(exclusion);
+
         // Modified files are prepared without the metadata cache: the Merkle
         // tree proved they changed, and a cache already describing the new
         // bytes (a run that wrote them but died before its snapshot) must not
@@ -445,13 +533,17 @@ impl IncrementalIndexer {
                 Err(e) => stats.record_error(path, &e),
             }
             if pending.rows >= WRITE_BATCH_ROWS {
+                publishing.before_write().await;
                 pending.flush(indexer, &mut stats).await;
             }
         }
+        publishing.before_write().await;
         pending.flush(indexer, &mut stats).await;
 
         // Commit changes to Tantivy
         indexer.commit()?;
+        // Readers come back in: both stores now show the whole run.
+        drop(publishing);
         mem.finish();
 
         tracing::info!(
@@ -706,6 +798,114 @@ mod tests {
         for index in &after.indices {
             assert_eq!(index.unindexed_rows, 0, "{index:#?}");
         }
+
+        let _ = std::fs::remove_file(snapshot_path);
+    }
+
+    /// A sync prepares its changed files beside the workspace's readers and
+    /// keeps them out only while it writes (`ReaderExclusion::AroundPublish`).
+    ///
+    /// A reader holds the lock for the whole of the run's preparation; the
+    /// run must still read and embed the changed file, then queue for the
+    /// write and wait there — not finish — until the reader leaves. The file
+    /// is rewritten once the run is queued: the store must hold what the run
+    /// read before it queued (`f0_second`), never the rewrite. Mutant
+    /// (checked 2026-10-31): taking the exclusion before the preparation loop
+    /// → the run queues at once and reads the file only after the reader
+    /// leaves, so it never indexes `f0_second` (red on the stats assertion).
+    #[tokio::test]
+    #[ignore] // Requires the CPU embedding model files
+    async fn a_sync_prepares_beside_the_readers_and_writes_without_them() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        let temp_dir = TempDir::new().unwrap();
+        let cache_path = temp_dir.path().join("cache");
+        let tantivy_path = temp_dir.path().join("tantivy");
+        let codebase = temp_dir.path().join("codebase");
+        std::fs::create_dir(&codebase).unwrap();
+        let write_f0 = |name: &str| {
+            std::fs::write(codebase.join("f0.rs"), format!("pub fn {name}() {{}}\n")).unwrap();
+        };
+        write_f0("f0_first");
+        std::fs::write(codebase.join("f1.rs"), "pub fn f1_only() {}\n").unwrap();
+
+        let backend = EmbeddingBackend::from_profile_name("local-cpu-small").unwrap();
+        let snapshot_path = get_snapshot_path_for_backend(&codebase, &backend);
+        let _ = std::fs::remove_file(&snapshot_path);
+        let mut indexer = IncrementalIndexer::with_backend(
+            &cache_path,
+            &tantivy_path,
+            "sync_beside_readers",
+            backend.dim(),
+            &backend.identity(),
+            None,
+            backend,
+        )
+        .await
+        .unwrap();
+        indexer
+            .index_with_change_detection(&codebase)
+            .await
+            .unwrap();
+
+        write_f0("f0_second");
+        let operation = tokio::sync::RwLock::new(());
+        let reader = operation.read().await;
+        let finished = AtomicBool::new(false);
+        let run = async {
+            let stats = indexer
+                .index_with_change_detection_excluding(
+                    &codebase,
+                    ReaderExclusion::AroundPublish(&operation),
+                )
+                .await
+                .unwrap();
+            finished.store(true, Ordering::SeqCst);
+            stats
+        };
+        let driver = async {
+            // A writer queued on tokio's fair lock makes `try_read` fail while
+            // our reader is still inside.
+            let deadline = Instant::now() + Duration::from_secs(120);
+            while operation.try_read().is_ok() {
+                assert!(
+                    !finished.load(Ordering::SeqCst),
+                    "the run finished without waiting for the reader inside"
+                );
+                assert!(Instant::now() < deadline, "the run never queued to write");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            write_f0("f0_third");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !finished.load(Ordering::SeqCst),
+                "the run wrote while a reader was inside"
+            );
+            drop(reader);
+        };
+        let (stats, ()) = tokio::join!(run, driver);
+        assert_eq!((stats.indexed_files, stats.failed_files), (1, 0), "{stats:?}");
+
+        let store = indexer.indexer().unwrap().vector_store_cloned();
+        let f0 = codebase.join("f0.rs");
+        let mut f0_contents = Vec::new();
+        store
+            .scan_chunks(&mut |batch| {
+                f0_contents.extend(
+                    batch
+                        .into_iter()
+                        .filter(|chunk| chunk.context.file_path == f0)
+                        .map(|chunk| chunk.content),
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let joined = f0_contents.join("\n");
+        assert!(joined.contains("f0_second"), "{f0_contents:?}");
+        assert!(!joined.contains("f0_third"), "{f0_contents:?}");
+        assert!(!joined.contains("f0_first"), "{f0_contents:?}");
 
         let _ = std::fs::remove_file(snapshot_path);
     }

@@ -21,7 +21,7 @@ mod unified;
 mod unified_parallel;
 
 pub(crate) use error::IndexingError;
-pub use incremental::{IncrementalIndexer, get_snapshot_path};
+pub use incremental::{IncrementalIndexer, ReaderExclusion, get_snapshot_path};
 pub use incremental_service::{
     IncrementalIndexOutcome, IncrementalIndexRequest, index_project_incrementally,
 };

@@ -461,7 +461,7 @@ pub(crate) async fn search(
                 sync_manager,
             )
             .await?;
-            crate::mcp::finish_index_writer(writer, maintenance);
+            crate::mcp::finish_index_writer(writer.into_maintenance(), maintenance);
             bm25 = try_open_bm25(&paths);
             (Some(st), None)
         }

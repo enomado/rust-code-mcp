@@ -7,9 +7,19 @@ use crate::mcp::defaults::is_background_embedding_backend;
 use crate::mcp::project_paths::{ProjectPaths, resolve_embedding_backend_for_mcp};
 use rmc_engine::embeddings::{EmbeddingBackend, Qwen3Variant};
 use rmc_engine::vector_store::VectorStoreError;
-use rmc_indexing::indexing::{IncrementalIndexRequest, IndexStats, index_project_incrementally};
+use rmc_indexing::indexing::{
+    IncrementalIndexRequest, IndexStats, ReaderExclusion, index_project_incrementally,
+};
 use rmcp::{ErrorData as McpError, model::CallToolResult, model::Content, schemars};
 use tracing;
+
+/// The lock an `index_codebase` run holds; see `crate::mcp::workspace_locks`.
+enum IndexCodebaseWriter {
+    /// Force or repair: readers out for the whole run.
+    WholeRun(crate::mcp::IndexWriterGuard),
+    /// Ordinary run: readers out only while it writes.
+    Store(crate::mcp::StoreWriterGuard),
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct IndexCodebaseParams {
@@ -272,12 +282,23 @@ pub async fn index_codebase(
         ));
     }
 
-    let writer = workspace_locks.lock_index_writer(&dir).await;
-    if force || repair {
+    // A force or repair run deletes before it writes, and a cached search
+    // runtime opened before the clear must not outlive it: readers stay out for
+    // the whole run. An ordinary run is a store writer, like a sync — readers
+    // are kept out only while it writes.
+    let writer = if force || repair {
+        let writer = workspace_locks.lock_index_writer(&dir).await;
         if let Some(search_cache) = search_cache {
             search_cache.invalidate_workspace(&dir);
         }
-    }
+        IndexCodebaseWriter::WholeRun(writer)
+    } else {
+        IndexCodebaseWriter::Store(workspace_locks.lock_store_writer(&dir).await)
+    };
+    let reader_exclusion = match &writer {
+        IndexCodebaseWriter::WholeRun(_) => ReaderExclusion::HeldByCaller,
+        IndexCodebaseWriter::Store(store) => ReaderExclusion::AroundPublish(store.operation_lock()),
+    };
 
     tracing::info!(
         "Indexing codebase: {} (force: {}, repair_coverage: {})",
@@ -325,12 +346,17 @@ pub async fn index_codebase(
         codebase_loc: None,
         force_reindex: force,
         repair_coverage: repair,
+        reader_exclusion,
     })
     .await
     .map_err(|error| indexing_error_to_mcp(error, &dir))?;
     // Indexing is done: readers of the workspace stop waiting here, and the
     // maintenance pass runs in the background under the maintenance lock.
-    crate::mcp::finish_index_writer(writer, outcome.maintenance.clone());
+    let maintenance_guard = match writer {
+        IndexCodebaseWriter::WholeRun(writer) => writer.into_maintenance(),
+        IndexCodebaseWriter::Store(writer) => writer.into_maintenance(),
+    };
+    crate::mcp::finish_index_writer(maintenance_guard, outcome.maintenance.clone());
     let stats = &outcome.stats;
 
     // Track directory for background sync if indexing was successful

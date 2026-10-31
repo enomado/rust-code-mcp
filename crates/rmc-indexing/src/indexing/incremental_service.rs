@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use rmc_engine::embeddings::EmbeddingBackend;
 
-use crate::indexing::incremental::IncrementalIndexer;
+use crate::indexing::incremental::{IncrementalIndexer, ReaderExclusion};
 use crate::indexing::unified::{IndexStats, VectorMaintenance};
 
 /// Request for an incremental indexing run.
@@ -25,6 +25,12 @@ pub struct IncrementalIndexRequest<'a> {
     /// chunks of files the tree no longer has. Ignored when `force_reindex` is
     /// set — that path clears everything anyway.
     pub repair_coverage: bool,
+    /// How the workspace's readers are kept off the stores while the run
+    /// writes. A force reindex and a coverage repair write before they
+    /// detect anything, so with [`ReaderExclusion::AroundPublish`] they keep
+    /// the readers out for the whole run; an ordinary run only around its
+    /// writes.
+    pub reader_exclusion: ReaderExclusion<'a>,
 }
 
 /// Result of an incremental indexing run.
@@ -57,7 +63,11 @@ trait IncrementalIndexRunner {
     async fn clear_all_data(&mut self) -> Result<()>;
     async fn forget_files_without_vectors(&mut self) -> Result<Vec<String>>;
     async fn drop_files_outside_tree(&mut self, codebase_path: &Path) -> Result<Vec<String>>;
-    async fn index_with_change_detection(&mut self, codebase_path: &Path) -> Result<IndexStats>;
+    async fn index_with_change_detection(
+        &mut self,
+        codebase_path: &Path,
+        exclusion: ReaderExclusion<'_>,
+    ) -> Result<IndexStats>;
     fn vector_maintenance(&self) -> Option<VectorMaintenance>;
 }
 
@@ -74,8 +84,13 @@ impl IncrementalIndexRunner for IncrementalIndexer {
         IncrementalIndexer::drop_files_outside_tree(self, codebase_path).await
     }
 
-    async fn index_with_change_detection(&mut self, codebase_path: &Path) -> Result<IndexStats> {
-        IncrementalIndexer::index_with_change_detection(self, codebase_path).await
+    async fn index_with_change_detection(
+        &mut self,
+        codebase_path: &Path,
+        exclusion: ReaderExclusion<'_>,
+    ) -> Result<IndexStats> {
+        IncrementalIndexer::index_with_change_detection_excluding(self, codebase_path, exclusion)
+            .await
     }
 
     fn vector_maintenance(&self) -> Option<VectorMaintenance> {
@@ -117,6 +132,20 @@ where
 {
     let start = Instant::now();
 
+    // Clearing and repairing write first and in pieces: readers stay out for
+    // all of such a run. An ordinary one leaves it to the indexer.
+    let writes_before_detection = request.force_reindex || request.repair_coverage;
+    let _readers_out = if writes_before_detection {
+        request.reader_exclusion.exclude().await
+    } else {
+        None
+    };
+    let detection_exclusion = if writes_before_detection {
+        ReaderExclusion::HeldByCaller
+    } else {
+        request.reader_exclusion
+    };
+
     if request.force_reindex {
         remove_snapshot(request.snapshot_path, "Force reindex")?;
     }
@@ -153,7 +182,7 @@ where
     }
 
     let stats = indexer
-        .index_with_change_detection(request.codebase_path)
+        .index_with_change_detection(request.codebase_path, detection_exclusion)
         .await?;
 
     // A force clear and a coverage drop write to the store as much as the
@@ -295,6 +324,7 @@ mod tests {
         async fn index_with_change_detection(
             &mut self,
             codebase_path: &Path,
+            _exclusion: ReaderExclusion<'_>,
         ) -> Result<IndexStats> {
             let mut state = self.state.lock().unwrap();
             state
@@ -351,6 +381,7 @@ mod tests {
                 codebase_loc: None,
                 force_reindex: true,
                 repair_coverage: false,
+                reader_exclusion: ReaderExclusion::HeldByCaller,
             },
             &factory,
         )
@@ -444,6 +475,7 @@ mod tests {
             codebase_loc: None,
             force_reindex,
             repair_coverage: true,
+            reader_exclusion: ReaderExclusion::HeldByCaller,
         }
     }
 
@@ -653,6 +685,7 @@ mod tests {
                 codebase_loc: Some(42),
                 force_reindex: false,
                 repair_coverage: false,
+                reader_exclusion: ReaderExclusion::HeldByCaller,
             },
             &factory,
         )
@@ -703,6 +736,7 @@ mod tests {
                 codebase_loc: None,
                 force_reindex: true,
                 repair_coverage: false,
+                reader_exclusion: ReaderExclusion::HeldByCaller,
             },
             &factory,
         )
@@ -739,6 +773,7 @@ mod tests {
                 codebase_loc: None,
                 force_reindex: false,
                 repair_coverage: false,
+                reader_exclusion: ReaderExclusion::HeldByCaller,
             },
             &factory,
         )
@@ -765,6 +800,7 @@ mod tests {
                 codebase_loc: None,
                 force_reindex: true,
                 repair_coverage: false,
+                reader_exclusion: ReaderExclusion::HeldByCaller,
             },
             &factory,
         )
@@ -791,6 +827,7 @@ mod tests {
                 codebase_loc: None,
                 force_reindex: false,
                 repair_coverage: false,
+                reader_exclusion: ReaderExclusion::HeldByCaller,
             },
             &factory,
         )

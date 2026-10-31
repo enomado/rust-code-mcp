@@ -7,7 +7,7 @@
 //! - Tracks multiple directories independently
 
 use rmc_indexing::indexing::{
-    index_project_incrementally, IncrementalIndexRequest, VectorMaintenance,
+    index_project_incrementally, IncrementalIndexRequest, ReaderExclusion, VectorMaintenance,
 };
 use crate::mcp::workspace_locks::run_outside_operation_lock;
 use anyhow::Result;
@@ -266,17 +266,22 @@ impl SyncManager {
     /// - < 10ms if no changes
     /// - Only reindexes changed files if changes detected
     async fn sync_directory(&self, dir: &Path) -> Result<()> {
-        let writer = self.workspace_locks.lock_index_writer(dir).await;
-        let maintenance = self.sync_directory_indexes(dir).await?;
+        // A store writer: the walk and the embedding of changed files run
+        // beside the workspace's readers, which are kept out only while the
+        // run writes (16 files, 2026-10-31: 0.4 s of a 23 s run).
+        let writer = self.workspace_locks.lock_store_writer(dir).await;
+        let maintenance = self
+            .sync_directory_indexes(dir, writer.operation_lock())
+            .await?;
         if maintenance.is_empty() {
             return Ok(());
         }
-        // The stores' maintenance runs after the operation lock goes: a
+        // The stores' maintenance runs outside the operation lock too: a
         // `search` of this workspace must not wait for it (it waited 413.9 s
         // for a 425.2 s pass, 2026-10-31). The next writer still does. Inline
         // rather than spawned: the sync visits its directories one by one,
         // and that keeps at most one pass of this loop running at a time.
-        run_outside_operation_lock(writer, async {
+        run_outside_operation_lock(writer.into_maintenance(), async {
             for pass in &maintenance {
                 pass.run().await;
             }
@@ -285,10 +290,15 @@ impl SyncManager {
         Ok(())
     }
 
-    /// The indexing half of [`Self::sync_directory`], under its writer lock.
-    /// Returns the maintenance passes the writes call for, one per index
-    /// that wrote.
-    async fn sync_directory_indexes(&self, dir: &Path) -> Result<Vec<VectorMaintenance>> {
+    /// The indexing half of [`Self::sync_directory`], under its store-writer
+    /// lock; `operation` is the workspace's operation lock, which each run
+    /// takes for write around its writes. Returns the maintenance passes the
+    /// writes call for, one per index that wrote.
+    async fn sync_directory_indexes(
+        &self,
+        dir: &Path,
+        operation: &tokio::sync::RwLock<()>,
+    ) -> Result<Vec<VectorMaintenance>> {
         use crate::mcp::project_paths::ProjectPaths;
         let mut maintenance = Vec::new();
 
@@ -355,6 +365,7 @@ impl SyncManager {
                 // Background sync only chases file changes; repairing coverage
                 // is an explicit, user-triggered decision.
                 repair_coverage: false,
+                reader_exclusion: ReaderExclusion::AroundPublish(operation),
             })
             .await?;
             mem.finish();
