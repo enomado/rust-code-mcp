@@ -146,10 +146,16 @@ async fn ensure_indexed(
     .await
     .map_err(|e| McpError::invalid_params(format!("Failed to initialize indexer: {}", e), None))?;
 
+    // Its own `mem:` line: a `search` that has to build the index first is
+    // long because of its own work (788 files, 600 s, 2026-10-31), and
+    // `--tool-latency` must be able to tell that from a wait.
+    let mem =
+        rmc_engine::mem_trace::MemSpan::start(format!("index build of {}", dir_path.display()));
     let stats = indexer
         .index_directory(dir_path)
         .await
         .map_err(|e| McpError::invalid_params(format!("Indexing failed: {}", e), None))?;
+    mem.finish();
 
     tracing::info!(
         "Indexed {} files ({} chunks), {} unchanged, {} skipped",

@@ -13,6 +13,9 @@
 //! - `own` — a rust-analyzer tool loading ITS OWN project pays for the load;
 //!   that is the call's cost, not a wait. Loads of any other project are not
 //!   (since the per-project slots one project's load must hold no other).
+//!   Likewise a `search` that builds the missing index of its directory
+//!   inside the call (an index build that began before the call is somebody
+//!   else's, and waiting for it counts).
 //! - `base` — the longest clean call of the same tool on the same workspace
 //!   (the same tool on any workspace when that one has none; 0 when the tool
 //!   never ran clean).
@@ -34,14 +37,16 @@
 //! - `mem: vector store maintenance[ of <dir>] took …`
 //! - `mem: index changes[ of <dir>] (…) took …`
 //! - `mem: analysis load <kind> of <dir> took …`
+//! - `mem: index build of <dir> took …`
 //!
 //! Older binaries wrote maintenance and index lines without the directory and
-//! had no load line. A dir-less line is given the directory of the sync or
-//! `index_codebase` call of the same process that encloses it; a load is the
-//! interval from `Loading <kind> IDE for project: <dir>` to the next
-//! `IDE loaded successfully` of the same process. That pairing is exact only
-//! while loads were serialised (before per-project slots); the report counts
-//! the closes that had more than one load open.
+//! had neither load nor build line. A dir-less line is given the directory of
+//! the sync or `index_codebase` call of the same process that encloses it; a
+//! load is the interval from `Loading <kind> IDE for project: <dir>` to the
+//! next `IDE loaded successfully` of the same process, a build from
+//! `Initializing unified indexer for <dir>` to the next `Indexed N files`.
+//! That pairing is exact only while such work did not overlap in a process;
+//! the report counts the closes that had more than one open.
 //!
 //! Intervals of different processes (daemons sharing a log over a binary
 //! swap) never overlap here: the locks in question are per process.
@@ -78,6 +83,8 @@ pub enum Kind {
     Maintenance,
     IndexChanges,
     AnalysisLoad,
+    /// A `search` building the missing index of its directory first.
+    IndexBuild,
 }
 
 impl Kind {
@@ -88,6 +95,7 @@ impl Kind {
             Kind::Maintenance => "vector store maintenance".to_string(),
             Kind::IndexChanges => "index changes".to_string(),
             Kind::AnalysisLoad => "analysis load".to_string(),
+            Kind::IndexBuild => "index build".to_string(),
         }
     }
 
@@ -126,11 +134,12 @@ impl Span {
 #[derive(Debug, Default)]
 pub struct Parsed {
     pub spans: Vec<Span>,
-    /// Loads rebuilt from the `Loading …` / `IDE loaded successfully` pair.
-    pub loads_from_text: usize,
-    /// …of which the close had more than one load open (paired with the
-    /// latest; exact only while loads were serialised).
-    pub loads_paired_by_guess: usize,
+    /// Loads and index builds rebuilt from their opening and closing text
+    /// lines ([`TEXT_PAIRS`]).
+    pub rebuilt_from_text: usize,
+    /// …of which the close had more than one open (paired with the latest;
+    /// exact only while such work did not overlap in a process).
+    pub paired_by_guess: usize,
 }
 
 /// Seconds since the Unix epoch of `2026-10-31T15:34:46.421517Z` (the
@@ -219,6 +228,8 @@ fn parse_mem(what_and_rest: &str) -> Option<(Kind, Option<String>, f64)> {
     } else if let Some(tail) = what.strip_prefix("analysis load ") {
         let (_, dir) = tail.split_once(" of ")?;
         (Kind::AnalysisLoad, Some(dir.to_string()))
+    } else if let Some(dir) = what.strip_prefix("index build of ") {
+        (Kind::IndexBuild, Some(dir.to_string()))
     } else {
         // `indexer init for …` and anything newer: not work a reader waits for.
         return None;
@@ -226,15 +237,41 @@ fn parse_mem(what_and_rest: &str) -> Option<(Kind, Option<String>, f64)> {
     Some((kind, workspace, secs))
 }
 
+/// Work an older binary logged as an opening and a closing text line instead
+/// of a `mem:` line.
+struct TextPair {
+    kind: Kind,
+    /// The directory, when `rest` (the line after the pid) opens one.
+    opens: fn(&str) -> Option<&str>,
+    closes: fn(&str) -> bool,
+}
+
+const TEXT_PAIRS: &[TextPair] = &[
+    TextPair {
+        kind: Kind::AnalysisLoad,
+        opens: |rest| rest.split_once(" IDE for project: ").map(|(_, dir)| dir),
+        closes: |rest| rest.ends_with("IDE loaded successfully"),
+    },
+    TextPair {
+        kind: Kind::IndexBuild,
+        opens: |rest| {
+            rest.split_once(
+                "rmc_server::tools::endpoints::query: Initializing unified indexer for ",
+            )
+            .map(|(_, dir)| dir)
+        },
+        closes: |rest| rest.contains("rmc_server::tools::endpoints::query: Indexed "),
+    },
+];
+
 /// Read the spans out of log text (several files: call once per file and
 /// [`Parsed::absorb`] — or feed the concatenation, the pairing is per pid).
 pub fn parse_log(text: &str) -> Parsed {
     let mut parsed = Parsed::default();
-    // Per pid: open `Loading …` lines (time, dir), and whether the process
-    // writes `analysis load` lines itself (then the text pair is ignored).
-    let mut open_loads: BTreeMap<u32, Vec<(f64, String)>> = BTreeMap::new();
-    let mut text_loads: Vec<Span> = Vec::new();
-    let mut text_guesses: Vec<bool> = Vec::new();
+    // Per (pair, pid): the open lines (time, dir). A process that writes the
+    // `mem:` line of a kind itself has its text pairs of that kind ignored.
+    let mut open: BTreeMap<(usize, u32), Vec<(f64, String)>> = BTreeMap::new();
+    let mut from_text: Vec<(Span, bool)> = Vec::new();
     for line in text.lines() {
         let Some((at, pid, rest)) = split_line(line) else {
             continue;
@@ -252,38 +289,44 @@ pub fn parse_log(text: &str) -> Parsed {
                     end: at,
                 });
             }
-        } else if let Some((_, tail)) = rest.split_once(" IDE for project: ") {
-            open_loads
-                .entry(pid)
-                .or_default()
-                .push((at, tail.trim().to_string()));
-        } else if rest.ends_with("IDE loaded successfully") {
-            let open = open_loads.entry(pid).or_default();
-            if let Some((start, dir)) = open.pop() {
-                text_guesses.push(!open.is_empty());
-                open.clear();
-                text_loads.push(Span {
-                    pid,
-                    kind: Kind::AnalysisLoad,
-                    workspace: Some(dir),
-                    start,
-                    end: at,
-                });
+        } else {
+            for (index, pair) in TEXT_PAIRS.iter().enumerate() {
+                if let Some(dir) = (pair.opens)(rest) {
+                    open.entry((index, pid))
+                        .or_default()
+                        .push((at, dir.trim().to_string()));
+                } else if (pair.closes)(rest) {
+                    let open = open.entry((index, pid)).or_default();
+                    // The latest open one; any earlier ones never closed
+                    // (failed) — or, where such work overlapped, a guess.
+                    if let Some((start, dir)) = open.pop() {
+                        let guessed = !open.is_empty();
+                        open.clear();
+                        let span = Span {
+                            pid,
+                            kind: pair.kind.clone(),
+                            workspace: Some(dir),
+                            start,
+                            end: at,
+                        };
+                        from_text.push((span, guessed));
+                    }
+                }
             }
         }
     }
-    let pids_with_mem_loads: Vec<u32> = parsed
+    let with_mem_lines: Vec<(Kind, u32)> = parsed
         .spans
         .iter()
-        .filter(|span| span.kind == Kind::AnalysisLoad)
-        .map(|span| span.pid)
+        .filter(|span| TEXT_PAIRS.iter().any(|pair| pair.kind == span.kind))
+        .map(|span| (span.kind.clone(), span.pid))
         .collect();
-    for (span, guessed) in text_loads.into_iter().zip(text_guesses) {
-        if pids_with_mem_loads.contains(&span.pid) {
+    for (span, guessed) in from_text {
+        if with_mem_lines.contains(&(span.kind.clone(), span.pid)) {
             continue;
         }
-        parsed.loads_from_text += 1;
-        parsed.loads_paired_by_guess += usize::from(guessed);
+        parsed.rebuilt_from_text += 1;
+        parsed.paired_by_guess += usize::from(guessed);
         parsed.spans.push(span);
     }
     attribute_dirless(&mut parsed.spans);
@@ -294,8 +337,8 @@ pub fn parse_log(text: &str) -> Parsed {
 impl Parsed {
     pub fn absorb(&mut self, other: Parsed) {
         self.spans.extend(other.spans);
-        self.loads_from_text += other.loads_from_text;
-        self.loads_paired_by_guess += other.loads_paired_by_guess;
+        self.rebuilt_from_text += other.rebuilt_from_text;
+        self.paired_by_guess += other.paired_by_guess;
         self.spans.sort_by(|a, b| a.end.total_cmp(&b.end));
     }
 }
@@ -402,7 +445,14 @@ pub fn judge(parsed: &Parsed, since: Option<f64>, until: Option<f64>) -> Vec<Jud
             let Some(part) = call.overlap(span) else {
                 continue;
             };
-            if analysis && span.kind == Kind::AnalysisLoad && span.workspace == call.workspace {
+            let same_workspace = span.workspace == call.workspace;
+            let own_load = analysis && span.kind == Kind::AnalysisLoad && same_workspace;
+            // Begun inside the call: this search's build. Begun before, it
+            // is another call's, and this one waited for it.
+            let own_build = span.kind == Kind::IndexBuild
+                && same_workspace
+                && span.start >= call.start - ROUNDING_SECS;
+            if own_load || own_build {
                 own_parts.push(part);
             } else {
                 other_parts.push(part);
@@ -552,8 +602,8 @@ pub fn report(parsed: &Parsed, judged: &[Judged]) -> (String, usize) {
     .unwrap();
     writeln!(
         out,
-        "rust-analyzer loads rebuilt from text lines: {} ({} paired by guess)",
-        parsed.loads_from_text, parsed.loads_paired_by_guess
+        "loads and index builds rebuilt from text lines: {} ({} paired by guess)",
+        parsed.rebuilt_from_text, parsed.paired_by_guess
     )
     .unwrap();
 
@@ -822,10 +872,7 @@ mod tests {
         );
         log += &mem("15:34:24.581", 7, "tool find_definition /w/small", 176.7);
         let parsed = parse_log(&log);
-        assert_eq!(
-            (parsed.loads_from_text, parsed.loads_paired_by_guess),
-            (3, 0)
-        );
+        assert_eq!((parsed.rebuilt_from_text, parsed.paired_by_guess), (3, 0));
 
         let judged = judge(&parsed, None, None);
         let first_small = judged
@@ -873,8 +920,9 @@ mod tests {
             "index changes of /w/b (1 added, 0 modified, 0 deleted)",
             1.0,
         );
+        log += &mem("10:02:00.000", 9, "index build of /w/c", 50.0);
         let parsed = parse_log(&log);
-        assert_eq!(parsed.loads_from_text, 0);
+        assert_eq!(parsed.rebuilt_from_text, 0);
         let workspaces: Vec<(Kind, Option<&str>)> = parsed
             .spans
             .iter()
@@ -886,8 +934,50 @@ mod tests {
                 (Kind::AnalysisLoad, Some("/w/a")),
                 (Kind::Maintenance, Some("/w/b")),
                 (Kind::IndexChanges, Some("/w/b")),
+                (Kind::IndexBuild, Some("/w/c")),
             ]
         );
+    }
+
+    /// A `search` that builds its directory's missing index inside the call
+    /// (measured 2026-10-31: 788 files, 600.4 s, a sync beside it 13.8 s) is
+    /// long by its own work; a second `search` of that directory, which
+    /// began after the build and waited for it, is blocked. Old text-pair form.
+    #[test]
+    fn a_search_building_its_index_pays_and_the_one_waiting_for_it_is_blocked() {
+        let query = "rmc_server::tools::endpoints::query";
+        let mut log = String::new();
+        log += &mem("18:00:01.000", 7, "tool search /w/sub", 0.5);
+        log += &mem("18:00:10.000", 7, "tool search /w/big", 0.5);
+        log += &text(
+            "18:10:43.905",
+            7,
+            query,
+            "Initializing unified indexer for /w/sub",
+        );
+        log += &mem("18:15:00.000", 7, "background sync of /w/big", 13.8);
+        log += &text(
+            "18:20:44.059",
+            7,
+            query,
+            "Indexed 781 files (32221 chunks), 0 unchanged, 7 skipped",
+        );
+        log += &mem("18:20:44.305", 7, "tool search /w/sub", 600.4);
+        log += &mem("18:20:44.900", 7, "tool search /w/sub", 300.0);
+        let parsed = parse_log(&log);
+        assert_eq!((parsed.rebuilt_from_text, parsed.paired_by_guess), (1, 0));
+        let judged = judge(&parsed, None, None);
+        let builder = judged
+            .iter()
+            .find(|j| (j.call.took() - 600.4).abs() < 0.05)
+            .unwrap();
+        assert!(builder.own > 600.0 && !builder.blocked, "{builder:?}");
+        let waiter = judged
+            .iter()
+            .find(|j| (j.call.took() - 300.0).abs() < 0.05)
+            .unwrap();
+        assert!(waiter.blocked && waiter.own == 0.0, "{waiter:?}");
+        assert_eq!(waiter.culprit.as_ref().unwrap().kind, Kind::IndexBuild);
     }
 
     /// Readers beside each other within the slack are not blocked, and a
