@@ -16,8 +16,8 @@ use crate::indexing::merkle::{ChangeSet, FileSystemMerkle};
 use crate::indexing::tantivy_adapter::TantivyAdapter;
 use crate::indexing::traversal::collect_project_rust_files;
 use crate::indexing::unified::{
-    IndexStats, Preparation, PreparedFile, UnifiedIndexer, ensure_index_disk_headroom,
-    rebuild_bm25_from_existing_store,
+    IndexStats, Preparation, PreparedFile, UnifiedIndexer, VectorMaintenance,
+    ensure_index_disk_headroom, rebuild_bm25_from_existing_store,
 };
 use anyhow::Result;
 use rmc_engine::embeddings::EmbeddingBackend;
@@ -333,13 +333,11 @@ impl IncrementalIndexer {
             stats.failed_files,
         );
 
-        // Vector-store maintenance is NOT hooked here, even though this
-        // looks like the natural place. The two branches above reach the
-        // store by different routes — a first-time index goes through
-        // `index_directory_parallel`, an update writes file by file — and
-        // only the second is peculiar to this function. Both are hooked at
-        // their own ends instead, which also covers the lazy
-        // `index_directory` path that never passes through here at all.
+        // Vector-store maintenance is not run here, nor anywhere in
+        // indexing: both branches above set `stats.needs_maintenance` at
+        // their own ends (a first-time index through
+        // `index_directory_parallel`, an update file by file), and the
+        // caller runs the pass after releasing its workspace lock.
 
         Ok(stats)
     }
@@ -463,13 +461,15 @@ impl IncrementalIndexer {
             stats.failed_files,
         );
 
-        // Reclaim what those writes left behind. Deletions count as writes
-        // here: they publish a version each without adding a fragment, and
-        // a tick that only removed files would otherwise pile up versions
-        // no pass ever collects. A tick that found nothing is skipped —
-        // there is nothing to compact and a pass would be pure I/O.
+        // Ask the caller to reclaim what those writes left behind (it runs
+        // the pass after releasing the workspace lock; see
+        // `IndexStats::needs_maintenance`). Deletions count as writes here:
+        // they publish a version each without adding a fragment, and a tick
+        // that only removed files would otherwise pile up versions no pass
+        // ever collects. A tick that found nothing asks for nothing — there
+        // is nothing to compact and a pass would be pure I/O.
         if stats.indexed_files > 0 || deleted_count > 0 {
-            indexer.maintain_vector_store().await;
+            stats.needs_maintenance = true;
         }
 
         Ok(stats)
@@ -507,7 +507,9 @@ impl IncrementalIndexer {
 
     /// Drop the files the stores hold but the tree under `codebase_path` no
     /// longer has; see [`UnifiedIndexer::drop_files_outside`]. A walk with
-    /// errors drops nothing — it may have missed live files.
+    /// errors drops nothing — it may have missed live files. A non-empty
+    /// result wrote to the vector store and so needs a maintenance pass,
+    /// which the caller runs (see `IndexStats::needs_maintenance`).
     pub async fn drop_files_outside_tree(&mut self, codebase_path: &Path) -> Result<Vec<String>> {
         let (tree, walk_errors) = collect_project_rust_files(codebase_path);
         if walk_errors > 0 {
@@ -519,11 +521,14 @@ impl IncrementalIndexer {
             return Ok(Vec::new());
         }
         let indexer = self.ensure_indexer().await?;
-        let dropped = indexer.drop_files_outside(&tree).await?;
-        if !dropped.is_empty() {
-            indexer.maintain_vector_store().await;
-        }
-        Ok(dropped)
+        indexer.drop_files_outside(&tree).await
+    }
+
+    /// The maintenance pass over this indexer's vector store, if the indexer
+    /// was ever opened (a run that found nothing never opens it, and then
+    /// wrote nothing to maintain).
+    pub fn vector_maintenance(&self) -> Option<VectorMaintenance> {
+        self.indexer.as_ref().map(UnifiedIndexer::vector_maintenance)
     }
 }
 
@@ -653,6 +658,7 @@ mod tests {
             .index_with_change_detection(&codebase)
             .await
             .unwrap();
+        indexer.vector_maintenance().unwrap().run().await;
         let store = indexer.indexer().unwrap().vector_store_cloned();
         let before = store.layout().await.unwrap();
 
@@ -670,6 +676,9 @@ mod tests {
             (4, 0),
             "{stats:?}"
         );
+        // The caller's half of the contract, as the sync runs it.
+        assert!(stats.needs_maintenance, "{stats:?}");
+        indexer.vector_maintenance().unwrap().run().await;
 
         let after = store.layout().await.unwrap();
         assert_eq!(

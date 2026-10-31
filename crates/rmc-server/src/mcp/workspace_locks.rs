@@ -1,24 +1,53 @@
 //! Per-workspace operation locks for index/cache state.
+//!
+//! # Lock order
+//!
+//! `global (read) → workspace operation → workspace maintenance`. Every
+//! acquisition below follows it; a new lock joins this list, not a call site.
+//!
+//! | Lock | Taken by | Protects |
+//! |---|---|---|
+//! | `global` read | every guard below | a whole-cache `lock_all` (directory-less `clear_cache`, shutdown) |
+//! | `global` write | [`WorkspaceLockRegistry::lock_all`] | everything: waits for every guard below |
+//! | operation | [`WorkspaceLockRegistry::lock_exclusive`], [`WorkspaceLockRegistry::lock_shared`], index writers | one operation on the workspace's index and caches at a time |
+//! | maintenance | index writers, [`MaintenanceGuard`] | the vector store against two writers: an indexing run and a maintenance pass (compaction, index extension, prune) |
+//!
+//! An index writer ([`IndexWriterGuard`]) holds all three. When its run
+//! leaves vector-store maintenance to do, it turns into a [`MaintenanceGuard`]
+//! ([`IndexWriterGuard::into_maintenance`]), which lets the operation lock go
+//! and keeps the maintenance lock: readers of the workspace (`lock_shared`)
+//! proceed while the pass runs — LanceDB gives them a committed version — the
+//! next index writer waits for the pass, and `lock_all` waits for it too.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rmc_indexing::indexing::VectorMaintenance;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 fn workspace_key(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
+/// The two per-workspace locks, in acquisition order.
+#[derive(Clone, Default)]
+struct WorkspaceSlot {
+    operation: Arc<Mutex<()>>,
+    maintenance: Arc<Mutex<()>>,
+}
+
 /// Registry of async locks keyed by canonical workspace directory.
 ///
-/// Two levels:
-/// - `global` is a read/write lock. Every per-workspace operation holds it
-///   for READ, so operations on different workspaces run concurrently;
-///   `lock_all` (whole-cache operations such as a directory-less
-///   `clear_cache`) takes it for WRITE and so excludes everyone.
-/// - `locks` holds one mutex per canonical workspace, serialising
-///   operations on the same workspace.
+/// Levels (see the module docs for the order and the table):
+/// - `global` is a read/write lock. Every per-workspace guard holds it for
+///   READ, so operations on different workspaces run concurrently; `lock_all`
+///   (whole-cache operations such as a directory-less `clear_cache`) takes it
+///   for WRITE and so excludes everyone.
+/// - per workspace, an operation mutex serialising operations on the same
+///   workspace, and a maintenance mutex serialising writers of its vector
+///   store (indexing runs and maintenance passes).
 ///
 /// The global level used to be a plain mutex taken by every workspace
 /// operation. On a shared daemon that made the per-workspace mutex
@@ -29,7 +58,7 @@ fn workspace_key(dir: &Path) -> PathBuf {
 #[derive(Clone, Default)]
 pub struct WorkspaceLockRegistry {
     global: Arc<RwLock<()>>,
-    locks: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    slots: Arc<Mutex<HashMap<PathBuf, WorkspaceSlot>>>,
 }
 
 impl WorkspaceLockRegistry {
@@ -37,30 +66,30 @@ impl WorkspaceLockRegistry {
         Self::default()
     }
 
-    async fn lock_for(&self, dir: &Path) -> (PathBuf, Arc<Mutex<()>>) {
+    async fn slot_for(&self, dir: &Path) -> (PathBuf, WorkspaceSlot) {
         let key = workspace_key(dir);
-        let lock = {
-            let mut locks = self.locks.lock().await;
-            locks
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
+        let slot = {
+            let mut slots = self.slots.lock().await;
+            slots.entry(key.clone()).or_default().clone()
         };
-        (key, lock)
+        (key, slot)
     }
 
     /// Take an exclusive workspace lock.
     ///
     /// Excludes other operations on the same workspace and `lock_all`, but
-    /// not operations on other workspaces. The global read guard is taken
-    /// first, so a pending `lock_all` writer is never starved by a stream
-    /// of workspace operations (tokio's `RwLock` is fair).
+    /// not operations on other workspaces, and not a maintenance pass of the
+    /// workspace's vector store: an operation that writes that store must
+    /// take [`Self::lock_index_writer`] instead. The global read guard is
+    /// taken first, so a pending `lock_all` writer is never starved by a
+    /// stream of workspace operations (tokio's `RwLock` is fair).
     pub async fn lock_exclusive(&self, dir: &Path) -> WorkspaceLockGuard {
         let global_guard = self.global.clone().read_owned().await;
-        let (workspace, lock) = self.lock_for(dir).await;
-        let guard = lock.lock_owned().await;
+        let (workspace, slot) = self.slot_for(dir).await;
+        let guard = slot.operation.clone().lock_owned().await;
         WorkspaceLockGuard {
             workspace,
+            maintenance: slot.maintenance,
             _global_guard: global_guard,
             _guard: guard,
         }
@@ -70,13 +99,22 @@ impl WorkspaceLockRegistry {
     ///
     /// This is intentionally backed by the same mutex as exclusive locks. It
     /// keeps the first implementation conservative while preserving a call
-    /// shape that can move to a real read/write lock later.
+    /// shape that can move to a real read/write lock later. It does NOT wait
+    /// for a maintenance pass of the workspace's vector store.
     pub async fn lock_shared(&self, dir: &Path) -> WorkspaceLockGuard {
         self.lock_exclusive(dir).await
     }
 
+    /// Take the lock of an operation that writes the workspace's vector store
+    /// (indexing, clearing it): the operation lock and then the maintenance
+    /// lock, so it waits for a maintenance pass in flight and no pass starts
+    /// under it.
+    pub async fn lock_index_writer(&self, dir: &Path) -> IndexWriterGuard {
+        self.lock_exclusive(dir).await.into_index_writer().await
+    }
+
     /// Take the global operation lock: waits for every in-flight workspace
-    /// operation and blocks new ones until dropped.
+    /// operation and maintenance pass, and blocks new ones until dropped.
     pub async fn lock_all(&self) -> WorkspaceGlobalLockGuard {
         WorkspaceGlobalLockGuard {
             _global_guard: self.global.clone().write_owned().await,
@@ -87,6 +125,9 @@ impl WorkspaceLockRegistry {
 /// Held workspace operation lock.
 pub struct WorkspaceLockGuard {
     workspace: PathBuf,
+    /// The workspace's maintenance lock, not held: what
+    /// [`Self::into_index_writer`] takes next, in order.
+    maintenance: Arc<Mutex<()>>,
     _global_guard: OwnedRwLockReadGuard<()>,
     _guard: OwnedMutexGuard<()>,
 }
@@ -95,6 +136,96 @@ impl WorkspaceLockGuard {
     pub fn workspace(&self) -> &Path {
         &self.workspace
     }
+
+    /// Become an index writer: keep this operation lock and take the
+    /// workspace's maintenance lock after it (the lock order). For an
+    /// operation that learns only under the lock that it has to write the
+    /// store — `search` on a missing or corrupt index indexes it.
+    pub async fn into_index_writer(self) -> IndexWriterGuard {
+        let maintenance_guard = self.maintenance.clone().lock_owned().await;
+        IndexWriterGuard {
+            workspace: self.workspace,
+            _global_guard: self._global_guard,
+            operation_guard: self._guard,
+            maintenance_guard,
+        }
+    }
+}
+
+/// Held lock of a vector-store writer: global read, operation, maintenance.
+pub struct IndexWriterGuard {
+    workspace: PathBuf,
+    _global_guard: OwnedRwLockReadGuard<()>,
+    operation_guard: OwnedMutexGuard<()>,
+    maintenance_guard: OwnedMutexGuard<()>,
+}
+
+impl IndexWriterGuard {
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    /// Let the operation lock go and keep the rest: the writer is done
+    /// indexing and only its vector-store maintenance remains. No other
+    /// writer slips in between — they need the maintenance lock this keeps.
+    pub fn into_maintenance(self) -> MaintenanceGuard {
+        drop(self.operation_guard);
+        MaintenanceGuard {
+            workspace: self.workspace,
+            _global_guard: self._global_guard,
+            _maintenance_guard: self.maintenance_guard,
+        }
+    }
+}
+
+/// Held maintenance lock of a workspace (with the global read guard): a
+/// vector-store maintenance pass runs under it, outside the operation lock.
+pub struct MaintenanceGuard {
+    workspace: PathBuf,
+    _global_guard: OwnedRwLockReadGuard<()>,
+    _maintenance_guard: OwnedMutexGuard<()>,
+}
+
+impl MaintenanceGuard {
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+}
+
+/// Run a writer's vector-store maintenance outside its operation lock.
+///
+/// The one place an index writer finishes: the guard turns into a
+/// [`MaintenanceGuard`] BEFORE `maintenance` is polled, so the workspace's
+/// readers do not wait for the pass (measured 2026-10-31: `search` waited
+/// 413.9 s for a 425.2 s pass that ran under the operation lock), while the
+/// next writer and `lock_all` still do.
+pub async fn run_outside_operation_lock<F>(writer: IndexWriterGuard, maintenance: F) -> F::Output
+where
+    F: Future,
+{
+    let _maintenance_guard = writer.into_maintenance();
+    maintenance.await
+}
+
+/// Finish an index writer that answers a tool call: release the operation
+/// lock now and run the vector-store maintenance its run calls for (if any)
+/// in the background, under the maintenance lock — the caller answers without
+/// waiting for the pass, and so do the workspace's readers. A panic in the
+/// pass is logged like a failed sync, not lost with the task.
+pub fn finish_index_writer(writer: IndexWriterGuard, maintenance: Option<VectorMaintenance>) {
+    let Some(pass) = maintenance else {
+        return;
+    };
+    let workspace = writer.workspace().display().to_string();
+    tokio::spawn(async move {
+        let run = run_outside_operation_lock(writer, async move { pass.run().await });
+        if let Err(message) = crate::panic_boundary::catch_panic(run).await {
+            tracing::error!(
+                target: "panic",
+                "vector store maintenance of {workspace} panicked: {message}; the next write runs it again"
+            );
+        }
+    });
 }
 
 /// Held global operation lock.
@@ -197,5 +328,132 @@ mod tests {
         let guard = registry.lock_exclusive(&workspace.join(".")).await;
 
         assert_eq!(guard.workspace(), std::fs::canonicalize(&workspace).unwrap());
+    }
+
+    /// A maintenance pass that runs until the test lets it finish, through
+    /// [`run_outside_operation_lock`] as the index writers run theirs.
+    /// Returns the release switch and the task; the pass has started when
+    /// this returns.
+    async fn hold_maintenance(
+        registry: &WorkspaceLockRegistry,
+        workspace: &Path,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let writer = registry.lock_index_writer(workspace).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(run_outside_operation_lock(writer, async move {
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+        }));
+        started_rx.await.unwrap();
+        (release_tx, task)
+    }
+
+    fn workspace_in(temp_dir: &TempDir) -> PathBuf {
+        let workspace = temp_dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        workspace
+    }
+
+    /// The point of the maintenance lock: a reader of the workspace does not
+    /// wait for the vector-store maintenance a sync left behind (it waited
+    /// 413.9 s on 2026-10-31). Mutant: poll the pass before turning the
+    /// guard into a `MaintenanceGuard` → this times out.
+    #[tokio::test]
+    async fn reader_passes_a_maintenance_pass_in_flight() {
+        let registry = WorkspaceLockRegistry::new();
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = workspace_in(&temp_dir);
+
+        let (release, pass) = hold_maintenance(&registry, &workspace).await;
+        let reader =
+            tokio::time::timeout(Duration::from_secs(5), registry.lock_shared(&workspace)).await;
+        assert!(reader.is_ok(), "lock_shared waited for the maintenance pass");
+        drop(reader);
+
+        release.send(()).unwrap();
+        pass.await.unwrap();
+    }
+
+    /// Two writers of one vector store stay serialised: the next indexing run
+    /// waits for the maintenance pass in flight.
+    #[tokio::test]
+    async fn index_writer_waits_for_a_maintenance_pass() {
+        let registry = WorkspaceLockRegistry::new();
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = workspace_in(&temp_dir);
+
+        let (release, pass) = hold_maintenance(&registry, &workspace).await;
+        let waiter_registry = registry.clone();
+        let waiter_workspace = workspace.clone();
+        let writer = tokio::spawn(async move {
+            let _guard = waiter_registry.lock_index_writer(&waiter_workspace).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !writer.is_finished(),
+            "an index writer started while a maintenance pass was running"
+        );
+
+        release.send(()).unwrap();
+        pass.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("the index writer did not get the lock after the pass")
+            .unwrap();
+    }
+
+    /// A search that turns into a writer under its shared lock waits for the
+    /// pass the same way.
+    #[tokio::test]
+    async fn reader_turned_writer_waits_for_a_maintenance_pass() {
+        let registry = WorkspaceLockRegistry::new();
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = workspace_in(&temp_dir);
+
+        let (release, pass) = hold_maintenance(&registry, &workspace).await;
+        let reader = tokio::time::timeout(Duration::from_secs(5), registry.lock_shared(&workspace))
+            .await
+            .expect("lock_shared waited for the maintenance pass");
+        let writer = tokio::spawn(reader.into_index_writer());
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!writer.is_finished());
+
+        release.send(()).unwrap();
+        pass.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("the reader never became a writer after the pass")
+            .unwrap();
+    }
+
+    /// `clear_cache` without a directory deletes stores wholesale: it must
+    /// not run under a maintenance pass.
+    #[tokio::test]
+    async fn global_lock_waits_for_a_maintenance_pass() {
+        let registry = WorkspaceLockRegistry::new();
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = workspace_in(&temp_dir);
+
+        let (release, pass) = hold_maintenance(&registry, &workspace).await;
+        let waiter_registry = registry.clone();
+        let global = tokio::spawn(async move {
+            let _guard = waiter_registry.lock_all().await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!global.is_finished(), "lock_all ran under a maintenance pass");
+
+        release.send(()).unwrap();
+        pass.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), global)
+            .await
+            .expect("lock_all did not get the lock after the pass")
+            .unwrap();
     }
 }

@@ -41,6 +41,80 @@ pub struct IndexStats {
     pub retry_files: Vec<PathBuf>,
     /// Total number of chunks generated
     pub total_chunks: usize,
+    /// The run wrote to the vector store (appended, rewrote or dropped
+    /// files), so it left versions and fragments a [`VectorMaintenance`]
+    /// pass should reclaim.
+    ///
+    /// Indexing never runs that pass itself: the caller holds the
+    /// workspace's exclusive lock while indexing, and maintenance of a large
+    /// store takes minutes (425 s on a 249k-row table, 2026-10-31) — run
+    /// under the same lock it kept every `search` of the workspace waiting.
+    /// The caller releases the workspace lock first and then runs
+    /// maintenance under the workspace's maintenance lock.
+    pub needs_maintenance: bool,
+}
+
+/// Reclaims the disk space an indexing run's writes left behind: compaction,
+/// index extension, old-version prune (`VectorStore::maintain`).
+///
+/// Every path that writes to the vector store — whole directory, parallel
+/// whole directory, the per-file incremental update, dropping files outside
+/// the tree — reports it through [`IndexStats::needs_maintenance`] (or, for
+/// the drop, a non-empty result), and its caller runs this handle. The
+/// handle holds only the store, not the indexer: the metadata cache and the
+/// Tantivy writer are closed by the time it runs, so a reader that opens
+/// them meanwhile finds them free.
+///
+/// Concurrent readers are safe: LanceDB readers see a committed version
+/// (MVCC), and the prune keeps every version younger than
+/// `RMC_VECTOR_PRUNE_KEEP_SECS` for a reader that opened one before the pass
+/// began. Concurrent WRITERS are not, which is the caller's job: run this
+/// under the workspace's maintenance lock, which every index writer takes.
+#[derive(Clone)]
+pub struct VectorMaintenance {
+    vector_store: VectorStore,
+}
+
+impl std::fmt::Debug for VectorMaintenance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VectorMaintenance")
+    }
+}
+
+impl VectorMaintenance {
+    /// Run the pass.
+    ///
+    /// Deliberately infallible: the index is correct either way, and a
+    /// maintenance failure is a disk-space problem rather than an indexing
+    /// one. Failing the run over it would mean a full disk also destroys
+    /// the record of the work that did complete.
+    pub async fn run(&self) {
+        if !vector_maintenance_enabled() {
+            tracing::debug!(
+                "Vector store maintenance disabled by {}",
+                VECTOR_MAINTENANCE_ENV
+            );
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mem = rmc_engine::mem_trace::MemSpan::start("vector store maintenance");
+        let result = self.vector_store.maintain(vector_prune_keep()).await;
+        mem.finish();
+        match result {
+            Ok(stats) => tracing::info!(
+                "Vector store maintenance: {} fragment(s) merged into {}, {} old version(s) pruned, {:.1} MiB reclaimed in {:.2}s",
+                stats.fragments_removed,
+                stats.fragments_added,
+                stats.old_versions_removed,
+                stats.bytes_removed as f64 / (1024.0 * 1024.0),
+                started.elapsed().as_secs_f64(),
+            ),
+            Err(e) => tracing::warn!(
+                "Vector store maintenance failed (index is still correct, disk use will keep growing): {}",
+                e
+            ),
+        }
+    }
 }
 
 impl IndexStats {
@@ -627,7 +701,7 @@ impl UnifiedIndexer {
         );
 
         if stats.indexed_files > 0 || dropped > 0 {
-            self.maintain_vector_store().await;
+            stats.needs_maintenance = true;
         }
 
         Ok(stats)
@@ -750,7 +824,7 @@ impl UnifiedIndexer {
         );
 
         if stats.indexed_files > 0 || dropped > 0 {
-            self.maintain_vector_store().await;
+            stats.needs_maintenance = true;
         }
 
         Ok(stats)
@@ -848,44 +922,12 @@ impl UnifiedIndexer {
         self.tantivy.commit()
     }
 
-    /// Reclaim the disk space this run's writes left behind.
-    ///
-    /// Call this from EVERY path that writes to the vector store, and only
-    /// after one that actually wrote. There are three such paths — whole
-    /// directory, parallel whole directory, and the per-file incremental
-    /// update — and they do not nest, so a hook on any one of them would
-    /// leave the other two growing. The 5-minute background sync uses the
-    /// per-file path, which makes it the one that matters most.
-    ///
-    /// Deliberately infallible: the index is correct either way, and a
-    /// maintenance failure is a disk-space problem rather than an indexing
-    /// one. Failing the run over it would mean a full disk also destroys
-    /// the record of the work that did complete.
-    pub async fn maintain_vector_store(&self) {
-        if !vector_maintenance_enabled() {
-            tracing::debug!(
-                "Vector store maintenance disabled by {}",
-                VECTOR_MAINTENANCE_ENV
-            );
-            return;
-        }
-        let started = std::time::Instant::now();
-        let mem = rmc_engine::mem_trace::MemSpan::start("vector store maintenance");
-        let result = self.vector_store.maintain(vector_prune_keep()).await;
-        mem.finish();
-        match result {
-            Ok(stats) => tracing::info!(
-                "Vector store maintenance: {} fragment(s) merged into {}, {} old version(s) pruned, {:.1} MiB reclaimed in {:.2}s",
-                stats.fragments_removed,
-                stats.fragments_added,
-                stats.old_versions_removed,
-                stats.bytes_removed as f64 / (1024.0 * 1024.0),
-                started.elapsed().as_secs_f64(),
-            ),
-            Err(e) => tracing::warn!(
-                "Vector store maintenance failed (index is still correct, disk use will keep growing): {}",
-                e
-            ),
+    /// The maintenance pass over this indexer's vector store, as a handle
+    /// that outlives the indexer and the caller's workspace lock — see
+    /// [`IndexStats::needs_maintenance`] for when to run it and why not here.
+    pub fn vector_maintenance(&self) -> VectorMaintenance {
+        VectorMaintenance {
+            vector_store: self.vector_store.clone(),
         }
     }
 

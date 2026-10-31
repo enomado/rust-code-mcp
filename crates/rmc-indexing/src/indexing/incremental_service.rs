@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use rmc_engine::embeddings::EmbeddingBackend;
 
 use crate::indexing::incremental::IncrementalIndexer;
-use crate::indexing::unified::IndexStats;
+use crate::indexing::unified::{IndexStats, VectorMaintenance};
 
 /// Request for an incremental indexing run.
 pub struct IncrementalIndexRequest<'a> {
@@ -38,6 +38,11 @@ pub struct IncrementalIndexOutcome {
     /// Files the coverage repair found in the stores but not in the tree, and
     /// dropped from both.
     pub dropped_files: Vec<String>,
+    /// The vector-store maintenance pass this run's writes call for, or
+    /// `None` when it wrote nothing. NOT run here: the caller runs it after
+    /// releasing its workspace lock, under the workspace's maintenance lock
+    /// (see `IndexStats::needs_maintenance`).
+    pub maintenance: Option<VectorMaintenance>,
 }
 
 /// Index a project through the indexing-owned incremental service boundary.
@@ -53,6 +58,7 @@ trait IncrementalIndexRunner {
     async fn forget_files_without_vectors(&mut self) -> Result<Vec<String>>;
     async fn drop_files_outside_tree(&mut self, codebase_path: &Path) -> Result<Vec<String>>;
     async fn index_with_change_detection(&mut self, codebase_path: &Path) -> Result<IndexStats>;
+    fn vector_maintenance(&self) -> Option<VectorMaintenance>;
 }
 
 impl IncrementalIndexRunner for IncrementalIndexer {
@@ -70,6 +76,10 @@ impl IncrementalIndexRunner for IncrementalIndexer {
 
     async fn index_with_change_detection(&mut self, codebase_path: &Path) -> Result<IndexStats> {
         IncrementalIndexer::index_with_change_detection(self, codebase_path).await
+    }
+
+    fn vector_maintenance(&self) -> Option<VectorMaintenance> {
+        IncrementalIndexer::vector_maintenance(self)
     }
 }
 
@@ -146,11 +156,21 @@ where
         .index_with_change_detection(request.codebase_path)
         .await?;
 
+    // A force clear and a coverage drop write to the store as much as the
+    // indexing does; either alone calls for the pass.
+    let wrote = stats.needs_maintenance || request.force_reindex || !dropped_files.is_empty();
+    let maintenance = if wrote {
+        indexer.vector_maintenance()
+    } else {
+        None
+    };
+
     Ok(IncrementalIndexOutcome {
         stats,
         elapsed: start.elapsed(),
         repaired_files,
         dropped_files,
+        maintenance,
     })
 }
 
@@ -285,6 +305,16 @@ mod tests {
             }
             Ok(state.stats.clone())
         }
+
+        /// Records the request; the fake has no store to hand out.
+        fn vector_maintenance(&self) -> Option<VectorMaintenance> {
+            self.state
+                .lock()
+                .unwrap()
+                .events
+                .push("maintenance".to_string());
+            None
+        }
     }
 
     fn test_backend() -> EmbeddingBackend {
@@ -330,14 +360,67 @@ mod tests {
         let state = factory.state.lock().unwrap();
         assert!(!snapshot_path.exists());
         assert_eq!(outcome.stats.indexed_files, 2);
+        // The clear wrote to the store: the facade asks for the pass, after
+        // indexing and without running it.
         assert_eq!(
             state.events,
             vec![
                 "create".to_string(),
                 "clear".to_string(),
-                format!("index:{}", codebase_path.display())
+                format!("index:{}", codebase_path.display()),
+                "maintenance".to_string(),
             ]
         );
+    }
+
+    /// The maintenance pass is requested exactly when the run wrote to the
+    /// store: an indexing write or a coverage drop asks for it, a run that
+    /// found nothing does not.
+    #[tokio::test]
+    async fn maintenance_is_requested_only_after_a_write() {
+        let temp_dir = TempDir::new().unwrap();
+        let codebase_path = temp_dir.path().join("codebase");
+        let cache_path = temp_dir.path().join("cache");
+        let tantivy_path = temp_dir.path().join("tantivy");
+        let snapshot_path = temp_dir.path().join("snapshot");
+        std::fs::create_dir(&codebase_path).unwrap();
+
+        let requested = |needs_maintenance: bool, outside_files: Vec<String>| {
+            let factory = FakeFactory::default();
+            {
+                let mut state = factory.state.lock().unwrap();
+                state.stats.needs_maintenance = needs_maintenance;
+                state.outside_files = outside_files;
+            }
+            let backend = test_backend();
+            let embedder_identity = backend.identity();
+            let codebase_path = codebase_path.clone();
+            let cache_path = cache_path.clone();
+            let tantivy_path = tantivy_path.clone();
+            let snapshot_path = snapshot_path.clone();
+            async move {
+                index_project_incrementally_with_factory(
+                    repair_request(
+                        &codebase_path,
+                        &cache_path,
+                        &tantivy_path,
+                        &snapshot_path,
+                        backend,
+                        &embedder_identity,
+                        false,
+                    ),
+                    &factory,
+                )
+                .await
+                .unwrap();
+                let state = factory.state.lock().unwrap();
+                state.events.iter().any(|event| event == "maintenance")
+            }
+        };
+
+        assert!(!requested(false, Vec::new()).await);
+        assert!(requested(true, Vec::new()).await);
+        assert!(requested(false, vec!["/repo/gone.rs".to_string()]).await);
     }
 
     /// Build a request whose paths live under `temp_dir`, for the repair tests.
@@ -538,7 +621,8 @@ mod tests {
             vec![
                 "create".to_string(),
                 "clear".to_string(),
-                format!("index:{}", codebase_path.display())
+                format!("index:{}", codebase_path.display()),
+                "maintenance".to_string(),
             ]
         );
     }

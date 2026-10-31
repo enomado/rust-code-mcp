@@ -118,7 +118,9 @@ pub(crate) async fn clear_cache(
         // Clear cache for specific project
         let directory = crate::tools::paths::require_absolute("directory", directory)?;
         let target = target_directory(&directory);
-        let _workspace_lock = workspace_locks.lock_exclusive(&target.canonical).await;
+        // Deletes the workspace's stores: a writer, so it waits for a
+        // maintenance pass in flight rather than deleting under it.
+        let _workspace_lock = workspace_locks.lock_index_writer(&target.canonical).await;
         if !dry_run {
             if let Some(sync_manager) = sync_manager {
                 sync_manager.untrack_directory(&target.canonical).await;

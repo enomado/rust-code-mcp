@@ -272,7 +272,7 @@ pub async fn index_codebase(
         ));
     }
 
-    let _workspace_lock = workspace_locks.lock_exclusive(&dir).await;
+    let writer = workspace_locks.lock_index_writer(&dir).await;
     if force || repair {
         if let Some(search_cache) = search_cache {
             search_cache.invalidate_workspace(&dir);
@@ -328,6 +328,9 @@ pub async fn index_codebase(
     })
     .await
     .map_err(|error| indexing_error_to_mcp(error, &dir))?;
+    // Indexing is done: readers of the workspace stop waiting here, and the
+    // maintenance pass runs in the background under the maintenance lock.
+    crate::mcp::finish_index_writer(writer, outcome.maintenance.clone());
     let stats = &outcome.stats;
 
     // Track directory for background sync if indexing was successful

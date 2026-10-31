@@ -15,6 +15,7 @@ use rmc_engine::embeddings::{EmbeddingBackend, EmbeddingGenerator};
 use rmc_engine::search::{Bm25Search, HybridSearch};
 use rmc_indexing::indexing::{
     open_bm25_search, rebuild_bm25_from_existing_store, IndexStats, UnifiedIndexer,
+    VectorMaintenance,
 };
 use crate::mcp::{SearchRuntimeCache, SearchRuntimeCacheEntry, SearchRuntimeCacheKey};
 use crate::mcp::project_paths::{
@@ -119,14 +120,15 @@ fn select_index_paths(
         .map_err(|msg| McpError::invalid_params(msg, None))
 }
 
-/// Initialize indexer and run incremental indexing, returning stats.
-/// Only called when we actually need to index.
+/// Initialize indexer and run incremental indexing, returning stats and the
+/// vector-store maintenance the run calls for (the caller runs it after
+/// releasing its operation lock). Only called when we actually need to index.
 async fn ensure_indexed(
     dir_path: &Path,
     paths: &ProjectPaths,
     backend: EmbeddingBackend,
     sync_manager: Option<&std::sync::Arc<crate::mcp::SyncManager>>,
-) -> Result<IndexStats, McpError> {
+) -> Result<(IndexStats, Option<VectorMaintenance>), McpError> {
     tracing::info!("Initializing unified indexer for {}", dir_path.display());
     let resolved = resolve_query_backend(paths, backend)?;
     let backend = resolved.backend;
@@ -163,7 +165,10 @@ async fn ensure_indexed(
         }
     }
 
-    Ok(stats)
+    let maintenance = stats
+        .needs_maintenance
+        .then(|| indexer.vector_maintenance());
+    Ok((stats, maintenance))
 }
 
 /// Resolve the embedding backend the query side should use.
@@ -382,7 +387,7 @@ pub(crate) async fn search(
         ));
     }
 
-    let _workspace_lock = workspace_locks.lock_shared(dir_path).await;
+    let workspace_lock = workspace_locks.lock_shared(dir_path).await;
 
     let requested_backend = resolve_embedding_backend_for_mcp(embedding_profile, dir_path)?;
     let paths = select_index_paths(dir_path, &requested_backend)?;
@@ -421,29 +426,35 @@ pub(crate) async fn search(
     }
 
     let mut rebuilt = false;
-    let stats = if vector_index_exists && (bm25.is_some() || bm25_missing) {
+    // The read side keeps its shared lock for the whole query; the write
+    // side below gives its lock up as soon as the index is built (the query
+    // then reads committed versions, like any reader during maintenance).
+    let (stats, _reader_lock) = if vector_index_exists && (bm25.is_some() || bm25_missing) {
         if let Some(ref sync_mgr) = sync_manager {
             sync_mgr
                 .track_directory_for_backend(dir_path.to_path_buf(), &requested_backend)
                 .await;
         }
-        None
+        (None, Some(workspace_lock))
     } else {
-        // Corrupt or missing — clean stale caches to force full reindex
+        // Corrupt or missing — this search becomes the index's writer: it
+        // waits for a maintenance pass in flight before it deletes anything.
+        let writer = workspace_lock.into_index_writer().await;
         rebuilt = paths.tantivy_path.exists();
         if let Some(search_cache) = search_cache {
             search_cache.invalidate_workspace(dir_path);
         }
         clean_stale_index(&paths);
-        let st = ensure_indexed(
+        let (st, maintenance) = ensure_indexed(
             dir_path,
             &paths,
             requested_backend.clone(),
             sync_manager,
         )
         .await?;
+        crate::mcp::finish_index_writer(writer, maintenance);
         bm25 = try_open_bm25(&paths);
-        Some(st)
+        (Some(st), None)
     };
 
     // Handle case where first-time indexing produced nothing

@@ -6,7 +6,10 @@
 //! - Uses the indexing incremental service for fast change detection
 //! - Tracks multiple directories independently
 
-use rmc_indexing::indexing::{index_project_incrementally, IncrementalIndexRequest};
+use rmc_indexing::indexing::{
+    index_project_incrementally, IncrementalIndexRequest, VectorMaintenance,
+};
+use crate::mcp::workspace_locks::run_outside_operation_lock;
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -263,9 +266,31 @@ impl SyncManager {
     /// - < 10ms if no changes
     /// - Only reindexes changed files if changes detected
     async fn sync_directory(&self, dir: &Path) -> Result<()> {
-        use crate::mcp::project_paths::ProjectPaths;
+        let writer = self.workspace_locks.lock_index_writer(dir).await;
+        let maintenance = self.sync_directory_indexes(dir).await?;
+        if maintenance.is_empty() {
+            return Ok(());
+        }
+        // The stores' maintenance runs after the operation lock goes: a
+        // `search` of this workspace must not wait for it (it waited 413.9 s
+        // for a 425.2 s pass, 2026-10-31). The next writer still does. Inline
+        // rather than spawned: the sync visits its directories one by one,
+        // and that keeps at most one pass of this loop running at a time.
+        run_outside_operation_lock(writer, async {
+            for pass in &maintenance {
+                pass.run().await;
+            }
+        })
+        .await;
+        Ok(())
+    }
 
-        let _workspace_lock = self.workspace_locks.lock_exclusive(dir).await;
+    /// The indexing half of [`Self::sync_directory`], under its writer lock.
+    /// Returns the maintenance passes the writes call for, one per index
+    /// that wrote.
+    async fn sync_directory_indexes(&self, dir: &Path) -> Result<Vec<VectorMaintenance>> {
+        use crate::mcp::project_paths::ProjectPaths;
+        let mut maintenance = Vec::new();
 
         // Background sync maintains the automatic profile's index and nothing
         // else. A directory can carry several indexes at once — typically a
@@ -284,7 +309,7 @@ impl SyncManager {
                 "No existing embedding indexes found for {}; sync skipped",
                 dir.display()
             );
-            return Ok(());
+            return Ok(maintenance);
         }
 
         for indexed in indexes {
@@ -333,6 +358,7 @@ impl SyncManager {
             })
             .await?;
             mem.finish();
+            maintenance.extend(outcome.maintenance);
             let stats = outcome.stats;
 
             if stats.indexed_files > 0 {
@@ -352,7 +378,7 @@ impl SyncManager {
             }
         }
 
-        Ok(())
+        Ok(maintenance)
     }
 
     /// Trigger an immediate sync for all tracked directories
