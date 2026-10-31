@@ -9,15 +9,22 @@
 //! |---|---|---|
 //! | `global` read | every guard below | a whole-cache `lock_all` (directory-less `clear_cache`, shutdown) |
 //! | `global` write | [`WorkspaceLockRegistry::lock_all`] | everything: waits for every guard below |
-//! | operation | [`WorkspaceLockRegistry::lock_exclusive`], [`WorkspaceLockRegistry::lock_shared`], index writers | one operation on the workspace's index and caches at a time |
+//! | operation read | [`WorkspaceLockRegistry::lock_shared`] | the workspace's index and caches against a writer, while readers run side by side |
+//! | operation write | [`WorkspaceLockRegistry::lock_exclusive`], index writers | one writing operation on the workspace's index and caches, with no reader inside |
 //! | maintenance | index writers, [`MaintenanceGuard`] | the vector store against two writers: an indexing run and a maintenance pass (compaction, index extension, prune) |
 //!
-//! An index writer ([`IndexWriterGuard`]) holds all three. When its run
-//! leaves vector-store maintenance to do, it turns into a [`MaintenanceGuard`]
-//! ([`IndexWriterGuard::into_maintenance`]), which lets the operation lock go
-//! and keeps the maintenance lock: readers of the workspace (`lock_shared`)
-//! proceed while the pass runs — LanceDB gives them a committed version — the
-//! next index writer waits for the pass, and `lock_all` waits for it too.
+//! An index writer ([`IndexWriterGuard`]) holds the operation lock for write and
+//! the maintenance lock. When its run leaves vector-store maintenance to do, it
+//! turns into a [`MaintenanceGuard`] ([`IndexWriterGuard::into_maintenance`]),
+//! which lets the operation lock go and keeps the maintenance lock: readers of
+//! the workspace (`lock_shared`) proceed while the pass runs — LanceDB gives
+//! them a committed version — the next index writer waits for the pass, and
+//! `lock_all` waits for it too.
+//!
+//! A read guard does not upgrade. An operation that learns under its read lock
+//! that it has to write (`search` on a missing or corrupt index) lets it go,
+//! takes [`WorkspaceLockRegistry::lock_index_writer`], and checks again under
+//! that: another reader may have done the writing while it waited.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -34,7 +41,7 @@ fn workspace_key(dir: &Path) -> PathBuf {
 /// The two per-workspace locks, in acquisition order.
 #[derive(Clone, Default)]
 struct WorkspaceSlot {
-    operation: Arc<Mutex<()>>,
+    operation: Arc<RwLock<()>>,
     maintenance: Arc<Mutex<()>>,
 }
 
@@ -45,9 +52,9 @@ struct WorkspaceSlot {
 ///   READ, so operations on different workspaces run concurrently; `lock_all`
 ///   (whole-cache operations such as a directory-less `clear_cache`) takes it
 ///   for WRITE and so excludes everyone.
-/// - per workspace, an operation mutex serialising operations on the same
-///   workspace, and a maintenance mutex serialising writers of its vector
-///   store (indexing runs and maintenance passes).
+/// - per workspace, an operation read/write lock — readers side by side, a
+///   writing operation alone — and a maintenance mutex serialising writers of
+///   its vector store (indexing runs and maintenance passes).
 ///
 /// The global level used to be a plain mutex taken by every workspace
 /// operation. On a shared daemon that made the per-workspace mutex
@@ -86,31 +93,50 @@ impl WorkspaceLockRegistry {
     pub async fn lock_exclusive(&self, dir: &Path) -> WorkspaceLockGuard {
         let global_guard = self.global.clone().read_owned().await;
         let (workspace, slot) = self.slot_for(dir).await;
-        let guard = slot.operation.clone().lock_owned().await;
+        let guard = slot.operation.clone().write_owned().await;
         WorkspaceLockGuard {
             workspace,
-            maintenance: slot.maintenance,
             _global_guard: global_guard,
-            _guard: guard,
+            _operation: OperationGuard::Write(guard),
         }
     }
 
-    /// Take a read-side workspace lock.
+    /// Take a read-side workspace lock: waits for a writing operation on the
+    /// workspace, not for other readers, and NOT for a maintenance pass of its
+    /// vector store.
     ///
-    /// This is intentionally backed by the same mutex as exclusive locks. It
-    /// keeps the first implementation conservative while preserving a call
-    /// shape that can move to a real read/write lock later. It does NOT wait
-    /// for a maintenance pass of the workspace's vector store.
+    /// The holder must not write the workspace's index or caches. What the
+    /// readers do share is guarded on its own: the search cache has its own
+    /// mutex, a BM25 refill takes tantivy's writer lock (a second refill is
+    /// refused, not queued, and that search reads vectors alone), and a reader
+    /// that turns out to need a writer takes [`Self::lock_index_writer`] after
+    /// letting this go.
     pub async fn lock_shared(&self, dir: &Path) -> WorkspaceLockGuard {
-        self.lock_exclusive(dir).await
+        let global_guard = self.global.clone().read_owned().await;
+        let (workspace, slot) = self.slot_for(dir).await;
+        let guard = slot.operation.clone().read_owned().await;
+        WorkspaceLockGuard {
+            workspace,
+            _global_guard: global_guard,
+            _operation: OperationGuard::Read(guard),
+        }
     }
 
     /// Take the lock of an operation that writes the workspace's vector store
-    /// (indexing, clearing it): the operation lock and then the maintenance
-    /// lock, so it waits for a maintenance pass in flight and no pass starts
-    /// under it.
+    /// (indexing, clearing it): the operation lock for write and then the
+    /// maintenance lock, so it waits for a maintenance pass in flight and no
+    /// pass starts under it.
     pub async fn lock_index_writer(&self, dir: &Path) -> IndexWriterGuard {
-        self.lock_exclusive(dir).await.into_index_writer().await
+        let global_guard = self.global.clone().read_owned().await;
+        let (workspace, slot) = self.slot_for(dir).await;
+        let operation_guard = slot.operation.clone().write_owned().await;
+        let maintenance_guard = slot.maintenance.clone().lock_owned().await;
+        IndexWriterGuard {
+            workspace,
+            _global_guard: global_guard,
+            operation_guard,
+            maintenance_guard,
+        }
     }
 
     /// Take the global operation lock: waits for every in-flight workspace
@@ -122,41 +148,31 @@ impl WorkspaceLockRegistry {
     }
 }
 
-/// Held workspace operation lock.
+/// Either side of a workspace's operation lock — held, never read.
+enum OperationGuard {
+    Read(#[allow(dead_code)] OwnedRwLockReadGuard<()>),
+    Write(#[allow(dead_code)] OwnedRwLockWriteGuard<()>),
+}
+
+/// Held workspace operation lock, read or write.
 pub struct WorkspaceLockGuard {
     workspace: PathBuf,
-    /// The workspace's maintenance lock, not held: what
-    /// [`Self::into_index_writer`] takes next, in order.
-    maintenance: Arc<Mutex<()>>,
     _global_guard: OwnedRwLockReadGuard<()>,
-    _guard: OwnedMutexGuard<()>,
+    _operation: OperationGuard,
 }
 
 impl WorkspaceLockGuard {
     pub fn workspace(&self) -> &Path {
         &self.workspace
     }
-
-    /// Become an index writer: keep this operation lock and take the
-    /// workspace's maintenance lock after it (the lock order). For an
-    /// operation that learns only under the lock that it has to write the
-    /// store — `search` on a missing or corrupt index indexes it.
-    pub async fn into_index_writer(self) -> IndexWriterGuard {
-        let maintenance_guard = self.maintenance.clone().lock_owned().await;
-        IndexWriterGuard {
-            workspace: self.workspace,
-            _global_guard: self._global_guard,
-            operation_guard: self._guard,
-            maintenance_guard,
-        }
-    }
 }
 
-/// Held lock of a vector-store writer: global read, operation, maintenance.
+/// Held lock of a vector-store writer: global read, operation write,
+/// maintenance.
 pub struct IndexWriterGuard {
     workspace: PathBuf,
     _global_guard: OwnedRwLockReadGuard<()>,
-    operation_guard: OwnedMutexGuard<()>,
+    operation_guard: OwnedRwLockWriteGuard<()>,
     maintenance_guard: OwnedMutexGuard<()>,
 }
 
@@ -407,28 +423,61 @@ mod tests {
             .unwrap();
     }
 
-    /// A search that turns into a writer under its shared lock waits for the
-    /// pass the same way.
+    /// Readers of one workspace do not wait for each other: a long `search`
+    /// (or `get_similar_code`, `codemap`) does not hold up the next one.
+    /// Mutant (checked 2026-10-31): `lock_shared` taking the write side → this
+    /// times out.
     #[tokio::test]
-    async fn reader_turned_writer_waits_for_a_maintenance_pass() {
+    async fn readers_of_one_workspace_do_not_wait_for_each_other() {
         let registry = WorkspaceLockRegistry::new();
         let temp_dir = TempDir::new().unwrap();
         let workspace = workspace_in(&temp_dir);
 
-        let (release, pass) = hold_maintenance(&registry, &workspace).await;
-        let reader = tokio::time::timeout(Duration::from_secs(5), registry.lock_shared(&workspace))
-            .await
-            .expect("lock_shared waited for the maintenance pass");
-        let writer = tokio::spawn(reader.into_index_writer());
+        let _first = registry.lock_shared(&workspace).await;
+        let second =
+            tokio::time::timeout(Duration::from_secs(5), registry.lock_shared(&workspace)).await;
+        assert!(second.is_ok(), "a second reader waited for the first");
+    }
 
+    /// The other half of a read/write lock: a writing operation (a sync's
+    /// index run, `index_codebase`, `clear_cache` of the workspace) waits for
+    /// the readers inside, and a reader arriving meanwhile waits for it — a
+    /// reader never sees an index mid-write.
+    #[tokio::test]
+    async fn a_writer_waits_for_readers_and_readers_wait_for_a_writer() {
+        let registry = WorkspaceLockRegistry::new();
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = workspace_in(&temp_dir);
+
+        let reader = registry.lock_shared(&workspace).await;
+        let writer = tokio::spawn({
+            let registry = registry.clone();
+            let workspace = workspace.clone();
+            async move {
+                let _guard = registry.lock_index_writer(&workspace).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!writer.is_finished());
+        assert!(!writer.is_finished(), "an index writer ran beside a reader");
 
-        release.send(()).unwrap();
-        pass.await.unwrap();
+        drop(reader);
+        // The writer now holds the lock (or is about to): a reader waits.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let late_reader = tokio::spawn({
+            let registry = registry.clone();
+            let workspace = workspace.clone();
+            async move {
+                let _guard = registry.lock_shared(&workspace).await;
+            }
+        });
         tokio::time::timeout(Duration::from_secs(5), writer)
             .await
-            .expect("the reader never became a writer after the pass")
+            .expect("the writer never got the lock after the reader left")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), late_reader)
+            .await
+            .expect("the reader never got the lock after the writer left")
             .unwrap();
     }
 

@@ -84,7 +84,13 @@ pub(crate) async fn handle_build_codemap(
     let include_snippets = include_snippets.unwrap_or(false);
 
     let directory_path = crate::tools::paths::require_absolute("directory", directory)?;
-    let _workspace_lock = workspace_locks.lock_shared(&directory_path).await;
+    // `compute_missing` writes the graph's embedding cache, so it is a writer,
+    // like `semantic_overlaps`; the other policies only read.
+    let _workspace_lock = if policy == EmbeddingPolicy::ComputeMissing {
+        workspace_locks.lock_exclusive(&directory_path).await
+    } else {
+        workspace_locks.lock_shared(&directory_path).await
+    };
 
     let opts = CodemapOptions {
         max_nodes,

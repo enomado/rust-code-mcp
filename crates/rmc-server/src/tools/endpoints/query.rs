@@ -437,24 +437,34 @@ pub(crate) async fn search(
         }
         (None, Some(workspace_lock))
     } else {
-        // Corrupt or missing — this search becomes the index's writer: it
-        // waits for a maintenance pass in flight before it deletes anything.
-        let writer = workspace_lock.into_index_writer().await;
-        rebuilt = paths.tantivy_path.exists();
-        if let Some(search_cache) = search_cache {
-            search_cache.invalidate_workspace(dir_path);
-        }
-        clean_stale_index(&paths);
-        let (st, maintenance) = ensure_indexed(
-            dir_path,
-            &paths,
-            requested_backend.clone(),
-            sync_manager,
-        )
-        .await?;
-        crate::mcp::finish_index_writer(writer, maintenance);
+        // Corrupt or missing — this search becomes the index's writer. A read
+        // lock does not upgrade: let it go, take the writer's (which also
+        // waits for a maintenance pass in flight before anything is deleted),
+        // and look again — another search may have built the index while this
+        // one waited, and wiping that would re-embed the project for nothing.
+        drop(workspace_lock);
+        let writer = workspace_locks.lock_index_writer(dir_path).await;
         bm25 = try_open_bm25(&paths);
-        (Some(st), None)
+        if paths.vector_metadata_exists() && bm25.is_some() {
+            drop(writer);
+            (None, None)
+        } else {
+            rebuilt = paths.tantivy_path.exists();
+            if let Some(search_cache) = search_cache {
+                search_cache.invalidate_workspace(dir_path);
+            }
+            clean_stale_index(&paths);
+            let (st, maintenance) = ensure_indexed(
+                dir_path,
+                &paths,
+                requested_backend.clone(),
+                sync_manager,
+            )
+            .await?;
+            crate::mcp::finish_index_writer(writer, maintenance);
+            bm25 = try_open_bm25(&paths);
+            (Some(st), None)
+        }
     };
 
     // Handle case where first-time indexing produced nothing
