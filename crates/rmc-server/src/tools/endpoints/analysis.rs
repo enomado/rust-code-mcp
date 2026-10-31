@@ -86,7 +86,7 @@ use rmcp::{
 };
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tracing;
 
 use rmc_engine::parser::RustParser;
@@ -129,7 +129,7 @@ fn validate_cargo_project_directory(project_path: &Path) -> Result<(), McpError>
 
 /// Find the definition of a symbol using an explicit semantic service.
 pub(crate) async fn find_definition_with_semantic(
-    semantic: &Arc<Mutex<SemanticService>>,
+    semantic: &Arc<SemanticService>,
     symbol_name: &str,
     directory: &str,
     exact: bool,
@@ -175,7 +175,7 @@ pub(crate) async fn find_definition_with_semantic(
 
 /// Find all references to a symbol using an explicit semantic service.
 pub(crate) async fn find_references_with_semantic(
-    semantic: &Arc<Mutex<SemanticService>>,
+    semantic: &Arc<SemanticService>,
     symbol_name: &str,
     directory: &str,
     exact: bool,
@@ -221,7 +221,7 @@ pub(crate) async fn find_references_with_semantic(
 
 /// Preview a rename using an explicit semantic service.
 pub(crate) async fn rename_symbol_with_semantic(
-    semantic: &Arc<Mutex<SemanticService>>,
+    semantic: &Arc<SemanticService>,
     symbol_name: &str,
     new_name: &str,
     directory: &str,
@@ -560,7 +560,7 @@ pub(crate) async fn analyze_complexity(file_path: &str) -> Result<CallToolResult
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_find_definition_invalid_project() {
@@ -685,8 +685,8 @@ edition = "2021"
         dir
     }
 
-    fn test_semantic() -> Arc<Mutex<SemanticService>> {
-        Arc::new(Mutex::new(SemanticService::new()))
+    fn test_semantic() -> Arc<SemanticService> {
+        Arc::new(SemanticService::new())
     }
 
     /// `find_definition`, `find_references`, `rename_symbol`, `get_dependencies`,

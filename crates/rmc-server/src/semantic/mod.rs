@@ -10,6 +10,8 @@ mod rename;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::SystemTime;
 
 use ra_ap_ide::AnalysisHost;
@@ -51,15 +53,8 @@ struct ProjectContext {
     load_kind: LoadKind,
     /// The working tree as it was when this context was built or last
     /// refreshed. Without it the cache has no way to notice that the code
-    /// moved on — see [`SemanticService::refresh_if_stale`].
+    /// moved on — see [`refresh_if_stale`].
     stamps: HashMap<PathBuf, FileStamp>,
-    /// Value of [`SemanticService::clock`] when this context was last asked a
-    /// question. Orders eviction — see [`SemanticService::evict_to_capacity`].
-    ///
-    /// A counter rather than a `SystemTime`: eviction needs the *order* of
-    /// uses, and a wall clock can step backwards (NTP, suspend) and reorder
-    /// them.
-    last_used: u64,
 }
 
 fn stamp_of(path: &Path) -> Option<FileStamp> {
@@ -545,9 +540,42 @@ fn max_projects_from_env() -> usize {
         .unwrap_or(DEFAULT_MAX_PROJECTS)
 }
 
-/// Service for semantic code queries
+/// Service for semantic code queries: one rust-analyzer context per project,
+/// each behind a lock of its own.
+///
+/// # The defect this closes
+///
+/// The service used to be one `Mutex<SemanticService>` for the whole process,
+/// held for the whole of every call — the load of a workspace included. A
+/// `Full` load of a large workspace runs for minutes, and a reload follows every
+/// file added under it, so a question about a small project queued behind the
+/// load of a big one: measured 2026-10-31, `find_definition` on a small project
+/// answered after 176.7 s, the time a neighbour's load took.
+///
+/// # Locks — two levels, taken in this order only
+///
+/// 1. **A project's slot** ([`ProjectSlot::context`]): held for the whole of a
+///    load, a refresh and the query on that one project. Two calls on the same
+///    project are serialized on it — the second waits for the first one's
+///    load and then finds the context ready, rather than loading it again.
+/// 2. **The registry** ([`Self::registry`]): the map of slots, the use clock and
+///    the cap. Held only to look up, insert, touch or remove an entry — never
+///    across rust-analyzer work, never while waiting for a slot.
+///
+/// A slot holder may take the registry; a registry holder never *waits* for a
+/// slot (eviction only `try_lock`s one), and no code waits for a second slot
+/// while holding one. So the order cannot cycle.
+///
+/// What is unchanged lives outside: `crate::deep_stack`'s analysis gate still
+/// keeps a garbage collection apart from every analysis in flight, since the
+/// interner sweep is process-wide whatever lock a context has.
 pub(crate) struct SemanticService {
-    projects: HashMap<PathBuf, ProjectContext>,
+    registry: Mutex<Registry>,
+}
+
+/// The map of contexts and what orders their eviction. Lock level 2.
+struct Registry {
+    projects: HashMap<PathBuf, Entry>,
     /// Upper bound on `projects`; `0` disables eviction entirely.
     ///
     /// # The defect this closes
@@ -558,8 +586,295 @@ pub(crate) struct SemanticService {
     /// bounded that — measured 2026-08-27, one daemon sat on 14.6 GB, most of
     /// it contexts for directories nobody had touched in hours.
     max_projects: usize,
-    /// Monotonic tick, handed out by [`Self::touch`]. Only its order matters.
+    /// Monotonic tick, handed out on every use. Only its order matters.
     clock: u64,
+}
+
+struct Entry {
+    slot: Arc<ProjectSlot>,
+    /// Value of [`Registry::clock`] when this project was last asked a
+    /// question. Orders eviction — see [`Registry::evict_to_capacity`].
+    ///
+    /// A counter rather than a `SystemTime`: eviction needs the *order* of
+    /// uses, and a wall clock can step backwards (NTP, suspend) and reorder
+    /// them.
+    last_used: u64,
+}
+
+/// One project's context and its lock. Lock level 1.
+///
+/// `Arc` because a call keeps working on the slot it found after letting go of
+/// the registry: a project cleared or evicted meanwhile leaves the map at once,
+/// and its database goes when the last call on it ends.
+struct ProjectSlot {
+    /// `None` until the first load finishes, and again after a failed load or a
+    /// panic inside one.
+    context: Mutex<Option<ProjectContext>>,
+    /// What `context` holds, readable without its lock — so `runtime_status`
+    /// can say "loading" rather than wait for the load to end. Written only by
+    /// the holder of `context`.
+    loaded: AtomicU8,
+}
+
+const SLOT_EMPTY: u8 = 0;
+const SLOT_FAST: u8 = 1;
+const SLOT_FULL: u8 = 2;
+
+impl ProjectSlot {
+    fn empty() -> Self {
+        Self {
+            context: Mutex::new(None),
+            loaded: AtomicU8::new(SLOT_EMPTY),
+        }
+    }
+
+    #[cfg(test)]
+    fn holding(context: ProjectContext) -> Self {
+        let slot = Self::empty();
+        slot.publish(Some(context.load_kind));
+        *slot.context.lock().unwrap() = Some(context);
+        slot
+    }
+
+    /// Record what the slot now holds, for [`SemanticService::status`].
+    fn publish(&self, kind: Option<LoadKind>) {
+        let value = match kind {
+            None => SLOT_EMPTY,
+            Some(LoadKind::Fast) => SLOT_FAST,
+            Some(LoadKind::Full) => SLOT_FULL,
+        };
+        self.loaded.store(value, Ordering::SeqCst);
+    }
+
+    /// Take the slot's lock. A slot poisoned by a panic is emptied first: what
+    /// the panic interrupted — a load half done, a context mid-update — is
+    /// unknown, so the caller loads afresh, as after a drift.
+    fn lock(&self) -> MutexGuard<'_, Option<ProjectContext>> {
+        match self.context.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = None;
+                self.publish(None);
+                self.context.clear_poison();
+                guard
+            }
+        }
+    }
+}
+
+/// What [`SemanticService::unload_after_panic`] found and dropped.
+pub(crate) struct AfterPanic {
+    /// `"<project>: <what changed>"` for each dropped context whose panic was a
+    /// dependency's source changing on disk.
+    pub(crate) drifted: Vec<String>,
+    pub(crate) dropped: usize,
+}
+
+impl Registry {
+    /// Drop the least recently used contexts until [`Self::max_projects`] holds,
+    /// and hand them back so the caller drops them *after* letting go of the
+    /// registry — freeing a large database takes seconds.
+    ///
+    /// `keep` is never evicted whatever its age: it is the project the caller is
+    /// about to answer a question about, and evicting it would mean reloading it
+    /// on the very next line. With a cap of 1 that is the whole rule — the
+    /// working project stays, everything else goes.
+    ///
+    /// A context another call is using right now is not a victim either: it was
+    /// just asked a question, whatever its clock says, and evicting it would
+    /// throw away a load the moment it finishes. If only such contexts are
+    /// left, the cap is exceeded until the next use evicts again.
+    fn evict_to_capacity(&mut self, keep: &Path) -> Vec<Arc<ProjectSlot>> {
+        let mut evicted = Vec::new();
+        if self.max_projects == 0 {
+            return evicted;
+        }
+
+        while self.projects.len() > self.max_projects {
+            let victim = self
+                .projects
+                .iter()
+                .filter(|(path, _)| path.as_path() != keep)
+                .filter(|(_, entry)| !matches!(entry.slot.context.try_lock(), Err(TryLockError::WouldBlock)))
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(path, _)| path.clone());
+
+            let Some(victim) = victim else { break };
+
+            tracing::info!(
+                "unloading {} to stay within {}={} loaded project(s)",
+                victim.display(),
+                MAX_PROJECTS_ENV,
+                self.max_projects
+            );
+            evicted.push(self.projects.remove(&victim).unwrap().slot);
+        }
+        evicted
+    }
+
+    fn slots(&self) -> Vec<(PathBuf, Arc<ProjectSlot>)> {
+        self.projects
+            .iter()
+            .map(|(path, entry)| (path.clone(), Arc::clone(&entry.slot)))
+            .collect()
+    }
+
+    /// Remove `path` only if it still maps to `slot`: a clear and a fresh call
+    /// may have replaced it while the caller worked.
+    fn remove_if_same(&mut self, path: &Path, slot: &Arc<ProjectSlot>) -> Option<Entry> {
+        let same = self
+            .projects
+            .get(path)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.slot, slot));
+        if same { self.projects.remove(path) } else { None }
+    }
+}
+
+/// Load `canonical` into its slot, or refresh what is there. The caller holds
+/// the slot's lock.
+fn bring_up_to_date(
+    slot: &ProjectSlot,
+    context: &mut Option<ProjectContext>,
+    canonical: &Path,
+    requested: LoadKind,
+) -> Result<()> {
+    let needs_load = match context {
+        Some(ctx) => requested == LoadKind::Full && ctx.load_kind == LoadKind::Fast,
+        None => true,
+    };
+    if needs_load {
+        load_into(slot, context, canonical, requested)
+    } else {
+        // Cached — but "cached" said nothing about "current" until this call
+        // existed. See [`refresh_if_stale`].
+        refresh_if_stale(slot, context, canonical, requested)
+    }
+}
+
+fn load_into(
+    slot: &ProjectSlot,
+    context: &mut Option<ProjectContext>,
+    canonical: &Path,
+    requested: LoadKind,
+) -> Result<()> {
+    tracing::info!(
+        "Loading {:?} IDE for project: {}",
+        requested,
+        canonical.display()
+    );
+    // Stamps are taken BEFORE the load, not after: a file edited while
+    // rust-analyzer was reading the workspace must come out stale on the
+    // next query, not silently accepted as already analysed.
+    let stamps = collect_stamps(canonical);
+    // The context being replaced (a reload after a structural change, or
+    // a Fast → Full upgrade) goes BEFORE the new one is built. Left in
+    // the slot until the new one is stored, it kept a whole database alive
+    // beside the one being loaded: on salsa-bur a reload peaked +797 MiB over
+    // the 732 MiB held, on a ~49 000-file workspace ≈ 8 → 11 GiB
+    // (`reload_peak_holds_one_database`).
+    // A failed load then leaves the project unloaded rather than stale;
+    // the next call loads it again, which a stale context needed anyway.
+    //
+    // Dropping alone is half of it: the freed database sits in the arenas
+    // of the threads that built it, and the load allocates from the arenas
+    // of its own priming threads, so glibc does not reuse it (+597 MiB
+    // instead of +797 on salsa-bur). The release hands it back first.
+    slot.publish(None);
+    if let Some(previous) = context.take() {
+        drop(previous);
+        crate::mcp::memory::release_free_memory();
+    }
+    let (host, vfs) = match requested {
+        LoadKind::Fast => loader::load_project(canonical)?,
+        LoadKind::Full => loader::load_project_full(canonical)?,
+    };
+    *context = Some(ProjectContext {
+        host,
+        vfs,
+        load_kind: requested,
+        stamps,
+    });
+    slot.publish(Some(requested));
+    tracing::info!("IDE loaded successfully");
+    Ok(())
+}
+
+/// Bring a cached project up to date with the working tree.
+///
+/// # The defect this closes
+///
+/// A `ProjectContext` is an `AnalysisHost` built from the files as they
+/// were at load time. Nothing ever invalidated it: the only reload
+/// condition was upgrading a `Fast` context to `Full`. So every answer
+/// after the first edit described code that no longer existed —
+/// `find_references` reporting 2 call sites where the file on disk had 7,
+/// with no error and no warning anywhere. The only cure was knowing to
+/// call `clear_runtime scope=semantic_only`, which requires already
+/// suspecting the answer, which is exactly what a confident wrong answer
+/// prevents.
+///
+/// # Why two repair paths
+///
+/// Edits to existing files are pushed straight into the salsa database
+/// (`apply_change`), which invalidates precisely the derived queries that
+/// depended on those files — milliseconds, and it is what a real IDE does
+/// on every keystroke. Added or deleted files are not patchable that way:
+/// they change the module tree, and a new crate changes the crate graph,
+/// so those force a reload. Reloading costs seconds (`Fast`, `no_deps`) to
+/// minutes (`Full`), which is why it is reserved for the case that needs
+/// it rather than used for everything.
+///
+/// # Known limit
+///
+/// Only `*.rs` files are watched. A `Cargo.toml` edited on its own —
+/// dropping a dependency, renaming a feature — is invisible here. Adding a
+/// crate is not: its sources are new files, which trips the structural
+/// path anyway.
+fn refresh_if_stale(
+    slot: &ProjectSlot,
+    context: &mut Option<ProjectContext>,
+    canonical: &Path,
+    requested: LoadKind,
+) -> Result<()> {
+    let current = collect_stamps(canonical);
+    let ctx = context
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
+
+    match classify_staleness(&ctx.stamps, &current) {
+        Staleness::Fresh => Ok(()),
+        Staleness::StructureChanged => {
+            tracing::info!(
+                "Project {} gained or lost files since it was analysed; reloading",
+                canonical.display()
+            );
+            load_into(slot, context, canonical, requested)
+        }
+        Staleness::Edited(paths) => {
+            match apply_edits(ctx, &paths).map(|()| ctx.stamps = current) {
+                Ok(()) => {
+                    tracing::info!(
+                        "Refreshed {} edited file(s) in {}",
+                        paths.len(),
+                        canonical.display()
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    // A file the analysis does not know (excluded from the
+                    // build, unreadable, non-UTF-8) cannot be patched in.
+                    // Falling back to a reload is slow but honest; keeping
+                    // the stale context would be the original defect.
+                    tracing::info!(
+                        "Cannot patch {} incrementally ({e}); reloading",
+                        canonical.display()
+                    );
+                    load_into(slot, context, canonical, requested)
+                }
+            }
+        }
+    }
 }
 
 impl SemanticService {
@@ -572,23 +887,41 @@ impl SemanticService {
     /// environment around it.
     pub(crate) fn with_max_projects(max_projects: usize) -> Self {
         Self {
-            projects: HashMap::new(),
-            max_projects,
-            clock: 0,
+            registry: Mutex::new(Registry {
+                projects: HashMap::new(),
+                max_projects,
+                clock: 0,
+            }),
         }
     }
 
+    /// The registry, stepping over poison: every change under it is a single
+    /// map operation, so a panic cannot leave it half-updated in a way a later
+    /// call could trip on.
+    fn registry(&self) -> MutexGuard<'_, Registry> {
+        self.registry.lock().unwrap_or_else(|poisoned| {
+            self.registry.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
     pub(crate) fn project_count(&self) -> usize {
-        self.projects.len()
+        self.registry().projects.len()
     }
 
     pub(crate) fn status(&self) -> SemanticServiceStatus {
         let mut projects = self
+            .registry()
             .projects
             .iter()
-            .map(|(path, ctx)| SemanticProjectStatus {
+            .map(|(path, entry)| SemanticProjectStatus {
                 path: path.display().to_string(),
-                load_kind: ctx.load_kind.as_str().to_string(),
+                load_kind: match entry.slot.loaded.load(Ordering::SeqCst) {
+                    SLOT_FAST => LoadKind::Fast.as_str(),
+                    SLOT_FULL => LoadKind::Full.as_str(),
+                    _ => "loading",
+                }
+                .to_string(),
             })
             .collect::<Vec<_>>();
         projects.sort_by(|a, b| {
@@ -602,69 +935,161 @@ impl SemanticService {
         }
     }
 
-    pub(crate) fn clear_all(&mut self) -> usize {
-        let count = self.projects.len();
-        self.projects.clear();
+    /// Forget every context. A call still working on one keeps it until it
+    /// answers; the memory goes when that call ends.
+    pub(crate) fn clear_all(&self) -> usize {
+        let taken = std::mem::take(&mut self.registry().projects);
+        // Counted and dropped after the registry is let go: freeing a large
+        // database takes seconds, and `status` must not wait for it.
+        let count = taken.len();
+        drop(taken);
         count
     }
 
-    /// Unload every context whose database read a dependency's source back
-    /// from disk and found it changed since the load (see
-    /// `loader::file_text_store`); returns `"<project>: <what changed>"` for
-    /// each.
+    /// Clean up after a panic inside semantic work; see `deep_stack::with_semantic`.
     ///
-    /// Such a context can answer nothing that touches that file — the text its
-    /// syntax and item trees were built from is gone — and nothing inside
-    /// rust-analyzer can repair an input mid-query. Unloading it makes the next
-    /// call load the workspace afresh, against the files as they are now.
-    pub(crate) fn unload_drifted(&mut self) -> Vec<String> {
-        let drifted: Vec<(PathBuf, String)> = self
-            .projects
-            .iter()
-            .filter_map(|(path, ctx)| {
-                let drift = ctx.host.raw_database().file_text_drift()?;
-                Some((path.clone(), drift))
-            })
-            .collect();
-        drifted
-            .into_iter()
-            .map(|(path, drift)| {
-                self.projects.remove(&path);
-                format!("{}: {drift}", path.display())
-            })
-            .collect()
+    /// The panic unwound through the slot it happened under and poisoned it, so
+    /// the poisoned slots are exactly the contexts the panic interrupted — and
+    /// only those are dropped: a panic on one project no longer costs every
+    /// other project its load. A slot another call holds right now is busy, not
+    /// poisoned, and is left alone.
+    ///
+    /// A dropped context whose database read a dependency's source back from
+    /// disk and found it changed since the load (see `loader::file_text_store`)
+    /// is reported as a drift, `"<project>: <what changed>"`: such a context can
+    /// answer nothing that touches that file, nothing inside rust-analyzer can
+    /// repair an input mid-query, and the cure is the next call loading the
+    /// workspace afresh against the files as they are now.
+    ///
+    /// No slot poisoned means the panic was outside every context, and what it
+    /// interrupted is unknown — then every context goes, as before contexts
+    /// had locks of their own.
+    pub(crate) fn unload_after_panic(&self) -> AfterPanic {
+        let slots = self.registry().slots();
+        let mut drifted = Vec::new();
+        let mut poisoned = Vec::new();
+        for (path, slot) in slots {
+            let drift = match slot.context.try_lock() {
+                Err(TryLockError::Poisoned(guard)) => Some(
+                    guard
+                        .get_ref()
+                        .as_ref()
+                        .and_then(|ctx| ctx.host.raw_database().file_text_drift()),
+                ),
+                _ => None,
+            };
+            if let Some(drift) = drift {
+                if let Some(drift) = drift {
+                    drifted.push(format!("{}: {drift}", path.display()));
+                }
+                poisoned.push((path, slot));
+            }
+        }
+
+        if poisoned.is_empty() {
+            return AfterPanic {
+                drifted,
+                dropped: self.clear_all(),
+            };
+        }
+        let removed: Vec<Entry> = {
+            let mut registry = self.registry();
+            poisoned
+                .iter()
+                .filter_map(|(path, slot)| registry.remove_if_same(path, slot))
+                .collect()
+        };
+        AfterPanic {
+            drifted,
+            dropped: removed.len(),
+        }
     }
 
     /// A context built by hand, for a test that needs a database no workspace
-    /// on disk would produce.
+    /// on disk would produce. The path is taken as given, not canonicalized.
     #[cfg(test)]
-    pub(crate) fn insert_for_test(&mut self, path: PathBuf, host: AnalysisHost) {
-        self.clock += 1;
-        self.projects.insert(
+    pub(crate) fn insert_for_test(&self, path: PathBuf, host: AnalysisHost) {
+        self.insert_context_for_test(
             path,
             ProjectContext {
                 host,
                 vfs: Vfs::default(),
                 load_kind: LoadKind::Full,
                 stamps: HashMap::new(),
-                last_used: self.clock,
             },
         );
     }
 
     #[cfg(test)]
-    pub(crate) fn raw_database_for_test(&self, path: &Path) -> &ra_ap_ide_db::RootDatabase {
-        self.projects[path].host.raw_database()
+    fn insert_context_for_test(&self, path: PathBuf, context: ProjectContext) {
+        let mut registry = self.registry();
+        registry.clock += 1;
+        let last_used = registry.clock;
+        registry.projects.insert(
+            path,
+            Entry {
+                slot: Arc::new(ProjectSlot::holding(context)),
+                last_used,
+            },
+        );
     }
 
-    pub(crate) fn clear_project(&mut self, project_path: &Path) -> usize {
+    /// Run `work` on the loaded context of `path` (exactly as given), under its
+    /// slot lock. Panics if nothing is loaded there.
+    #[cfg(test)]
+    fn with_context_for_test<T>(
+        &self,
+        path: &Path,
+        work: impl FnOnce(&mut ProjectContext) -> T,
+    ) -> T {
+        let slot = Arc::clone(
+            &self
+                .registry()
+                .projects
+                .get(path)
+                .unwrap_or_else(|| panic!("no context is loaded for {}", path.display()))
+                .slot,
+        );
+        let mut guard = slot.lock();
+        work(guard.as_mut().expect("the context is loaded"))
+    }
+
+    /// [`Self::with_context_for_test`] for callers outside this module.
+    #[cfg(test)]
+    pub(crate) fn with_host_for_test<T>(
+        &self,
+        path: &Path,
+        work: impl FnOnce(&mut AnalysisHost) -> T,
+    ) -> T {
+        self.with_context_for_test(path, |ctx| work(&mut ctx.host))
+    }
+
+    /// Hold `path`'s slot for as long as `work` runs, the way a load or a query
+    /// holds it — for the tests that judge who waits for whom. The project
+    /// must be loaded and unchanged on disk, so nothing is loaded here.
+    #[cfg(test)]
+    pub(crate) fn hold_project_for_test<T>(
+        &self,
+        path: &Path,
+        work: impl FnOnce() -> T,
+    ) -> Result<T> {
+        self.with_project(path, LoadKind::Full, |_, _| Ok(work()))
+    }
+
+    /// Projects in the registry, sorted.
+    #[cfg(test)]
+    pub(crate) fn loaded_paths_for_test(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<_> = self.registry().projects.keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+
+    pub(crate) fn clear_project(&self, project_path: &Path) -> usize {
         let canonical =
             std::fs::canonicalize(project_path).unwrap_or_else(|_| project_path.to_path_buf());
-        if self.projects.remove(&canonical).is_some() {
-            1
-        } else {
-            0
-        }
+        let removed = self.registry().projects.remove(&canonical);
+        // Dropped here, after the registry is let go.
+        usize::from(removed.is_some())
     }
 
     /// Give every loaded analysis a revision bump and sweep the type interner.
@@ -690,15 +1115,12 @@ impl SemanticService {
     /// `AnalysisHost` here — but its roots are refcounts (`Arc::strong_count(item) > 1`
     /// marks alive), so a type another host holds is a root and survives. What
     /// the `unsafe` really demands is that no query be *in flight*, holding a
-    /// type it has not recorded anywhere yet. Every path into this service goes
-    /// through one `Mutex<SemanticService>`, and this method needs `&mut self`,
-    /// so holding that lock means no analysis is running *in this service*.
-    ///
-    /// That is not the whole process, though — the graph tools, the audits and
-    /// the skeleton builder each load a rust-analyzer workspace outside this
-    /// service. What covers them is the gate in [`crate::deep_stack`], which
-    /// the caller enters exclusively for this call; see
-    /// `RuntimeState::collect_garbage`.
+    /// type it has not recorded anywhere yet. That is the gate in
+    /// [`crate::deep_stack`], which the caller holds exclusively for this call
+    /// (see `RuntimeState::collect_garbage`): every analysis — this service's
+    /// and the graph tools', audits' and skeleton builder's, which load
+    /// workspaces of their own — runs inside that gate, so none is in flight
+    /// here and every slot lock below is free.
     ///
     /// # Cost
     ///
@@ -708,12 +1130,18 @@ impl SemanticService {
     /// later, by the next query re-validating its memos.
     ///
     /// Returns the number of contexts collected, for the log line.
-    pub(crate) fn collect_garbage(&mut self) -> usize {
-        for (path, ctx) in self.projects.iter_mut() {
-            tracing::debug!("collecting garbage in {}", path.display());
-            ctx.host.trigger_garbage_collection();
+    pub(crate) fn collect_garbage(&self) -> usize {
+        let slots = self.registry().slots();
+        let mut collected = 0;
+        for (path, slot) in slots {
+            let mut guard = slot.lock();
+            if let Some(ctx) = guard.as_mut() {
+                tracing::debug!("collecting garbage in {}", path.display());
+                ctx.host.trigger_garbage_collection();
+                collected += 1;
+            }
         }
-        self.projects.len()
+        collected
     }
 
     /// Per-ingredient memory of one *already loaded* analysis.
@@ -738,42 +1166,61 @@ impl SemanticService {
     /// `process` is where that gap goes: the whole daemon cut into lines that
     /// add up to `rss + swap`, salsa of every loaded project being one of them —
     /// see [`ProcessPortrait`].
+    ///
+    /// # Waits
+    ///
+    /// Weighing a database needs its slot, so this waits for a load or a query
+    /// in progress on *any* loaded project — the portrait has to see all of
+    /// them. It is a diagnostic, asked rarely; serving tools never wait on it
+    /// for longer than the weighing of one context.
     pub(crate) fn memory_breakdown(
-        &mut self,
+        &self,
         project: &Path,
         top: usize,
     ) -> Result<ProjectMemoryReport> {
         let canonical = project
             .canonicalize()
             .with_context(|| format!("resolving {}", project.display()))?;
-        if !self.projects.contains_key(&canonical) {
-            let loaded: Vec<String> = self
-                .projects
-                .keys()
-                .map(|path| path.display().to_string())
-                .collect();
+        let slots = self.registry().slots();
+        let loaded = || -> String {
+            let names: Vec<String> =
+                slots.iter().map(|(path, _)| path.display().to_string()).collect();
+            if names.is_empty() { "nothing".to_owned() } else { names.join(", ") }
+        };
+        if !slots.iter().any(|(path, _)| *path == canonical) {
             anyhow::bail!(
                 "no analysis is loaded for {}; this reports what a live daemon is holding and \
                  will not load a project to answer, because a database built for the question \
                  measures a cold start rather than the daemon. Loaded: {}",
                 canonical.display(),
-                if loaded.is_empty() { "nothing".to_owned() } else { loaded.join(", ") }
+                loaded()
             );
         }
         // Every loaded analysis is weighed, not just the one asked about: the
         // process portrait below has to see all of them, and the rows of the
-        // requested one fall out of the same pass.
+        // requested one fall out of the same pass. One slot at a time.
         let mut salsa_bytes = 0;
+        let mut weighed = 0;
         let mut requested = None;
-        for (path, ctx) in self.projects.iter_mut() {
+        for (path, slot) in &slots {
+            let mut guard = slot.lock();
+            let Some(ctx) = guard.as_mut() else { continue };
             let rows = ingredient_rows(&mut ctx.host);
+            weighed += 1;
             salsa_bytes += rows.iter().map(IngredientMemory::bytes).sum::<usize>();
             if *path == canonical {
                 requested = Some(rows);
             }
         }
-        let mut rows = requested.unwrap();
-        let process = process_portrait(self.projects.len(), salsa_bytes, top);
+        let Some(mut rows) = requested else {
+            anyhow::bail!(
+                "the analysis of {} failed to load or was dropped while this waited for it; \
+                 nothing to weigh. Loaded: {}",
+                canonical.display(),
+                loaded()
+            );
+        };
+        let process = process_portrait(weighed, salsa_bytes, top);
 
         let instances = rows.iter().map(|row| row.count).sum();
         let accounted_bytes = rows.iter().map(IngredientMemory::bytes).sum();
@@ -795,51 +1242,74 @@ impl SemanticService {
         })
     }
 
-    /// Mark `canonical` as the most recently used context.
-    fn touch(&mut self, canonical: &Path) {
-        self.clock += 1;
-        let clock = self.clock;
-        if let Some(ctx) = self.projects.get_mut(canonical) {
-            ctx.last_used = clock;
-        }
+    /// The slot of `canonical`, made if the project has none yet. A new entry
+    /// counts as used now, so a load in progress is not the first victim of
+    /// another project's eviction.
+    fn slot_for(&self, canonical: &Path) -> Arc<ProjectSlot> {
+        let mut registry = self.registry();
+        registry.clock += 1;
+        let clock = registry.clock;
+        let entry = registry
+            .projects
+            .entry(canonical.to_path_buf())
+            .or_insert_with(|| Entry {
+                slot: Arc::new(ProjectSlot::empty()),
+                last_used: clock,
+            });
+        Arc::clone(&entry.slot)
     }
 
-    /// Drop the least recently used contexts until [`Self::max_projects`] holds.
+    /// Load or refresh `project_path` to `requested`, then run `work` on its
+    /// context — all under that project's slot lock and nothing else, so the
+    /// load and the query of one project never hold up another's.
     ///
-    /// `keep` is never evicted whatever its age: it is the project the caller is
-    /// about to answer a question about, and evicting it would mean reloading it
-    /// on the very next line. With a cap of 1 that is the whole rule — the
-    /// working project stays, everything else goes.
-    ///
-    /// Returns how many contexts were dropped.
-    fn evict_to_capacity(&mut self, keep: &Path) -> usize {
-        if self.max_projects == 0 {
-            return 0;
-        }
+    /// The one door every served path and every probe goes through: the lock
+    /// order in [`SemanticService`]'s header holds because nothing else takes
+    /// a slot for rust-analyzer work.
+    fn with_project<T>(
+        &self,
+        project_path: &Path,
+        requested: LoadKind,
+        work: impl FnOnce(&Path, &mut ProjectContext) -> Result<T>,
+    ) -> Result<T> {
+        let canonical = project_path.canonicalize()?;
+        let slot = self.slot_for(&canonical);
+        let mut context = slot.lock();
 
-        let mut evicted = 0;
-        while self.projects.len() > self.max_projects {
-            let victim = self
-                .projects
-                .iter()
-                .filter(|(path, _)| path.as_path() != keep)
-                .min_by_key(|(_, ctx)| ctx.last_used)
-                .map(|(path, _)| path.clone());
+        let outcome = bring_up_to_date(&slot, &mut context, &canonical, requested);
+        let evicted = {
+            let mut registry = self.registry();
+            match outcome {
+                // Only after it succeeded: a load that failed left no context to
+                // order, and a query that never happened is not a use.
+                Ok(()) => {
+                    registry.clock += 1;
+                    let clock = registry.clock;
+                    match registry.projects.get_mut(&canonical) {
+                        Some(entry) if Arc::ptr_eq(&entry.slot, &slot) => {
+                            entry.last_used = clock;
+                            registry.evict_to_capacity(&canonical)
+                        }
+                        // Cleared while this call worked: it still answers, but
+                        // the context goes with it rather than back in the map.
+                        _ => Vec::new(),
+                    }
+                }
+                // A failed load leaves the project unloaded rather than stale —
+                // and out of the map, so `status` does not show it loading.
+                Err(_) => {
+                    if context.is_none() {
+                        registry.remove_if_same(&canonical, &slot);
+                    }
+                    Vec::new()
+                }
+            }
+        };
+        // After the registry is let go: freeing a large database takes seconds.
+        drop(evicted);
+        outcome?;
 
-            // Only `keep` is left: the cap is smaller than one project, and one
-            // is the least we can hold and still answer.
-            let Some(victim) = victim else { break };
-
-            tracing::info!(
-                "unloading {} to stay within {}={} loaded project(s)",
-                victim.display(),
-                MAX_PROJECTS_ENV,
-                self.max_projects
-            );
-            self.projects.remove(&victim);
-            evicted += 1;
-        }
-        evicted
+        work(&canonical, context.as_mut().unwrap())
     }
 
     /// Get or load project with full workspace dependency edges.
@@ -849,167 +1319,14 @@ impl SemanticService {
     /// decided whether it could see `#[cfg(test)]` and that depended on call
     /// order. `LoadKind::Fast` stays for the upgrade machinery it is the source
     /// half of — nothing requests it any more.
-    fn get_or_load_full(&mut self, project_path: &Path) -> Result<()> {
-        self.get_or_load_kind(project_path, LoadKind::Full)
-    }
-
-    fn get_or_load_kind(&mut self, project_path: &Path, requested: LoadKind) -> Result<()> {
-        let canonical = project_path.canonicalize()?;
-
-        let needs_load = match self.projects.get(&canonical) {
-            Some(ctx) => requested == LoadKind::Full && ctx.load_kind == LoadKind::Fast,
-            None => true,
-        };
-
-        let outcome = if needs_load {
-            self.load_kind_into_cache(&canonical, requested)
-        } else {
-            // Cached — but "cached" said nothing about "current" until this call
-            // existed. See [`Self::refresh_if_stale`].
-            self.refresh_if_stale(&canonical, requested)
-        };
-        outcome?;
-
-        // Both branches, and only after they succeeded: a load that failed left
-        // no context to order, and a query that never happened is not a use.
-        self.touch(&canonical);
-        self.evict_to_capacity(&canonical);
-        Ok(())
-    }
-
-    fn load_kind_into_cache(&mut self, canonical: &Path, requested: LoadKind) -> Result<()> {
-        tracing::info!(
-            "Loading {:?} IDE for project: {}",
-            requested,
-            canonical.display()
-        );
-        // Stamps are taken BEFORE the load, not after: a file edited while
-        // rust-analyzer was reading the workspace must come out stale on the
-        // next query, not silently accepted as already analysed.
-        let stamps = collect_stamps(canonical);
-        // The context being replaced (a reload after a structural change, or
-        // a Fast → Full upgrade) goes BEFORE the new one is built. Left in
-        // `projects` until `insert`, it kept a whole database alive beside
-        // the one being loaded: on salsa-bur a reload peaked +797 MiB over the
-        // 732 MiB held, on a ~49 000-file workspace ≈ 8 → 11 GiB
-        // (`reload_peak_holds_one_database`).
-        // A failed load then leaves the project unloaded rather than stale;
-        // the next call loads it again, which a stale context needed anyway.
-        //
-        // Dropping alone is half of it: the freed database sits in the arenas
-        // of the threads that built it, and the load allocates from the arenas
-        // of its own priming threads, so glibc does not reuse it (+597 MiB
-        // instead of +797 on salsa-bur). The release hands it back first.
-        if let Some(previous) = self.projects.remove(canonical) {
-            drop(previous);
-            crate::mcp::memory::release_free_memory();
-        }
-        let (host, vfs) = match requested {
-            LoadKind::Fast => loader::load_project(canonical)?,
-            LoadKind::Full => loader::load_project_full(canonical)?,
-        };
-        self.clock += 1;
-        self.projects.insert(
-            canonical.to_path_buf(),
-            ProjectContext {
-                host,
-                vfs,
-                load_kind: requested,
-                stamps,
-                last_used: self.clock,
-            },
-        );
-        tracing::info!("IDE loaded successfully");
-        Ok(())
-    }
-
-    /// Bring a cached project up to date with the working tree.
-    ///
-    /// # The defect this closes
-    ///
-    /// A `ProjectContext` is an `AnalysisHost` built from the files as they
-    /// were at load time. Nothing ever invalidated it: the only reload
-    /// condition was upgrading a `Fast` context to `Full`. So every answer
-    /// after the first edit described code that no longer existed —
-    /// `find_references` reporting 2 call sites where the file on disk had 7,
-    /// with no error and no warning anywhere. The only cure was knowing to
-    /// call `clear_runtime scope=semantic_only`, which requires already
-    /// suspecting the answer, which is exactly what a confident wrong answer
-    /// prevents.
-    ///
-    /// # Why two repair paths
-    ///
-    /// Edits to existing files are pushed straight into the salsa database
-    /// (`apply_change`), which invalidates precisely the derived queries that
-    /// depended on those files — milliseconds, and it is what a real IDE does
-    /// on every keystroke. Added or deleted files are not patchable that way:
-    /// they change the module tree, and a new crate changes the crate graph,
-    /// so those force a reload. Reloading costs seconds (`Fast`, `no_deps`) to
-    /// minutes (`Full`), which is why it is reserved for the case that needs
-    /// it rather than used for everything.
-    ///
-    /// # Known limit
-    ///
-    /// Only `*.rs` files are watched. A `Cargo.toml` edited on its own —
-    /// dropping a dependency, renaming a feature — is invisible here. Adding a
-    /// crate is not: its sources are new files, which trips the structural
-    /// path anyway.
-    fn refresh_if_stale(&mut self, canonical: &Path, requested: LoadKind) -> Result<()> {
-        let current = collect_stamps(canonical);
-
-        let staleness = {
-            let ctx = self
-                .projects
-                .get(canonical)
-                .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
-            classify_staleness(&ctx.stamps, &current)
-        };
-
-        match staleness {
-            Staleness::Fresh => Ok(()),
-            Staleness::StructureChanged => {
-                tracing::info!(
-                    "Project {} gained or lost files since it was analysed; reloading",
-                    canonical.display()
-                );
-                self.load_kind_into_cache(canonical, requested)
-            }
-            Staleness::Edited(paths) => {
-                let patched = {
-                    let ctx = self
-                        .projects
-                        .get_mut(canonical)
-                        .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
-                    apply_edits(ctx, &paths).map(|()| ctx.stamps = current)
-                };
-                match patched {
-                    Ok(()) => {
-                        tracing::info!(
-                            "Refreshed {} edited file(s) in {}",
-                            paths.len(),
-                            canonical.display()
-                        );
-                        Ok(())
-                    }
-                    Err(e) => {
-                        // A file the analysis does not know (excluded from the
-                        // build, unreadable, non-UTF-8) cannot be patched in.
-                        // Falling back to a reload is slow but honest; keeping
-                        // the stale context would be the original defect.
-                        tracing::info!(
-                            "Cannot patch {} incrementally ({e}); reloading",
-                            canonical.display()
-                        );
-                        self.load_kind_into_cache(canonical, requested)
-                    }
-                }
-            }
-        }
+    #[cfg(test)]
+    fn get_or_load_full(&self, project_path: &Path) -> Result<()> {
+        self.with_project(project_path, LoadKind::Full, |_, _| Ok(()))
     }
 
     /// Search for symbols by name (for find_definition)
     pub(crate) fn symbol_search(
-        &mut self,
+        &self,
         project_path: &Path,
         symbol_name: &str,
         limit: usize,
@@ -1038,26 +1355,22 @@ impl SemanticService {
     /// The load is shared, not doubled: `find_references` pays for the same
     /// upgrade, and whichever runs first pays it once.
     pub(crate) fn symbol_search_with_exact(
-        &mut self,
+        &self,
         project_path: &Path,
         symbol_name: &str,
         limit: usize,
         exact: bool,
     ) -> Result<Vec<Location>> {
-        self.get_or_load_full(project_path)?;
-
-        let canonical = project_path.canonicalize()?;
-        let ctx = self.projects.get(&canonical)
-            .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
-
-        position::symbol_search_with_exact(
-            &ctx.host,
-            &ctx.vfs,
-            &canonical,
-            symbol_name,
-            limit,
-            exact,
-        )
+        self.with_project(project_path, LoadKind::Full, |canonical, ctx| {
+            position::symbol_search_with_exact(
+                &ctx.host,
+                &ctx.vfs,
+                canonical,
+                symbol_name,
+                limit,
+                exact,
+            )
+        })
     }
 
     /// The symbol index's own answer, with the source sweep not run.
@@ -1068,26 +1381,20 @@ impl SemanticService {
     /// tool actually queries.
     #[cfg(test)]
     pub(crate) fn index_only_search(
-        &mut self,
+        &self,
         project_path: &Path,
         symbol_name: &str,
         limit: usize,
     ) -> Result<Vec<Location>> {
-        self.get_or_load_full(project_path)?;
-
-        let canonical = project_path.canonicalize()?;
-        let ctx = self
-            .projects
-            .get(&canonical)
-            .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
-
-        position::index_only_search(&ctx.host, &ctx.vfs, symbol_name, limit)
+        self.with_project(project_path, LoadKind::Full, |_, ctx| {
+            position::index_only_search(&ctx.host, &ctx.vfs, symbol_name, limit)
+        })
     }
 
     /// Find all references to symbols matching a name
     /// First finds all symbols matching the name, then finds references for each
     pub(crate) fn find_references_by_name(
-        &mut self,
+        &self,
         project_path: &Path,
         symbol_name: &str,
     ) -> Result<Vec<Location>> {
@@ -1115,45 +1422,37 @@ impl SemanticService {
     /// `Fast` context in place rather than holding a second one, and `rename`
     /// already pays the same price for the same reason.
     pub(crate) fn find_references_by_name_with_exact(
-        &mut self,
+        &self,
         project_path: &Path,
         symbol_name: &str,
         exact: bool,
     ) -> Result<Vec<Location>> {
-        self.get_or_load_full(project_path)?;
-
-        let canonical = project_path.canonicalize()?;
-        let ctx = self.projects.get(&canonical)
-            .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
-
-        position::find_references_by_name_with_exact(
-            &ctx.host,
-            &ctx.vfs,
-            &canonical,
-            symbol_name,
-            exact,
-        )
+        self.with_project(project_path, LoadKind::Full, |canonical, ctx| {
+            position::find_references_by_name_with_exact(
+                &ctx.host,
+                &ctx.vfs,
+                canonical,
+                symbol_name,
+                exact,
+            )
+        })
     }
 
     /// Preview rename of a symbol by name. Does not modify any files.
     pub(crate) fn rename_by_name(
-        &mut self,
+        &self,
         project_path: &Path,
         symbol_name: &str,
         new_name: &str,
     ) -> Result<RenamePreview> {
-        self.get_or_load_full(project_path)?;
-
-        let canonical = project_path.canonicalize()?;
-        let ctx = self.projects.get(&canonical)
-            .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
-
-        rename::rename_by_name(&ctx.host, &ctx.vfs, symbol_name, new_name)
+        self.with_project(project_path, LoadKind::Full, |_, ctx| {
+            rename::rename_by_name(&ctx.host, &ctx.vfs, symbol_name, new_name)
+        })
     }
 
     /// Preview rename of a symbol at a concrete file position. Does not modify any files.
     pub(crate) fn rename_by_position(
-        &mut self,
+        &self,
         project_path: &Path,
         file_path: &Path,
         line: u32,
@@ -1161,36 +1460,30 @@ impl SemanticService {
         symbol_name: &str,
         new_name: &str,
     ) -> Result<RenamePreview> {
-        self.get_or_load_full(project_path)?;
-
-        let canonical = project_path.canonicalize()?;
-        let ctx = self.projects.get(&canonical)
-            .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
-
-        rename::rename_by_position(
-            &ctx.host,
-            &ctx.vfs,
-            file_path,
-            line,
-            column,
-            symbol_name,
-            new_name,
-        )
+        self.with_project(project_path, LoadKind::Full, |_, ctx| {
+            rename::rename_by_position(
+                &ctx.host,
+                &ctx.vfs,
+                file_path,
+                line,
+                column,
+                symbol_name,
+                new_name,
+            )
+        })
     }
 
     #[cfg(test)]
-    pub(crate) fn insert_test_project_fast(&mut self, project_path: PathBuf) {
+    pub(crate) fn insert_test_project_fast(&self, project_path: PathBuf) {
         let canonical =
             std::fs::canonicalize(&project_path).unwrap_or(project_path);
-        self.clock += 1;
-        self.projects.insert(
+        self.insert_context_for_test(
             canonical,
             ProjectContext {
                 host: AnalysisHost::new(None),
                 vfs: Vfs::default(),
                 load_kind: LoadKind::Fast,
                 stamps: HashMap::new(),
-                last_used: self.clock,
             },
         );
     }
@@ -1276,7 +1569,7 @@ pub fn run(engine: &dyn Engine) {
 "#,
         );
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let preview = service
             .rename_by_position(
                 workspace_path,
@@ -1309,7 +1602,7 @@ pub fn run(engine: &dyn Engine) {
     #[test]
     fn runtime_semantic_status_and_clear_are_workspace_scoped() {
         let workspace = tempfile::tempdir().expect("create workspace tempdir");
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         service.insert_test_project_fast(workspace.path().join("."));
 
         let status = service.status();
@@ -1370,7 +1663,7 @@ pub fn first() {
         let root = workspace.path();
         let lib = one_crate_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let before = service
             .find_references_by_name_with_exact(root, "target", true)
             .expect("first query");
@@ -1413,7 +1706,7 @@ pub fn second() {
         let root = workspace.path();
         let lib = one_crate_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let before = service
             .find_references_by_name_with_exact(root, "target", true)
             .expect("first query");
@@ -1566,7 +1859,7 @@ pub fn call_across() {
         let root = workspace.path();
         two_crate_oracle_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let found = service
             .find_references_by_name_with_exact(root, "probed", true)
             .expect("query references");
@@ -1598,7 +1891,7 @@ pub fn call_across() {
         let root = workspace.path();
         two_crate_oracle_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let found = service
             .find_references_by_name_with_exact(root, "radius_override", true)
             .expect("query references");
@@ -1643,7 +1936,7 @@ pub fn a_local_of_the_same_name() -> u32 {
 "#,
         );
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let found = service
             .find_references_by_name_with_exact(root, "radius_override", true)
             .expect("query references");
@@ -1667,7 +1960,7 @@ pub fn a_local_of_the_same_name() -> u32 {
         let root = workspace.path();
         two_crate_oracle_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let found = service
             .symbol_search_with_exact(root, "radius_override", 8, true)
             .expect("query definition");
@@ -1699,7 +1992,7 @@ pub fn a_local_of_the_same_name() -> u32 {
         let root = workspace.path();
         two_crate_oracle_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let found = service
             .symbol_search_with_exact(root, "Downhole", 8, true)
             .expect("query definition");
@@ -1782,7 +2075,7 @@ pub fn read_generated(value: &Generated) -> u32 {
         let root = workspace.path();
         generated_code_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let found = service
             .find_references_by_name_with_exact(root, "generated_field", true)
             .expect("query references");
@@ -1926,7 +2219,7 @@ mod tests {
             ("kind_variant_field", "field of a struct-shaped variant"),
         ];
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let measured: Vec<(&str, bool)> = candidates
             .iter()
             .map(|(name, _what)| {
@@ -1989,7 +2282,7 @@ mod tests {
         let root = workspace.path();
         kind_survey_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let found = service
             .symbol_search_with_exact(root, "kind_test_fn", 8, true)
             .expect("query definition");
@@ -2021,7 +2314,7 @@ mod tests {
         let root = workspace.path();
         kind_survey_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         for name in ["kind_field", "kind_union_field", "kind_variant_field"] {
             let found = service
                 .symbol_search_with_exact(root, name, 8, true)
@@ -2057,7 +2350,7 @@ pub fn a_local_of_the_same_name() -> u32 {
 "#,
         );
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let found = service
             .symbol_search_with_exact(root, "radius_override", 8, true)
             .expect("query definition");
@@ -2082,23 +2375,21 @@ pub fn a_local_of_the_same_name() -> u32 {
         let root = workspace.path();
         one_crate_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         service
             .find_references_by_name_with_exact(root, "target", true)
             .expect("first query");
 
         let canonical = root.canonicalize().expect("canonicalize");
-        let stamps_before = service.projects[&canonical].stamps.clone();
+        let stamps_before = service.with_context_for_test(&canonical, |ctx| ctx.stamps.clone());
 
         service
             .find_references_by_name_with_exact(root, "target", true)
             .expect("second query");
 
+        let stamps_after = service.with_context_for_test(&canonical, |ctx| ctx.stamps.clone());
         assert!(
-            matches!(
-                classify_staleness(&stamps_before, &service.projects[&canonical].stamps),
-                Staleness::Fresh
-            ),
+            matches!(classify_staleness(&stamps_before, &stamps_after), Staleness::Fresh),
             "an untouched tree must classify as fresh"
         );
     }
@@ -2113,9 +2404,7 @@ pub fn a_local_of_the_same_name() -> u32 {
     /// Which projects the service is currently holding, canonicalized, so an
     /// assertion can name them instead of counting them.
     fn loaded(service: &SemanticService) -> Vec<PathBuf> {
-        let mut paths: Vec<_> = service.projects.keys().cloned().collect();
-        paths.sort();
-        paths
+        service.loaded_paths_for_test()
     }
 
     /// The cap has to evict by *use*, not by arrival. A queue that dropped the
@@ -2133,7 +2422,7 @@ pub fn a_local_of_the_same_name() -> u32 {
             one_crate_workspace(dir.path());
         }
 
-        let mut service = SemanticService::with_max_projects(2);
+        let service = SemanticService::with_max_projects(2);
         for dir in [&first, &second] {
             service
                 .symbol_search(dir.path(), "target", 8)
@@ -2174,7 +2463,7 @@ pub fn a_local_of_the_same_name() -> u32 {
             one_crate_workspace(dir.path());
         }
 
-        let mut service = SemanticService::with_max_projects(1);
+        let service = SemanticService::with_max_projects(1);
         service
             .symbol_search(first.path(), "target", 8)
             .expect("load the first project");
@@ -2200,12 +2489,12 @@ pub fn a_local_of_the_same_name() -> u32 {
             .map(|_| tempfile::tempdir().expect("tempdir"))
             .collect();
 
-        let mut service = SemanticService::with_max_projects(0);
+        let service = SemanticService::with_max_projects(0);
         for dir in &dirs {
             service.insert_test_project_fast(dir.path().to_path_buf());
         }
-        let kept = service.projects.keys().next().cloned().expect("a project");
-        assert_eq!(service.evict_to_capacity(&kept), 0);
+        let kept = loaded(&service)[0].clone();
+        assert!(service.registry().evict_to_capacity(&kept).is_empty());
         assert_eq!(
             service.project_count(),
             3,
@@ -2233,7 +2522,7 @@ pub fn a_local_of_the_same_name() -> u32 {
         let root = workspace.path();
         one_crate_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let before = service
             .find_references_by_name_with_exact(root, "target", true)
             .expect("query before collection");
@@ -2244,10 +2533,8 @@ pub fn a_local_of_the_same_name() -> u32 {
         );
 
         let canonical = root.canonicalize().expect("canonicalize");
-        let revision_before = service.projects[&canonical]
-            .host
-            .raw_database()
-            .nonce_and_revision();
+        let revision_before = service
+            .with_context_for_test(&canonical, |ctx| ctx.host.raw_database().nonce_and_revision());
 
         assert_eq!(
             service.collect_garbage(),
@@ -2255,10 +2542,8 @@ pub fn a_local_of_the_same_name() -> u32 {
             "the collection must visit the loaded project"
         );
 
-        let revision_after = service.projects[&canonical]
-            .host
-            .raw_database()
-            .nonce_and_revision();
+        let revision_after = service
+            .with_context_for_test(&canonical, |ctx| ctx.host.raw_database().nonce_and_revision());
         assert_ne!(
             revision_before, revision_after,
             "without a revision bump the LRU capacities never evict anything"
@@ -2290,7 +2575,7 @@ pub fn a_local_of_the_same_name() -> u32 {
         let root = workspace.path();
         one_crate_workspace(root);
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let found = service
             .find_references_by_name_with_exact(root, "target", true)
             .expect("a query that fills the database");
@@ -2436,7 +2721,7 @@ pub fn a_local_of_the_same_name() -> u32 {
 
         let mut after_release = Vec::with_capacity(cycles);
         for cycle in 0..cycles {
-            let mut service = SemanticService::new();
+            let service = SemanticService::new();
             // A real query, not a bare load: this is what fills the salsa
             // database in production, and an empty database would understate
             // both fragmentation and any leak.
@@ -2586,7 +2871,7 @@ pub fn a_local_of_the_same_name() -> u32 {
         type Row = IngredientMemory;
         let breakdown = ingredient_rows;
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         // A real query, not a bare load: an empty database has nothing memoized
         // and every row would read as zero.
         let probed = match probe.as_str() {
@@ -2624,13 +2909,7 @@ pub fn a_local_of_the_same_name() -> u32 {
             .expect("canonicalize the probe project");
         // Borrowed inline, not held: `collect_garbage` below needs `&mut` on the
         // service, so no borrow of a host may outlive a single measurement.
-        let rows = breakdown(
-            &mut service
-                .projects
-                .get_mut(&canonical)
-                .expect("the query above must have cached a context for this path")
-                .host,
-        );
+        let rows = service.with_context_for_test(&canonical, |ctx| breakdown(&mut ctx.host));
 
         let accounted: usize = rows.iter().map(Row::bytes).sum();
         let with_heap = rows.iter().filter(|row| row.heap_bytes.is_some()).count();
@@ -2729,29 +3008,22 @@ pub fn a_local_of_the_same_name() -> u32 {
         // generated ingredient of an *associated* tracked fn with `_`, so a
         // hand-written `Type::method` matches nothing and only logs a warning
         // nobody reads. This line is what makes that visible.
-        {
-            let db: &dyn salsa::Database = service
-                .projects
-                .get(&canonical)
-                .expect("context still cached")
-                .host
-                .raw_database();
+        service.with_context_for_test(&canonical, |ctx| {
+            let db: &dyn salsa::Database = ctx.host.raw_database();
             let mut tunable = salsa::Database::lru_capacity_names(db);
             tunable.sort_unstable();
             println!("queries with a tunable LRU capacity: {tunable:?}");
-        }
+        });
         {
             // And the other half: that rust-analyzer's own configuration reaches
             // those queries. It reports a miss only through `tracing::warn!`, and
             // a warning in a daemon log is not an oracle — this turns the whole
             // set of names into one red assertion.
-            let missed = service
-                .projects
-                .get_mut(&canonical)
-                .expect("context still cached")
-                .host
-                .raw_database_mut()
-                .update_base_query_lru_capacities(None);
+            let missed = service.with_context_for_test(&canonical, |ctx| {
+                ctx.host
+                    .raw_database_mut()
+                    .update_base_query_lru_capacities(None)
+            });
             assert_eq!(
                 missed, 0,
                 "rust-analyzer asked for {missed} LRU capacities that match no query in this \
@@ -2781,13 +3053,7 @@ pub fn a_local_of_the_same_name() -> u32 {
 
         service.collect_garbage();
 
-        let after_rows = breakdown(
-            &mut service
-                .projects
-                .get_mut(&canonical)
-                .expect("collecting garbage must not drop the context")
-                .host,
-        );
+        let after_rows = service.with_context_for_test(&canonical, |ctx| breakdown(&mut ctx.host));
         let (after, heap_after) = row_of(&after_rows, CAPPED_QUERY).unwrap_or((0, None));
         println!(
             "after collect_garbage: `{CAPPED_QUERY}` {before} -> {after} memo slot(s), heap \
@@ -3065,7 +3331,7 @@ pub fn a_local_of_the_same_name() -> u32 {
         };
         let reset_peak = || std::fs::write("/proc/self/clear_refs", "5").expect("reset VmHWM");
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         reset_peak();
         let started = kib("VmRSS:");
         let first = service
@@ -3309,28 +3575,29 @@ pub fn a_local_of_the_same_name() -> u32 {
         let project = PathBuf::from(required("RMC_FILE_TEXT_PROJECT"));
         let symbol = required("RMC_FILE_TEXT_SYMBOL");
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let found = service
             .find_references_by_name_with_exact(&project, &symbol, true)
             .expect("reference search on the probe workspace");
         assert!(!found.is_empty(), "`{symbol}` has no references: the load inferred nothing");
 
         let canonical = project.canonicalize().expect("canonicalize the probe workspace");
-        let ctx = &service.projects[&canonical];
-        let db = ctx.host.raw_database();
-        let sema = ra_ap_ide::Semantics::new(db);
         // (library root, module of some crate) -> (files, text bytes)
         let mut split: std::collections::BTreeMap<(bool, bool), (usize, usize)> =
             Default::default();
-        for (file, _path) in ctx.vfs.iter() {
-            let root = db.file_source_root(file).source_root_id(db);
-            let library = db.source_root(root).source_root(db).is_library;
-            let bytes = db.file_text(file).text(db).len();
-            let module = sema.file_to_module_defs(file).next().is_some();
-            let entry = split.entry((library, module)).or_default();
-            entry.0 += 1;
-            entry.1 += bytes;
-        }
+        service.with_context_for_test(&canonical, |ctx| {
+            let db = ctx.host.raw_database();
+            let sema = ra_ap_ide::Semantics::new(db);
+            for (file, _path) in ctx.vfs.iter() {
+                let root = db.file_source_root(file).source_root_id(db);
+                let library = db.source_root(root).source_root(db).is_library;
+                let bytes = db.file_text(file).text(db).len();
+                let module = sema.file_to_module_defs(file).next().is_some();
+                let entry = split.entry((library, module)).or_default();
+                entry.0 += 1;
+                entry.1 += bytes;
+            }
+        });
         for ((library, module), (files, bytes)) in &split {
             println!(
                 "{:<9} {:<11} {files:>7} file(s) {:>8.1} MiB",
@@ -3368,26 +3635,28 @@ pub fn a_local_of_the_same_name() -> u32 {
                 .unwrap_or_else(|_| panic!("set RMC_DEF_MAP_PROJECT: the probe has no default")),
         );
 
-        let mut service = SemanticService::new();
+        let service = SemanticService::new();
         let started = std::time::Instant::now();
         service.get_or_load_full(&project).expect("load the probe workspace");
         println!("load: {:.1} s", started.elapsed().as_secs_f64());
 
         let canonical = project.canonicalize().expect("canonicalize the probe workspace");
-        let db = service.projects[&canonical].host.raw_database();
         let mut census = DefMapCensus::default();
         let mut per_crate: Vec<(usize, String, usize)> = Vec::new();
-        for &krate in all_crates(db).iter() {
-            let before = census.bytes();
-            let modules = census.modules;
-            census.add_crate(db, krate);
-            let name = krate
-                .extra_data(db)
-                .display_name
-                .as_ref()
-                .map_or_else(|| format!("{krate:?}"), |name| name.to_string());
-            per_crate.push((census.bytes() - before, name, census.modules - modules));
-        }
+        service.with_context_for_test(&canonical, |ctx| {
+            let db = ctx.host.raw_database();
+            for &krate in all_crates(db).iter() {
+                let before = census.bytes();
+                let modules = census.modules;
+                census.add_crate(db, krate);
+                let name = krate
+                    .extra_data(db)
+                    .display_name
+                    .as_ref()
+                    .map_or_else(|| format!("{krate:?}"), |name| name.to_string());
+                per_crate.push((census.bytes() - before, name, census.modules - modules));
+            }
+        });
         assert!(
             census.def_maps > 0 && census.bytes() > 0,
             "no def map weighed: the census measured nothing"

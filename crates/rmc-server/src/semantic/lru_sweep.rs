@@ -233,13 +233,7 @@ fn query_bytes(rows: &[IngredientMemory], query: &str) -> (usize, usize) {
 }
 
 fn rows_of(service: &mut SemanticService, canonical: &Path) -> Vec<IngredientMemory> {
-    ingredient_rows(
-        &mut service
-            .projects
-            .get_mut(canonical)
-            .expect("the probe must have cached a context for this path")
-            .host,
-    )
+    service.with_context_for_test(canonical, |ctx| ingredient_rows(&mut ctx.host))
 }
 
 /// The capacities a sweep will walk, led by `None` — the capacity the daemon
@@ -283,13 +277,11 @@ pub(super) fn apply_capacity(
     canonical: &Path,
     capacity: Option<u16>,
 ) {
-    let missed = service
-        .projects
-        .get_mut(canonical)
-        .expect("the probe must have cached a context for this path")
-        .host
-        .raw_database_mut()
-        .update_base_query_lru_capacities(capacity);
+    let missed = service.with_context_for_test(canonical, |ctx| {
+        ctx.host
+            .raw_database_mut()
+            .update_base_query_lru_capacities(capacity)
+    });
     assert_eq!(
         missed, 0,
         "{missed} of the capacities rust-analyzer sets match no query in this database, so this \

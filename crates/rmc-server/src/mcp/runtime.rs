@@ -8,7 +8,7 @@ use serde::Serialize;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::deep_stack::run_exclusive_analysis;
+use crate::deep_stack::try_run_exclusive_analysis;
 use crate::semantic::{SemanticService, SemanticServiceStatus};
 
 use super::memory::{MemoryRelease, release_and_measure, rss_kib};
@@ -136,7 +136,7 @@ pub struct RuntimeState {
     sync_manager: Option<Arc<SyncManager>>,
     workspace_locks: WorkspaceLockRegistry,
     search_cache: SearchRuntimeCache,
-    semantic: Arc<Mutex<SemanticService>>,
+    semantic: Arc<SemanticService>,
     background_sync_enabled: Arc<AtomicBool>,
     background_sync_running: Arc<AtomicBool>,
 }
@@ -147,7 +147,7 @@ impl RuntimeState {
             sync_manager: None,
             workspace_locks: WorkspaceLockRegistry::new(),
             search_cache: SearchRuntimeCache::new(),
-            semantic: Arc::new(Mutex::new(SemanticService::new())),
+            semantic: Arc::new(SemanticService::new()),
             background_sync_enabled: Arc::new(AtomicBool::new(false)),
             background_sync_running: Arc::new(AtomicBool::new(false)),
         }
@@ -159,7 +159,7 @@ impl RuntimeState {
             sync_manager: Some(sync_manager),
             workspace_locks,
             search_cache: SearchRuntimeCache::new(),
-            semantic: Arc::new(Mutex::new(SemanticService::new())),
+            semantic: Arc::new(SemanticService::new()),
             background_sync_enabled: Arc::new(AtomicBool::new(false)),
             background_sync_running: Arc::new(AtomicBool::new(false)),
         }
@@ -185,7 +185,7 @@ impl RuntimeState {
         &self.search_cache
     }
 
-    pub(crate) fn semantic(&self) -> Arc<Mutex<SemanticService>> {
+    pub(crate) fn semantic(&self) -> Arc<SemanticService> {
         Arc::clone(&self.semantic)
     }
 
@@ -208,11 +208,8 @@ impl RuntimeState {
             Some(sync_manager) => RuntimeSyncStatus::from_sync_manager(sync_manager.status().await),
             None => RuntimeSyncStatus::disabled(),
         };
-        let semantic = self
-            .semantic
-            .lock()
-            .expect("semantic service mutex poisoned")
-            .status();
+        // Registry only: answers while any project is loading.
+        let semantic = self.semantic.status();
         RuntimeStatus {
             sync,
             search_cache: self.search_cache.status(),
@@ -242,34 +239,31 @@ impl RuntimeState {
     /// rust-analyzer work was run on one.
     ///
     /// It takes that thread *exclusively*
-    /// ([`crate::deep_stack::run_exclusive_analysis`]). The paragraph below
-    /// argues the sweep is safe because every path into this service is behind
-    /// one mutex, and that much holds — but this service is not the only
-    /// rust-analyzer in the process: the graph tools, the audits and the
-    /// skeleton builder each load a workspace of their own, outside it, and
-    /// this method runs on a timer that knows nothing about them. The gate is
-    /// what makes "no query is in flight" true rather than assumed; without it
-    /// the overlap is a `SIGSEGV`, which is how it was found.
+    /// ([`crate::deep_stack::try_run_exclusive_analysis`]): the semantic
+    /// service is not the only rust-analyzer in the process — the graph tools,
+    /// the audits and the skeleton builder each load a workspace of their own,
+    /// and this method runs on a timer that knows nothing about them. The gate
+    /// is what makes "no query is in flight" true rather than assumed; without
+    /// it the overlap is a `SIGSEGV`, which is how it was found.
+    ///
+    /// And only if it can have the gate *now*: `None` means analyses were
+    /// inside and the sweep was skipped — the caller tries again on its next
+    /// tick. Waiting instead would park every analysis that arrives behind the
+    /// waiting sweep, on every project, for as long as the longest one inside
+    /// runs (a load: minutes).
     ///
     /// It does *not* take the workspace locks that [`Self::clear`] takes. Those
     /// guard the search index and the sync manager, neither of which this
-    /// touches; taking them on a timer would stall indexing for no reason. The
-    /// lock that matters here is the semantic mutex, which is also what makes
-    /// the collection sound.
-    pub async fn collect_garbage(&self) -> usize {
+    /// touches; taking them on a timer would stall indexing for no reason.
+    pub async fn collect_garbage(&self) -> Option<usize> {
         let semantic = Arc::clone(&self.semantic);
-        match run_exclusive_analysis("collect_garbage", move || {
-            semantic
-                .lock()
-                .expect("semantic service mutex poisoned")
-                .collect_garbage()
-        })
-        .await
+        match try_run_exclusive_analysis("collect_garbage", move || semantic.collect_garbage())
+            .await
         {
             Ok(collected) => collected,
             Err(error) => {
                 tracing::warn!("garbage collection did not run: {}", error.message);
-                0
+                Some(0)
             }
         }
     }
@@ -318,36 +312,20 @@ impl RuntimeState {
             | (RuntimeClearScope::Workspace, Some(workspace)) => {
                 report.search_cache_entries_cleared =
                     self.search_cache.invalidate_workspace(workspace);
-                report.semantic_projects_cleared = self
-                    .semantic
-                    .lock()
-                    .expect("semantic service mutex poisoned")
-                    .clear_project(workspace);
+                report.semantic_projects_cleared = self.semantic.clear_project(workspace);
                 report.sync_directories_untracked = self.untrack_workspace(workspace).await;
             }
             (RuntimeClearScope::All, None) => {
                 report.search_cache_entries_cleared = self.search_cache.invalidate_all();
-                report.semantic_projects_cleared = self
-                    .semantic
-                    .lock()
-                    .expect("semantic service mutex poisoned")
-                    .clear_all();
+                report.semantic_projects_cleared = self.semantic.clear_all();
                 report.sync_directories_untracked = self.untrack_all().await;
             }
             (RuntimeClearScope::Workspace, None) => {}
             (RuntimeClearScope::SemanticOnly, Some(workspace)) => {
-                report.semantic_projects_cleared = self
-                    .semantic
-                    .lock()
-                    .expect("semantic service mutex poisoned")
-                    .clear_project(workspace);
+                report.semantic_projects_cleared = self.semantic.clear_project(workspace);
             }
             (RuntimeClearScope::SemanticOnly, None) => {
-                report.semantic_projects_cleared = self
-                    .semantic
-                    .lock()
-                    .expect("semantic service mutex poisoned")
-                    .clear_all();
+                report.semantic_projects_cleared = self.semantic.clear_all();
             }
             (RuntimeClearScope::SearchCacheOnly, Some(workspace)) => {
                 report.search_cache_entries_cleared =
@@ -628,8 +606,6 @@ mod tests {
             .await;
         state
             .semantic()
-            .lock()
-            .expect("semantic mutex")
             .insert_test_project_fast(workspace.path().join("."));
 
         let report = state

@@ -1895,11 +1895,23 @@ pub async fn run_daemon(
         // problem it prevents. Kept running while retiring too — a retired
         // daemon can sit here for the whole grace period holding what pushed it
         // over the hard limit.
+        //
+        // A sweep needs every analysis out of rust-analyzer, and it does not
+        // wait for that (`collect_garbage`): while one runs, the sweep is
+        // skipped and tried again on the next tick. Waiting here also stopped
+        // this loop from accepting connections — for the rest of a load, minutes.
         if should_collect_garbage(last_gc.elapsed().unwrap_or_default(), gc_interval) {
-            let collected = runtime.state().collect_garbage().await;
-            last_gc = SystemTime::now();
-            if collected > 0 {
-                tracing::info!("collected garbage in {} loaded project(s)", collected);
+            match runtime.state().collect_garbage().await {
+                Some(collected) => {
+                    last_gc = SystemTime::now();
+                    if collected > 0 {
+                        tracing::info!("collected garbage in {} loaded project(s)", collected);
+                    }
+                }
+                None => tracing::debug!(
+                    "garbage collection deferred: an analysis is in flight; retrying in {:?}",
+                    IDLE_TICK
+                ),
             }
         }
 
