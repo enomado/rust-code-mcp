@@ -1,17 +1,63 @@
-//! Per-workspace operation locks for index/cache state.
+//! The daemon's lock model: every lock a tool call can wait on, in one order.
+//!
+//! The workspace locks are declared here; the process locks live beside what
+//! they guard and are listed here, so this table is the whole model. A new
+//! lock joins this table and the order below, not a call site.
 //!
 //! # Lock order
 //!
-//! `global (read) → workspace maintenance → workspace operation`. Every
-//! acquisition below follows it; a new lock joins this list, not a call site.
+//! ```text
+//! workspace (async, tokio; held across .await):
+//!   global (read) → graph cache → maintenance → operation
+//! process (taken inside a workspace lock or alone, never the reverse):
+//!   analysis gate (read) → project slot → project Vfs → semantic registry
+//!   GPU broker grant → GPU flock
+//!   search cache, tracked directories, graph env cache — leaves: held for a lookup, nothing taken under them
+//! ```
+//!
+//! Each workspace guard is built in that order by one constructor below, and
+//! the only inner lock handed out separately comes from a guard of the level
+//! above it ([`GraphCacheWriterGuard::read_index`],
+//! [`StoreWriterGuard::operation_lock`]), so a guard cannot be taken out of
+//! order. No workspace lock is taken under a process lock: rust-analyzer work
+//! takes none, and a process lock is let go before its holder awaits anything
+//! but itself (the tracked directories are a tokio lock, held for a set
+//! update only).
+//!
+//! ## Workspace locks ([`WorkspaceLockRegistry`], keyed by canonical directory)
 //!
 //! | Lock | Taken by | Protects |
 //! |---|---|---|
-//! | `global` read | every guard below | a whole-cache `lock_all` (directory-less `clear_cache`, shutdown) |
+//! | `global` read | every guard below | a whole-cache `lock_all` (directory-less `clear_cache` / `clear_runtime`, shutdown) |
 //! | `global` write | [`WorkspaceLockRegistry::lock_all`] | everything: waits for every guard below |
+//! | graph cache | [`WorkspaceLockRegistry::lock_graph_cache_writer`]: `semantic_overlaps`, `build_codemap` with `compute_missing` | the hypergraph's embedding cache (LMDB) against two writers embedding the same missing items at once; its readers take nothing (LMDB MVCC), and it keeps no reader of the index out |
 //! | maintenance | store writers, index writers, [`MaintenanceGuard`] | the stores against two writers: indexing runs, clears and maintenance passes (compaction, index extension, prune) one at a time |
-//! | operation read | [`WorkspaceLockRegistry::lock_shared`] | the workspace's index and caches against a writer, while readers run side by side |
-//! | operation write | [`WorkspaceLockRegistry::lock_exclusive`], index writers for their whole run, store writers only while they publish | readers kept off what a writer has half done |
+//! | operation read | [`WorkspaceLockRegistry::lock_shared`], a graph cache writer that also reads the index | the workspace's index and caches against a writer, while readers run side by side |
+//! | operation write | index writers for their whole run, store writers only while they publish | readers kept off what a writer has half done |
+//!
+//! The graph cache comes before the operation lock on purpose: a graph cache
+//! writer queued behind another one (embedding for minutes) holds no read
+//! lock while it waits, so it cannot hold up a sync's publish — and with it,
+//! through tokio's fair queue, every reader arriving after the publish.
+//!
+//! ## Process locks
+//!
+//! | Lock | Where | Held for |
+//! |---|---|---|
+//! | analysis gate | `crate::deep_stack` (`ANALYSIS_GATE`) | read: one rust-analyzer analysis; write: one garbage collection, `try_write` only — it never queues ahead of analyses |
+//! | project slot | `crate::semantic::SemanticService` (`ProjectSlot::context`) | the load, refresh or snapshot of ONE project; queries run on the snapshot without it |
+//! | project Vfs | the slot's `Vfs` lock | read beside a query's snapshot; write by a refresh under the slot |
+//! | semantic registry | `SemanticService::registry` | lookup, insert, touch, evict of slots; never waits for a slot (eviction `try_lock`s) |
+//! | GPU broker grant | `rmc_engine::embeddings::gpu_broker` | one embedding run; search ahead of indexing ahead of graph |
+//! | GPU flock | `rmc_engine::embeddings::gpu_lock` (file lock, between daemons) | one GPU run or session creation; waits ≤ 5 min |
+//! | search cache | [`crate::mcp::SearchRuntimeCache`] | get / insert / invalidate of an entry |
+//! | tracked directories | [`crate::mcp::SyncManager`] | add / remove / list the synced directories |
+//! | graph env cache | `rmc_graph::graph::snapshot` (`OPENED_GRAPH_ENVS`) | opening a hypergraph's LMDB env once per process (heed requires it); its transactions are LMDB's own |
+//!
+//! Operations that clear in-memory state (`clear_runtime` of one workspace)
+//! take only these process locks, not the workspace operation lock: a reader
+//! in flight keeps what it already holds until it answers, as a query keeps
+//! its rust-analyzer snapshot when its project is cleared.
 //!
 //! Writers of the stores come in two kinds:
 //!
@@ -48,11 +94,12 @@ fn workspace_key(dir: &Path) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
 }
 
-/// The two per-workspace locks, in acquisition order.
+/// The per-workspace locks, in acquisition order.
 #[derive(Clone, Default)]
 struct WorkspaceSlot {
-    operation: Arc<RwLock<()>>,
+    graph_cache: Arc<Mutex<()>>,
     maintenance: Arc<Mutex<()>>,
+    operation: Arc<RwLock<()>>,
 }
 
 /// Registry of async locks keyed by canonical workspace directory.
@@ -63,8 +110,9 @@ struct WorkspaceSlot {
 ///   (whole-cache operations such as a directory-less `clear_cache`) takes it
 ///   for WRITE and so excludes everyone.
 /// - per workspace, an operation read/write lock — readers side by side, a
-///   writing operation alone — and a maintenance mutex serialising writers of
-///   its vector store (indexing runs and maintenance passes).
+///   writing operation alone — a maintenance mutex serialising writers of
+///   its vector store (indexing runs and maintenance passes), and a graph
+///   cache mutex serialising writers of the hypergraph's embedding cache.
 ///
 /// The global level used to be a plain mutex taken by every workspace
 /// operation. On a shared daemon that made the per-workspace mutex
@@ -92,28 +140,11 @@ impl WorkspaceLockRegistry {
         (key, slot)
     }
 
-    /// Take an exclusive workspace lock.
-    ///
-    /// Excludes other operations on the same workspace and `lock_all`, but
-    /// not operations on other workspaces, and not a maintenance pass of the
-    /// workspace's vector store: an operation that writes that store must
-    /// take [`Self::lock_index_writer`] instead. The global read guard is
-    /// taken first, so a pending `lock_all` writer is never starved by a
-    /// stream of workspace operations (tokio's `RwLock` is fair).
-    pub async fn lock_exclusive(&self, dir: &Path) -> WorkspaceLockGuard {
-        let global_guard = self.global.clone().read_owned().await;
-        let (workspace, slot) = self.slot_for(dir).await;
-        let guard = slot.operation.clone().write_owned().await;
-        WorkspaceLockGuard {
-            workspace,
-            _global_guard: global_guard,
-            _operation: OperationGuard::Write(guard),
-        }
-    }
-
     /// Take a read-side workspace lock: waits for a writing operation on the
     /// workspace, not for other readers, and NOT for a maintenance pass of its
-    /// vector store.
+    /// vector store. The global read guard is taken first, so a pending
+    /// `lock_all` is never starved by a stream of workspace operations
+    /// (tokio's `RwLock` is fair).
     ///
     /// The holder must not write the workspace's index or caches. What the
     /// readers do share is guarded on its own: the search cache has its own
@@ -121,14 +152,37 @@ impl WorkspaceLockRegistry {
     /// refused, not queued, and that search reads vectors alone), and a reader
     /// that turns out to need a writer takes [`Self::lock_index_writer`] after
     /// letting this go.
-    pub async fn lock_shared(&self, dir: &Path) -> WorkspaceLockGuard {
+    pub async fn lock_shared(&self, dir: &Path) -> WorkspaceReadGuard {
         let global_guard = self.global.clone().read_owned().await;
         let (workspace, slot) = self.slot_for(dir).await;
-        let guard = slot.operation.clone().read_owned().await;
-        WorkspaceLockGuard {
+        let operation_guard = slot.operation.clone().read_owned().await;
+        WorkspaceReadGuard {
             workspace,
             _global_guard: global_guard,
-            _operation: OperationGuard::Read(guard),
+            _operation_guard: operation_guard,
+        }
+    }
+
+    /// Take the lock of a writer of the hypergraph's embedding cache
+    /// (`semantic_overlaps`; `build_codemap` with `compute_missing`, which
+    /// then also reads the index through [`GraphCacheWriterGuard::read_index`]).
+    ///
+    /// Writers of that cache wait for each other, so two calls do not embed
+    /// the same missing items twice; nothing else waits for them. The cache
+    /// is in the snapshot's LMDB, which commits each write in a transaction
+    /// and lets its readers read the last commit, so the index readers have
+    /// nothing to be kept off. They used to be: these calls took the
+    /// workspace's operation lock for write and parked every `search` of the
+    /// workspace for as long as they embedded.
+    pub async fn lock_graph_cache_writer(&self, dir: &Path) -> GraphCacheWriterGuard {
+        let global_guard = self.global.clone().read_owned().await;
+        let (workspace, slot) = self.slot_for(dir).await;
+        let graph_cache_guard = slot.graph_cache.clone().lock_owned().await;
+        GraphCacheWriterGuard {
+            workspace,
+            _global_guard: global_guard,
+            _graph_cache_guard: graph_cache_guard,
+            operation: slot.operation,
         }
     }
 
@@ -179,27 +233,53 @@ impl WorkspaceLockRegistry {
     }
 }
 
-/// Either side of a workspace's operation lock — held, never read.
-enum OperationGuard {
-    Read(#[allow(dead_code)] OwnedRwLockReadGuard<()>),
-    Write(#[allow(dead_code)] OwnedRwLockWriteGuard<()>),
-}
-
-/// Held workspace operation lock, read or write.
-pub struct WorkspaceLockGuard {
+/// Held read side of a workspace's operation lock (with the global read guard).
+pub struct WorkspaceReadGuard {
     workspace: PathBuf,
     _global_guard: OwnedRwLockReadGuard<()>,
-    _operation: OperationGuard,
+    _operation_guard: OwnedRwLockReadGuard<()>,
 }
 
-impl WorkspaceLockGuard {
+impl WorkspaceReadGuard {
     pub fn workspace(&self) -> &Path {
         &self.workspace
     }
 }
 
-/// Held lock of a vector-store writer: global read, operation write,
-/// maintenance.
+/// Held lock of a hypergraph embedding-cache writer: global read and the
+/// workspace's graph cache lock, no operation lock.
+pub struct GraphCacheWriterGuard {
+    workspace: PathBuf,
+    _global_guard: OwnedRwLockReadGuard<()>,
+    _graph_cache_guard: OwnedMutexGuard<()>,
+    operation: Arc<RwLock<()>>,
+}
+
+impl GraphCacheWriterGuard {
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    /// Also read the workspace's index, as a reader does: the operation lock
+    /// for read, taken AFTER the graph cache lock — the order this type
+    /// enforces (see the module docs for why the other way round would let a
+    /// queued cache writer hold up a sync's publish).
+    pub async fn read_index(self) -> GraphCacheReadingIndexGuard {
+        let operation_guard = self.operation.clone().read_owned().await;
+        GraphCacheReadingIndexGuard {
+            _graph_cache_writer: self,
+            _operation_guard: operation_guard,
+        }
+    }
+}
+
+/// A [`GraphCacheWriterGuard`] that also reads the workspace's index.
+pub struct GraphCacheReadingIndexGuard {
+    _graph_cache_writer: GraphCacheWriterGuard,
+    _operation_guard: OwnedRwLockReadGuard<()>,
+}
+
+/// Held lock of an index writer: global read, maintenance, operation write.
 pub struct IndexWriterGuard {
     workspace: PathBuf,
     _global_guard: OwnedRwLockReadGuard<()>,
@@ -328,11 +408,11 @@ mod tests {
         let workspace = temp_dir.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
 
-        let guard = registry.lock_exclusive(&workspace).await;
+        let guard = registry.lock_index_writer(&workspace).await;
         let waiter_registry = registry.clone();
         let waiter_workspace = workspace.clone();
         let waiter = tokio::spawn(async move {
-            let _guard = waiter_registry.lock_exclusive(&waiter_workspace).await;
+            let _guard = waiter_registry.lock_index_writer(&waiter_workspace).await;
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -353,7 +433,7 @@ mod tests {
         let waiter_registry = registry.clone();
         let waiter_workspace = workspace.clone();
         let waiter = tokio::spawn(async move {
-            let _guard = waiter_registry.lock_exclusive(&waiter_workspace).await;
+            let _guard = waiter_registry.lock_index_writer(&waiter_workspace).await;
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -375,7 +455,7 @@ mod tests {
         std::fs::create_dir(&a).unwrap();
         std::fs::create_dir(&b).unwrap();
 
-        let _held_a = registry.lock_exclusive(&a).await;
+        let _held_a = registry.lock_index_writer(&a).await;
         let other = tokio::time::timeout(Duration::from_secs(5), registry.lock_shared(&b)).await;
         assert!(other.is_ok(), "lock on workspace b waited for workspace a");
     }
@@ -387,7 +467,7 @@ mod tests {
         let workspace = temp_dir.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
 
-        let guard = registry.lock_exclusive(&workspace).await;
+        let guard = registry.lock_index_writer(&workspace).await;
         let waiter_registry = registry.clone();
         let waiter = tokio::spawn(async move {
             let _guard = waiter_registry.lock_all().await;
@@ -407,7 +487,7 @@ mod tests {
         let workspace = temp_dir.path().join("workspace");
         std::fs::create_dir(&workspace).unwrap();
 
-        let guard = registry.lock_exclusive(&workspace.join(".")).await;
+        let guard = registry.lock_index_writer(&workspace.join(".")).await;
 
         assert_eq!(guard.workspace(), std::fs::canonicalize(&workspace).unwrap());
     }
@@ -588,6 +668,110 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), other)
             .await
             .expect("the second writer never got the lock")
+            .unwrap();
+    }
+
+    /// A writer of the hypergraph's embedding cache (`semantic_overlaps`
+    /// embedding for minutes) keeps no reader of the workspace's index out,
+    /// and no store writer's publish either. Mutant (checked 2026-10-31):
+    /// `lock_graph_cache_writer` taking the operation lock for write, as
+    /// `lock_exclusive` did → both time out.
+    #[tokio::test]
+    async fn a_graph_cache_writer_keeps_no_reader_or_publish_out() {
+        let registry = WorkspaceLockRegistry::new();
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = workspace_in(&temp_dir);
+
+        let _cache_writer = registry.lock_graph_cache_writer(&workspace).await;
+        let reader =
+            tokio::time::timeout(Duration::from_secs(5), registry.lock_shared(&workspace)).await;
+        assert!(reader.is_ok(), "a reader waited for a graph cache writer");
+        drop(reader);
+
+        let store_writer = registry.lock_store_writer(&workspace).await;
+        let publish =
+            tokio::time::timeout(Duration::from_secs(5), store_writer.operation_lock().write())
+                .await;
+        assert!(publish.is_ok(), "a sync's publish waited for a graph cache writer");
+    }
+
+    /// Two writers of the graph cache wait for each other (so they do not
+    /// embed the same missing items twice), and the one waiting holds no read
+    /// lock on the index meanwhile: a sync's publish — and every reader queued
+    /// behind it — gets in. Mutant (checked 2026-10-31): the second writer
+    /// taking the order the type rules out — `lock_shared`, then
+    /// `lock_graph_cache_writer` — → the publish times out.
+    #[tokio::test]
+    async fn a_queued_graph_cache_writer_does_not_hold_up_a_publish() {
+        let registry = WorkspaceLockRegistry::new();
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = workspace_in(&temp_dir);
+
+        let first = registry.lock_graph_cache_writer(&workspace).await;
+        let second = tokio::spawn({
+            let registry = registry.clone();
+            let workspace = workspace.clone();
+            async move {
+                let _guard = registry
+                    .lock_graph_cache_writer(&workspace)
+                    .await
+                    .read_index()
+                    .await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "a second graph cache writer ran beside the first"
+        );
+
+        let store_writer = registry.lock_store_writer(&workspace).await;
+        let publish =
+            tokio::time::timeout(Duration::from_secs(5), store_writer.operation_lock().write())
+                .await;
+        assert!(
+            publish.is_ok(),
+            "a sync's publish waited for a graph cache writer queued behind another"
+        );
+        drop(publish);
+        drop(store_writer);
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("the second graph cache writer never got the lock")
+            .unwrap();
+    }
+
+    /// A graph cache writer that reads the index is a reader of it: it waits
+    /// for an index writer, as `search` does.
+    #[tokio::test]
+    async fn a_graph_cache_writer_reading_the_index_waits_for_an_index_writer() {
+        let registry = WorkspaceLockRegistry::new();
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = workspace_in(&temp_dir);
+
+        let index_writer = registry.lock_index_writer(&workspace).await;
+        let cache_writer = tokio::spawn({
+            let registry = registry.clone();
+            let workspace = workspace.clone();
+            async move {
+                let _guard = registry
+                    .lock_graph_cache_writer(&workspace)
+                    .await
+                    .read_index()
+                    .await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !cache_writer.is_finished(),
+            "a graph cache writer read the index under an index writer"
+        );
+        drop(index_writer);
+        tokio::time::timeout(Duration::from_secs(5), cache_writer)
+            .await
+            .expect("the graph cache writer never got the index after the writer left")
             .unwrap();
     }
 

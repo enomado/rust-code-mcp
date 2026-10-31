@@ -285,7 +285,11 @@ impl RuntimeState {
     pub async fn clear(&self, request: RuntimeClearRequest) -> RuntimeClearReport {
         let workspace = request.workspace.as_deref().map(normalize_workspace);
         if let Some(workspace) = &workspace {
-            let _workspace_lock = self.workspace_locks.lock_exclusive(workspace).await;
+            // No workspace lock: the search cache, the rust-analyzer projects and
+            // the tracked directories each sit behind a lock of their own, and a
+            // reader in flight keeps what it already holds until it answers. The
+            // write side this took before made the clear wait for the longest
+            // `search` of the workspace and parked every new one behind it.
             self.clear_locked(request.scope, Some(workspace)).await
         } else {
             let _workspace_lock = self.workspace_locks.lock_all().await;
@@ -623,6 +627,29 @@ mod tests {
         assert_eq!(status.sync.tracked_count, 0);
     }
 
+    /// `clear_runtime` of one workspace clears what has locks of its own and
+    /// does not wait for the workspace's readers — before 2026-10-31 it took the
+    /// operation lock for write, waited for the longest `search` in flight and
+    /// parked every new one behind it. Mutant: the write lock back → timeout.
+    #[tokio::test]
+    async fn runtime_clear_of_a_workspace_does_not_wait_for_its_readers() {
+        let runtime = ServerRuntime::new(3600);
+        let state = runtime.state();
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+
+        let _reader = state.workspace_locks().lock_shared(workspace.path()).await;
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            state.clear(RuntimeClearRequest {
+                scope: RuntimeClearScope::Workspace,
+                workspace: Some(workspace.path().to_path_buf()),
+            }),
+        )
+        .await
+        .expect("clear_runtime of a workspace waited for a reader of it");
+        assert_eq!(report.scope, RuntimeClearScope::Workspace);
+    }
+
     #[tokio::test]
     async fn runtime_clear_all_waits_for_workspace_operations() {
         let runtime = ServerRuntime::new(3600);
@@ -631,7 +658,7 @@ mod tests {
 
         let guard = state
             .workspace_locks()
-            .lock_exclusive(workspace.path())
+            .lock_index_writer(workspace.path())
             .await;
         let clear_state = state.clone();
         let clear_task = tokio::spawn(async move {

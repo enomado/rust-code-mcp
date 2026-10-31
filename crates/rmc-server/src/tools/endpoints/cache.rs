@@ -402,7 +402,7 @@ mod tests {
         let project_dir = temp_dir.path().join("project");
         std::fs::create_dir(&project_dir).unwrap();
         let locks = crate::mcp::WorkspaceLockRegistry::new();
-        let guard = locks.lock_exclusive(&project_dir).await;
+        let guard = locks.lock_index_writer(&project_dir).await;
         let waiter_locks = locks.clone();
         let waiter_project = project_dir.clone();
 

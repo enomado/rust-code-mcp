@@ -13,7 +13,15 @@ use rmcp::{
 };
 use rmc_indexing::indexing::open_bm25_search;
 
+use crate::mcp::workspace_locks::{GraphCacheReadingIndexGuard, WorkspaceReadGuard};
 use crate::tools::graph::response::*;
+
+/// The workspace lock a codemap call holds for its whole run — held, never
+/// read.
+enum CodemapLock {
+    Reader(#[allow(dead_code)] WorkspaceReadGuard),
+    GraphCacheWriter(#[allow(dead_code)] GraphCacheReadingIndexGuard),
+}
 
 /// Bridge between the `#[tool]` method in `search_tool_router.rs` and the
 /// algorithm core in `src/graph/codemap/build.rs`.
@@ -84,12 +92,19 @@ pub(crate) async fn handle_build_codemap(
     let include_snippets = include_snippets.unwrap_or(false);
 
     let directory_path = crate::tools::paths::require_absolute("directory", directory)?;
-    // `compute_missing` writes the graph's embedding cache, so it is a writer,
-    // like `semantic_overlaps`; the other policies only read.
+    // Every policy reads the workspace's index (search seeding); `compute_missing`
+    // also writes the graph's embedding cache, so it is that cache's writer,
+    // like `semantic_overlaps` — which keeps no reader of the index out.
     let _workspace_lock = if policy == EmbeddingPolicy::ComputeMissing {
-        workspace_locks.lock_exclusive(&directory_path).await
+        CodemapLock::GraphCacheWriter(
+            workspace_locks
+                .lock_graph_cache_writer(&directory_path)
+                .await
+                .read_index()
+                .await,
+        )
     } else {
-        workspace_locks.lock_shared(&directory_path).await
+        CodemapLock::Reader(workspace_locks.lock_shared(&directory_path).await)
     };
 
     let opts = CodemapOptions {

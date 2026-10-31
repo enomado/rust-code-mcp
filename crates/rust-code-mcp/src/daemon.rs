@@ -2685,7 +2685,7 @@ mod tests {
         let held = runtime
             .state()
             .workspace_locks()
-            .lock_exclusive(Path::new("/nonexistent/held-by-a-sync"))
+            .lock_index_writer(Path::new("/nonexistent/held-by-a-sync"))
             .await;
 
         let started = Instant::now();

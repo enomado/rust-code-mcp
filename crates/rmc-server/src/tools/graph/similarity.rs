@@ -195,8 +195,11 @@ pub(crate) async fn semantic_overlaps(
     params: SemanticOverlapsParams,
     workspace_locks: &crate::mcp::WorkspaceLockRegistry,
 ) -> Result<CallToolResult, McpError> {
-    let _workspace_lock = workspace_locks
-        .lock_exclusive(Path::new(&params.directory))
+    // It reads and writes the hypergraph only (snapshot and its embedding
+    // cache), never the workspace's index: the graph cache writer's lock, which
+    // keeps the next writer of that cache waiting and no reader of the index.
+    let _graph_cache_writer = workspace_locks
+        .lock_graph_cache_writer(Path::new(&params.directory))
         .await;
     let directory = params.directory.clone();
     let backend = resolve_embedding_backend_for_mcp(

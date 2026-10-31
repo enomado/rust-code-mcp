@@ -1138,7 +1138,7 @@ async fn build_codemap_rejects_bad_embedding_policy() {
 async fn similar_to_item_waits_for_workspace_lock() {
     let temp_dir = TempDir::new().unwrap();
     let locks = crate::mcp::WorkspaceLockRegistry::new();
-    let guard = locks.lock_exclusive(temp_dir.path()).await;
+    let guard = locks.lock_index_writer(temp_dir.path()).await;
     let call_locks = locks.clone();
     let directory = temp_dir.path().display().to_string();
 
@@ -1172,7 +1172,7 @@ async fn similar_to_item_waits_for_workspace_lock() {
 async fn build_codemap_waits_for_workspace_lock_before_search_cache_use() {
     let temp_dir = TempDir::new().unwrap();
     let locks = crate::mcp::WorkspaceLockRegistry::new();
-    let guard = locks.lock_exclusive(temp_dir.path()).await;
+    let guard = locks.lock_index_writer(temp_dir.path()).await;
     let call_locks = locks.clone();
     let directory = temp_dir.path().display().to_string();
 

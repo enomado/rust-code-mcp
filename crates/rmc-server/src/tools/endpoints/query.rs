@@ -631,7 +631,7 @@ mod tests {
     async fn get_similar_code_waits_for_workspace_lock() {
         let temp_dir = TempDir::new().unwrap();
         let locks = crate::mcp::WorkspaceLockRegistry::new();
-        let guard = locks.lock_exclusive(temp_dir.path()).await;
+        let guard = locks.lock_index_writer(temp_dir.path()).await;
         let call_locks = locks.clone();
         let directory = temp_dir.path().display().to_string();
 
