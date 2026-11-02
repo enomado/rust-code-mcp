@@ -10,7 +10,7 @@
 //! Staging, publish and prune run under the workspace's `BUILD.lock`
 //! ([`lock_workspace_builds`]).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -59,6 +59,11 @@ pub struct BuildOptions {
     /// `rmc-server` has `mcp::memory::release_free_memory`. `None`: the pages
     /// stay with the allocator for reuse by the next crate.
     pub release_free_memory: Option<fn() -> bool>,
+    /// Build only these member packages (names, `-` or `_`) of the requested
+    /// directory; `None`: every member under it. Part of the snapshot's
+    /// fingerprint, so a graph of another crate set is never reused for this
+    /// one, and changing the set is a full rebuild.
+    pub crates: Option<BTreeSet<String>>,
 }
 
 impl Default for BuildOptions {
@@ -68,6 +73,7 @@ impl Default for BuildOptions {
             data_dir_override: None,
             env: GraphEnvOptions::default(),
             release_free_memory: None,
+            crates: None,
         }
     }
 }
@@ -84,6 +90,9 @@ pub struct BuildResult {
     pub reused: bool,
     pub kind: BuildKind,
     pub snapshot_path: PathBuf,
+    /// The crates (lib+bin groups by name) the snapshot holds — the positive
+    /// control that a scoped build saw what it was asked for.
+    pub crates: Vec<String>,
 }
 
 /// What a build did ([`incremental`](super::incremental) decides).
@@ -256,6 +265,7 @@ fn try_reuse_existing_snapshot(identity: &SnapshotIdentity) -> Result<Option<Bui
         reused: true,
         kind: BuildKind::Reused,
         snapshot_path: identity.snapshot_dir.clone(),
+        crates: manifest.crate_packages.keys().cloned().collect(),
     }))
 }
 
@@ -323,7 +333,7 @@ fn build_attempt(directory: &Path, options: &BuildOptions) -> Result<BuildResult
     // CURRENT at a snapshot another builder is still replacing or pruning.
     let _build_lock = lock_workspace_builds(&paths)?;
     let slice = InputSlice::for_build(&workspace_root, Some(paths.root_dir.clone()))?;
-    let inputs = slice.inputs.clone();
+    let inputs = slice.inputs.clone().scoped(options.crates.as_ref());
     let mut identity = snapshot_identity(workspace_root.clone(), paths, inputs.fingerprint());
     if !options.force_rebuild {
         let reusable = reuse_identity(&identity)?;
@@ -343,7 +353,7 @@ fn build_attempt(directory: &Path, options: &BuildOptions) -> Result<BuildResult
 
     let t = std::time::Instant::now();
     // Unprimed: the per-crate build primes the crates it walks itself.
-    let mut loaded = loader::load_unprimed(&workspace_root)?;
+    let mut loaded = loader::load_unprimed_scoped(&workspace_root, options.crates.as_ref())?;
     if timing {
         eprintln!(
             "build:   loader::load                 {:>9.2?}  ({} local crates)",
@@ -501,7 +511,7 @@ fn build_attempt(directory: &Path, options: &BuildOptions) -> Result<BuildResult
             "features": "all", "all_targets": false, "set_test": false,
             "build_script_outputs": false, "proc_macro_server": false,
             "targets": targets, "row_origins": row_origins, "incremental_base": base_graph_id,
-            "build": kind
+            "build": kind, "scope_crates": options.crates
         })),
         graph_id: identity.graph_id.clone(),
         workspace_root: loaded.workspace_root.display().to_string(),
@@ -516,6 +526,7 @@ fn build_attempt(directory: &Path, options: &BuildOptions) -> Result<BuildResult
         inputs: Some(inputs),
         crate_packages,
     };
+    let crates = manifest.crate_packages.keys().cloned().collect();
     write_manifest(&identity.manifest_path, &manifest)?;
 
     publish_current(&identity.paths, &identity.graph_id)?;
@@ -533,6 +544,7 @@ fn build_attempt(directory: &Path, options: &BuildOptions) -> Result<BuildResult
         reused: false,
         kind,
         snapshot_path: identity.snapshot_dir,
+        crates,
     })
 }
 

@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, fs, path::{Path, PathBuf}, time::SystemTime};
 use anyhow::{Context, Result};
 use walkdir::WalkDir;
 
-use super::storage::{BuildInputs, compute_build_inputs, is_fingerprinted, is_source_walk_excluded};
+use super::storage::{BuildInputs, compute_build_inputs, governing_files, is_fingerprinted, is_source_walk_excluded};
 
 #[derive(Debug, thiserror::Error)]
 #[error("workspace inputs changed during graph build at {0}; no snapshot was published")]
@@ -40,6 +40,21 @@ fn stamps(root: &Path, graph_output: Option<&Path>) -> Result<BTreeMap<PathBuf, 
             (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
         };
         out.insert(path.to_owned(), Stamp {
+            len: meta.len(), modified: meta.modified()?,
+            #[cfg(unix)]
+            identity,
+        });
+    }
+    // The inputs above the tree that the fingerprint hashes are guarded the
+    // same way; a missing one is simply absent (appearing later is a change).
+    for path in governing_files(root) {
+        let Ok(meta) = fs::metadata(&path) else { continue };
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+        };
+        out.insert(path, Stamp {
             len: meta.len(), modified: meta.modified()?,
             #[cfg(unix)]
             identity,

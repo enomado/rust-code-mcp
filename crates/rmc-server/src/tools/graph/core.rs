@@ -57,6 +57,7 @@ pub(crate) async fn build_hypergraph(
         // crates; this returns the pages to the kernel with the allocator
         // this binary actually links.
         release_free_memory: Some(crate::mcp::memory::release_free_memory),
+        crates: params.crates.map(|c| c.into_iter().collect()),
         ..Default::default()
     };
     // build_and_persist runs `loader::load` + the full extract pass + LMDB
@@ -78,6 +79,7 @@ pub(crate) async fn build_hypergraph(
         reused: result.reused,
         build: result.kind,
         snapshot_path: result.snapshot_path.display().to_string(),
+        crates: result.crates,
     })
 }
 
@@ -94,6 +96,8 @@ pub(crate) struct BuildHypergraphResponse {
     /// Reused, full (with the reason) or incremental (which crates).
     pub(crate) build: BuildKind,
     pub(crate) snapshot_path: String,
+    /// Crates the snapshot holds: check a scoped build saw what it was asked for.
+    pub(crate) crates: Vec<String>,
 }
 
 pub(crate) async fn get_imports(params: GraphImportsParams) -> Result<CallToolResult, McpError> {

@@ -29,6 +29,8 @@ pub mod model;
 mod ownership;
 mod query;
 mod relations;
+#[cfg(test)]
+mod scope_tests;
 mod recursion_check;
 mod signatures;
 mod skeleton;

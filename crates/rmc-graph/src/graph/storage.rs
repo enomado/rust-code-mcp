@@ -305,6 +305,25 @@ impl BuildInputs {
         hex(&h.finalize())
     }
 
+    /// These inputs as seen by a build narrowed to `crates` (package names;
+    /// `-` and `_` are one name): the set joins [`Self::global`], so a
+    /// snapshot of one crate set never passes for another's and a changed set
+    /// is a full rebuild. `None` leaves the inputs as they are.
+    pub fn scoped(mut self, crates: Option<&BTreeSet<String>>) -> Self {
+        if let Some(crates) = crates {
+            let names: BTreeSet<String> = crates.iter().map(|c| c.replace('-', "_")).collect();
+            let mut h = Sha256::new();
+            h.update(self.global.as_bytes());
+            h.update(b"\0crates\0");
+            for name in &names {
+                h.update(name.as_bytes());
+                h.update(&[0]);
+            }
+            self.global = hex(&h.finalize());
+        }
+        self
+    }
+
     /// The package `rel_path` (workspace-relative, `/` separators) belongs
     /// to: the deepest package directory above it, the root at worst.
     pub fn package_of<'a>(&'a self, rel_path: &str) -> &'a str {
@@ -406,6 +425,18 @@ pub(crate) fn compute_build_inputs(workspace_root: &Path) -> Result<BuildInputs>
         h.update(digest);
         h.update(&[0]);
     }
+    // Inputs above the tree: absolute paths, so they never collide with a
+    // workspace-relative one. Global — any change is a full rebuild, as it is
+    // for the same files inside the tree.
+    for path in governing_files(workspace_root) {
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read {} for fingerprint", path.display()))?;
+        global.update(b"^");
+        global.update(path.to_string_lossy().as_bytes());
+        global.update(&[0]);
+        global.update(Sha256::digest(&bytes));
+        global.update(&[0]);
+    }
     let packages = shape
         .packages
         .keys()
@@ -421,6 +452,54 @@ pub(crate) fn compute_build_inputs(workspace_root: &Path) -> Result<BuildInputs>
         global: hex(&global.finalize()),
         packages,
     })
+}
+
+/// Files ABOVE `root` that still decide how the tree under it builds, in a
+/// fixed order: for a request below the workspace root (one member's
+/// directory, or a group of members) the workspace's `Cargo.toml` (dependency
+/// versions, features, `[patch]`) and `Cargo.lock`, plus every ancestor's
+/// `.cargo/config(.toml)` and `rust-toolchain(.toml)` — cargo merges configs
+/// from all ancestors and rustup takes the nearest toolchain file.
+///
+/// Before these were hashed, a graph of a member directory stayed "current"
+/// across a `Cargo.lock` or workspace-dependency change it was built against.
+///
+/// Manifests are collected up to and including the first one that declares a
+/// workspace (`[workspace]` or `[workspace.*]`); when `root` itself declares
+/// it, none above are. A manifest without any workspace above it (a
+/// standalone package) collects every ancestor manifest — harmless extra
+/// inputs, never missing ones.
+pub(in crate::graph) fn governing_files(root: &Path) -> Vec<PathBuf> {
+    let declares_workspace = |manifest: &Path| {
+        fs::read_to_string(manifest).is_ok_and(|text| {
+            text.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("[workspace]") || line.starts_with("[workspace.")
+            })
+        })
+    };
+    let mut out = Vec::new();
+    let mut manifests_done = declares_workspace(&root.join("Cargo.toml"));
+    for dir in root.ancestors().skip(1) {
+        if !manifests_done {
+            let manifest = dir.join("Cargo.toml");
+            if manifest.is_file() {
+                manifests_done = declares_workspace(&manifest);
+                out.push(manifest);
+                let lock = dir.join("Cargo.lock");
+                if lock.is_file() {
+                    out.push(lock);
+                }
+            }
+        }
+        for name in [".cargo/config.toml", ".cargo/config", "rust-toolchain.toml", "rust-toolchain"] {
+            let path = dir.join(name);
+            if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
 /// Whether a workspace-relative path is one of the files

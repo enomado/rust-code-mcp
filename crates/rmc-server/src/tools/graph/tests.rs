@@ -35,8 +35,14 @@ use tempfile::{Builder, TempDir};
 // cases sequentially instead of relying on `--test-threads=1`.
 static DEFAULT_SNAPSHOT_BUILT: OnceLock<()> = OnceLock::new();
 
+/// The directory the default-snapshot cases build and query: the WORKSPACE
+/// root, not this member's directory. The cases ask cross-crate questions
+/// (`rmc_graph::graph` imports, `rmc_indexing` dependencies, `rmc_graph`'s
+/// `loader::load` importers), and since a member-directory request indexes
+/// only that member (02bd485) a graph of `crates/rmc-server` holds none of
+/// them — `get_imports` answered "no node found for `rmc_graph::graph`".
 fn test_project_root() -> String {
-    env!("CARGO_MANIFEST_DIR").to_string()
+    test_workspace_root().display().to_string()
 }
 
 fn test_workspace_root() -> PathBuf {
@@ -163,6 +169,7 @@ async fn ensure_default_snapshot(directory: &str) {
         build_hypergraph(BuildHypergraphParams {
             directory: directory.to_string(),
             force_rebuild: Some(true),
+            crates: None,
         })
         .await
         .expect("build_hypergraph");
@@ -194,6 +201,7 @@ async fn mcp_round_trip_against_self() {
     let build = build_hypergraph(BuildHypergraphParams {
         directory: manifest_dir.to_string(),
         force_rebuild: Some(true),
+        crates: None,
     })
     .await
     .expect("build_hypergraph");
@@ -721,6 +729,7 @@ async fn crate_skeleton_round_trip() {
     build_hypergraph(BuildHypergraphParams {
         directory: workspace.clone(),
         force_rebuild: Some(true),
+        crates: None,
     })
     .await
     .expect("build workspace-root snapshot for crate_skeleton");

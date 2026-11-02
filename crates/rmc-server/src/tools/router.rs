@@ -323,7 +323,7 @@ impl SearchToolRouter {
     // ----- Hypergraph tools (Layer 7) -----
 
     #[tool(
-        description = "Build or reuse the immutable HIR graph that graph and audit tools read (all features, lib/bin targets; no test cfg or build-script outputs). Source edits during the build reload a fresh slice; after three changed attempts it fails without replacing CURRENT. force_rebuild makes a fresh instance. Ambiguous paths take target selectors: app[lib]::helper / app[bin]::helper."
+        description = "Build or reuse the immutable HIR graph that graph and audit tools read (all features, lib/bin targets; no test cfg or build-script outputs). Scope = `directory`: a workspace root, one member, or any directory inside a workspace (a group of members, no Cargo.toml of its own needed), optionally narrowed by `crates`; calls between the scope's crates are edges, calls leaving it are TargetOutsideGraph. The response lists the crates the graph holds. Source edits during the build reload a fresh slice; after three changed attempts it fails without replacing CURRENT. force_rebuild makes a fresh instance. Ambiguous paths take target selectors: app[lib]::helper / app[bin]::helper."
     )]
     async fn build_hypergraph(
         &self,
@@ -858,7 +858,7 @@ impl ServerHandler for SearchToolRouter {
             server_info: Implementation::from_build_env(),
             // Loaded into every client session at start: keep it to the
             // contracts shared by many tools. Per-tool detail lives in TOOLS.md.
-            instructions: Some("Rust code intelligence server: search, definitions, references, renames, dependencies, call graphs, semantic similarity, persisted hypergraph queries, workspace audits, cache/index maintenance. Every path parameter (`directory`, `file_path`, …) must be ABSOLUTE: one daemon serves every working directory and shares no cwd with your session; relative paths are refused. `directory` is the workspace root (the directory with Cargo.toml). List tools page with `limit` (default 50), `offset` and `summary` (drops bulky per-item fields); the list is sorted first, then sliced, and the response carries `total_match_count` — more pages exist while it exceeds `offset + returned`. Graph and audit tools need `build_hypergraph` first. Full per-tool notes: TOOLS.md in the server repository."
+            instructions: Some("Rust code intelligence server: search, definitions, references, renames, dependencies, call graphs, semantic similarity, persisted hypergraph queries, workspace audits, cache/index maintenance. Every path parameter (`directory`, `file_path`, …) must be ABSOLUTE: one daemon serves every working directory and shares no cwd with your session; relative paths are refused. `directory` is the workspace root (the directory with Cargo.toml); graph tools take the directory their graph was built for, which may also be one member or a group of members (see `build_hypergraph`). List tools page with `limit` (default 50), `offset` and `summary` (drops bulky per-item fields); the list is sorted first, then sliced, and the response carries `total_match_count` — more pages exist while it exceeds `offset + returned`. Graph and audit tools need `build_hypergraph` first. Full per-tool notes: TOOLS.md in the server repository."
                 .into(),
             ),
         }

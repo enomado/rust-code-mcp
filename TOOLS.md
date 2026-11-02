@@ -492,8 +492,9 @@ Build or reuse a persisted workspace hypergraph snapshot (HIR-driven, `no_deps=f
 **Parameters:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `directory` | string | Yes | Workspace root (directory containing Cargo.toml) |
+| `directory` | string | Yes | Graph scope: a workspace root, one member's directory, or any directory inside a workspace (a group of members; no `Cargo.toml` of its own needed) |
 | `force_rebuild` | boolean | No | Force a rebuild even if a snapshot for the current fingerprint already exists (default: false) |
+| `crates` | string[] | No | Only these member packages under `directory` (a package's bins come with it). Part of the fingerprint: another set is a full rebuild. An unknown name — or a member outside `directory` — is an error listing the available ones |
 
 **Example:**
 ```json
@@ -502,6 +503,28 @@ Build or reuse a persisted workspace hypergraph snapshot (HIR-driven, `no_deps=f
   "force_rebuild": false
 }
 ```
+
+A group of members with cross-crate edges between them, without the rest of
+the workspace:
+```json
+{
+  "directory": "/repo/crates/backend/store",
+  "crates": ["store_core", "tsdb_engine", "wal"]
+}
+```
+Graph tools then take the same `directory`. Calls from the scope's crates into
+crates outside it come back as `TargetOutsideGraph` in `calls_from`.
+
+**Scope rules:**
+- The crates are the workspace members whose lib/bin target roots lie under
+  `directory` (vendored patch crates under it too, unless `crates` is given).
+  Integration tests, benches, examples and build scripts are never in the graph.
+- `cargo metadata` and rust-analyzer load through the nearest `Cargo.toml` at
+  or above `directory`.
+- The fingerprint also covers the inputs above `directory` that decide how it
+  builds: the workspace's `Cargo.toml` and `Cargo.lock` (when `directory` is
+  below the workspace root) and every ancestor's `.cargo/config(.toml)` and
+  `rust-toolchain(.toml)`. A change there is a full rebuild.
 
 **Returns:**
 ```json
@@ -513,13 +536,16 @@ Build or reuse a persisted workspace hypergraph snapshot (HIR-driven, `no_deps=f
   "binding_count": 5678,
   "usage_count": 9012,
   "reused": true,
-  "snapshot_path": "/.../snapshot/.../db"
+  "snapshot_path": "/.../snapshot/.../db",
+  "crates": ["wal[lib]@wal/src/lib.rs", "store_admin[bin]@store_core/src/bin/store_admin/main.rs", "..."]
 }
 ```
 
 **Notes:**
 - Runs `loader::load` + the full extract pass + LMDB writes synchronously on a blocking thread.
 - `reused: true` means the existing snapshot's fingerprint matched and no rebuild was needed.
+- `crates` lists the crate groups (`name[kind]@root`, relative to `directory`) the snapshot
+  holds — check it before trusting a zero from a graph query about some crate.
 
 ---
 

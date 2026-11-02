@@ -16,11 +16,23 @@
 //! `CARGO_RESOLVER_LOCKFILE_PATH` env var instead of `--lockfile-path` to
 //! avoid mutating Cargo.lock (older versions used the flag, which broke on
 //! cargo versions where metadata didn't accept it).
+//!
+//! ### What a request covers
+//!
+//! The requested directory is the graph's scope, and it need not hold a
+//! `Cargo.toml` of its own: a workspace root, one member's directory, or any
+//! directory inside a workspace (`crates/backend/store`) whose members
+//! are then the graph's crates — every member under it, lib and bin targets,
+//! with cross-crate edges between them. rust-analyzer and `cargo metadata`
+//! both load the workspace through the nearest manifest at or above the
+//! directory ([`governing_manifest`]); only the crate filter uses the
+//! directory itself. An optional crate list narrows the scope further to the
+//! named packages (`build_hypergraph`'s `crates`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use cargo_metadata::{MetadataCommand, TargetKind};
 use ra_ap_hir::Crate;
 use ra_ap_ide_db::RootDatabase;
@@ -42,6 +54,11 @@ struct WorkspaceTargets {
     /// frequently a member's subdirectory rather than the workspace root — in
     /// which case they are nearly empty and match nothing.
     by_abs_root_file: HashMap<PathBuf, String>,
+    /// Member package name (`-` normalized to `_`) by *absolute* (canonicalized)
+    /// target root path — what a crate list (`crates`) is matched against. By
+    /// package, not by target name: a package's binaries (`store_admin` of
+    /// `store_core`) belong to it.
+    package_by_abs_root_file: HashMap<PathBuf, String>,
     /// The workspace root Cargo itself reports, canonicalized. `None` when
     /// `cargo metadata` did not run.
     ///
@@ -64,14 +81,30 @@ pub struct LoadedWorkspace {
 /// Load `directory` with every crate's caches primed in parallel — what every
 /// one-shot analysis (audits, skeleton, tests) wants.
 pub fn load(directory: &Path) -> Result<LoadedWorkspace> {
-    load_with(directory, true)
+    load_with(directory, true, None)
 }
 
 /// Load `directory` without priming anything: the caller primes the crates it
 /// is about to walk with [`prime_for`]. The per-crate snapshot build does
 /// this, so a build of a few crates does not pay for the whole crate graph.
 pub(crate) fn load_unprimed(directory: &Path) -> Result<LoadedWorkspace> {
-    load_with(directory, false)
+    load_with(directory, false, None)
+}
+
+/// [`load_unprimed`] narrowed to the member packages named in `crates`
+/// (`None`: every member under `directory`). A name that is not a member
+/// package with a lib/bin target under `directory` is an error naming the ones
+/// that are — never an empty or silently smaller graph.
+pub(crate) fn load_unprimed_scoped(directory: &Path, crates: Option<&BTreeSet<String>>) -> Result<LoadedWorkspace> {
+    load_with(directory, false, crates)
+}
+
+/// The manifest cargo and rust-analyzer load a request at `dir` through:
+/// `dir`'s own `Cargo.toml`, else the nearest ancestor's. A directory inside a
+/// workspace that is not itself a package (`crates/backend/store`)
+/// resolves to the workspace root's manifest.
+pub(crate) fn governing_manifest(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors().map(|a| a.join("Cargo.toml")).find(|m| m.is_file())
 }
 
 /// Prime, in parallel, the caches of `crates` and of everything they depend
@@ -105,7 +138,7 @@ pub(crate) fn prime_for(loaded: &LoadedWorkspace, crates: &[Crate]) {
     );
 }
 
-fn load_with(directory: &Path, prefill_caches: bool) -> Result<LoadedWorkspace> {
+fn load_with(directory: &Path, prefill_caches: bool, crates: Option<&BTreeSet<String>>) -> Result<LoadedWorkspace> {
     let canonical = directory
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", directory.display()))?;
@@ -137,7 +170,10 @@ fn load_with(directory: &Path, prefill_caches: bool) -> Result<LoadedWorkspace> 
         load_workspace_at(&canonical, &cargo_config, &load_config, &|_| {})
             .with_context(|| format!("failed to load workspace at {}", canonical.display()))?;
 
-    let local_crates = filter_local_crates(&db, &vfs, &targets, &workspace_root);
+    let mut local_crates = filter_local_crates(&db, &vfs, &targets, &workspace_root);
+    if let Some(crates) = crates {
+        local_crates = narrow_to_packages(&db, &vfs, &targets, local_crates, crates, &workspace_root)?;
+    }
 
     Ok(LoadedWorkspace {
         workspace_root,
@@ -195,6 +231,36 @@ fn filter_local_crates(db: &RootDatabase, vfs: &Vfs, targets: &WorkspaceTargets,
         .collect()
 }
 
+/// Keep the crates of `local` whose root is a target of a package named in
+/// `crates`. Every name must match a member package that has a lib/bin target
+/// under the requested directory; otherwise the request is refused with the
+/// list of packages it could have named.
+fn narrow_to_packages(
+    db: &RootDatabase,
+    vfs: &Vfs,
+    targets: &WorkspaceTargets,
+    local: Vec<Crate>,
+    crates: &BTreeSet<String>,
+    requested_root: &Path,
+) -> Result<Vec<Crate>> {
+    let wanted: BTreeSet<String> = crates.iter().map(|c| normalize_crate_name(c)).collect();
+    if wanted.is_empty() {
+        bail!("an empty crate list would build an empty graph; omit `crates` to build every member under {}", requested_root.display());
+    }
+    let package_of = |krate: &Crate| {
+        crate_root_abs_path(db, vfs, *krate).and_then(|root| targets.package_by_abs_root_file.get(&root).cloned())
+    };
+    let available: BTreeSet<String> = local.iter().filter_map(package_of).collect();
+    let missing: Vec<&String> = wanted.iter().filter(|c| !available.contains(*c)).collect();
+    if !missing.is_empty() {
+        bail!(
+            "crates {missing:?} are not member packages with a lib/bin target under {}; available there: {available:?}",
+            requested_root.display()
+        );
+    }
+    Ok(local.into_iter().filter(|k| package_of(k).is_some_and(|p| wanted.contains(&p))).collect())
+}
+
 /// The membership decision itself, separated from rust-analyzer so it can be
 /// exercised directly. See [`filter_local_crates`] for the reasoning.
 fn should_index_crate_root(root_file: &Path, targets: &WorkspaceTargets) -> bool {
@@ -230,7 +296,24 @@ fn should_index_target_kind(kind: &str) -> bool {
 }
 
 fn load_crate_target_kinds(workspace_root: &Path) -> WorkspaceTargets {
-    let manifest_path = workspace_root.join("Cargo.toml");
+    // A directory without a manifest of its own (a group of members inside a
+    // workspace) is judged by the workspace that holds it — the same manifest
+    // rust-analyzer loads. Before, `cargo metadata` was pointed at a
+    // `Cargo.toml` that does not exist, failed, and the fallback below let
+    // every test, bench, example and build script under the directory in.
+    let Some(manifest_path) = governing_manifest(workspace_root) else {
+        tracing::warn!(
+            "no Cargo.toml at or above {}; crate target-kind filters will fall back to unknown/default handling",
+            workspace_root.display()
+        );
+        return WorkspaceTargets {
+            by_name: HashMap::new(),
+            by_root_file: HashMap::new(),
+            by_abs_root_file: HashMap::new(),
+            package_by_abs_root_file: HashMap::new(),
+            workspace_root: None,
+        };
+    };
     let mut command = MetadataCommand::new();
     // `current_dir` is not cosmetic: rustup picks the toolchain by the working
     // directory (not by `--manifest-path`), and cargo walks up from it looking
@@ -254,6 +337,7 @@ fn load_crate_target_kinds(workspace_root: &Path) -> WorkspaceTargets {
                 by_name: HashMap::new(),
                 by_root_file: HashMap::new(),
                 by_abs_root_file: HashMap::new(),
+                package_by_abs_root_file: HashMap::new(),
                 workspace_root: None,
             };
         }
@@ -263,6 +347,7 @@ fn load_crate_target_kinds(workspace_root: &Path) -> WorkspaceTargets {
     let mut by_name = HashMap::new();
     let mut by_root_file = HashMap::new();
     let mut by_abs_root_file = HashMap::new();
+    let mut package_by_abs_root_file = HashMap::new();
 
     for package in metadata
         .packages
@@ -276,11 +361,9 @@ fn load_crate_target_kinds(workspace_root: &Path) -> WorkspaceTargets {
                 normalize_crate_name(&target.name),
                 kind.clone(),
             );
-            insert_preferred_target_kind(
-                &mut by_abs_root_file,
-                canonical_or_self(target.src_path.as_std_path()),
-                kind.clone(),
-            );
+            let abs_root = canonical_or_self(target.src_path.as_std_path());
+            package_by_abs_root_file.insert(abs_root.clone(), normalize_crate_name(&package.name));
+            insert_preferred_target_kind(&mut by_abs_root_file, abs_root, kind.clone());
             if let Some(root_file) =
                 workspace_relative_path(target.src_path.as_std_path(), workspace_root)
             {
@@ -293,6 +376,7 @@ fn load_crate_target_kinds(workspace_root: &Path) -> WorkspaceTargets {
         by_name,
         by_root_file,
         by_abs_root_file,
+        package_by_abs_root_file,
         workspace_root: Some(canonical_or_self(metadata.workspace_root.as_std_path())),
     }
 }
@@ -417,6 +501,7 @@ mod tests {
             by_name: HashMap::new(),
             by_root_file: HashMap::new(),
             by_abs_root_file,
+            package_by_abs_root_file: HashMap::new(),
             workspace_root: Some(PathBuf::from("/ws")),
         }
     }
@@ -468,6 +553,7 @@ mod tests {
             by_name: HashMap::new(),
             by_root_file: HashMap::new(),
             by_abs_root_file: HashMap::new(),
+            package_by_abs_root_file: HashMap::new(),
             workspace_root: None,
         };
         assert!(should_index_crate_root(
