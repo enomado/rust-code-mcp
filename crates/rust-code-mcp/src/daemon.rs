@@ -65,7 +65,7 @@ use fs2::FileExt;
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENV, EMBEDDING_PROFILE_ENV, EP_CENSUS_ENV, RuntimeClearRequest,
     RuntimeClearScope, RuntimeState, RuntimeTaskReport, ServerRuntime, gpu_vram_budget,
-    mem_available_kib, release_free_memory, release_idle_gpu_sessions,
+    mem_available_kib, probe_runtime_dir, release_free_memory, release_idle_gpu_sessions,
     release_query_sessions_once_free, rss_kib,
 };
 use rmc_server::tools::SearchTool;
@@ -910,7 +910,7 @@ pub fn growth_trim_is_due(
 /// for it in `/tmp` — not find the running daemon, and start a second one. Both
 /// halves of that split were live on this machine at once, on two keys.
 fn socket_dir() -> Result<PathBuf, BoxError> {
-    let probed = rmc_engine::embeddings::probe_runtime_dir();
+    let probed = probe_runtime_dir();
     Ok(resolve_socket_dir(
         std::env::var(DAEMON_DIR_ENV).ok().as_deref(),
         std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),

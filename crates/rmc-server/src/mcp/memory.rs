@@ -454,6 +454,12 @@ pub fn release_idle_gpu_sessions(max_idle: std::time::Duration) -> usize {
     rmc_engine::embeddings::release_idle_gpu_sessions(max_idle)
 }
 
+/// `/run/user/<uid>`, if it exists: where the sockets live without
+/// `XDG_RUNTIME_DIR`, the same place the engine keeps its GPU lock.
+pub fn probe_runtime_dir() -> Option<std::path::PathBuf> {
+    rmc_engine::embeddings::probe_runtime_dir()
+}
+
 /// Drop the CPU query sessions once the GPU reservation they stood in for is
 /// over; a watchdog tick, like [`release_idle_gpu_sessions`].
 pub fn release_query_sessions_once_free() {
