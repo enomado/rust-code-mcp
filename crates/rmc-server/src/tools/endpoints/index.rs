@@ -230,6 +230,27 @@ fn format_path_sample(paths: &[String]) -> String {
     format!("\n  {}{}", sample.join("\n  "), tail)
 }
 
+/// Refuse to start indexing `dir` with `backend` while a training run holds
+/// the GPU. Not an error of the call: it says when to ask again.
+pub(crate) fn refuse_indexing_under_reservation(
+    backend: &EmbeddingBackend,
+    dir: &std::path::Path,
+) -> Result<(), McpError> {
+    match rmc_engine::embeddings::reservation_pausing(backend) {
+        None => Ok(()),
+        Some(reservation) => Err(McpError::invalid_request(
+            format!(
+                "Cannot index {} now: {reservation}. Indexing with profile `{}` needs the GPU \
+                 and resumes when that run ends; searching an existing index and the \
+                 rust-analyzer tools keep working.",
+                dir.display(),
+                backend.profile.name()
+            ),
+            None,
+        )),
+    }
+}
+
 fn indexing_error_to_mcp(error: anyhow::Error, dir: &std::path::Path) -> McpError {
     // Keep the existing actionable version-mismatch message at the MCP
     // boundary while indexing owns the concrete indexer construction.
@@ -315,6 +336,9 @@ pub async fn index_codebase(
         params.model.as_deref(),
         &dir,
     )?;
+    // Before anything is deleted: a forced run under a reservation would wipe
+    // the index and only then find it cannot embed.
+    refuse_indexing_under_reservation(&backend, &dir)?;
     let embedder_identity = backend.identity();
     // The collection search, health_check and the background sync use — an
     // existing one made by the same embedder — not the name the current

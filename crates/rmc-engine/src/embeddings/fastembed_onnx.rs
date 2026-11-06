@@ -41,6 +41,15 @@ impl Drop for Session {
     }
 }
 
+/// Where a session runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Where the backend's runtime says.
+    AsDeclared,
+    /// On the CPU, whatever the runtime.
+    Cpu,
+}
+
 impl FastembedOnnxEmbedder {
     /// A CPU session. GPU backends are refused: their sessions are made only
     /// by `gpu_broker`, through [`Self::new_gpu`].
@@ -54,7 +63,19 @@ impl FastembedOnnxEmbedder {
                 backend.profile.name()
             )));
         }
-        Self::new_inner(backend, owner, None)
+        Self::new_inner(backend, owner, None, Placement::AsDeclared)
+    }
+
+    /// A CPU session of a GPU backend, for queries while the GPU is reserved
+    /// (`gpu_reservation`). The same model and maximum length, so its vectors
+    /// are comparable with the stored ones. No fixed input shape: that exists
+    /// for MIGraphX's compiled kernels, and padding does not reach the
+    /// mean over the real tokens.
+    pub(super) fn new_query_on_cpu(
+        backend: &EmbeddingBackend,
+        owner: EmbeddingOwner,
+    ) -> Result<Self, EmbeddingError> {
+        Self::new_inner(backend, owner, None, Placement::Cpu)
     }
 
     /// A GPU session. The [`Admission`] is the broker's budget check, and the
@@ -65,7 +86,7 @@ impl FastembedOnnxEmbedder {
         owner: EmbeddingOwner,
         _admitted: &Admission,
     ) -> Result<Self, EmbeddingError> {
-        Self::new_inner(backend, owner, None)
+        Self::new_inner(backend, owner, None, Placement::AsDeclared)
     }
 
     /// The same initialization path, but with ORT profiling enabled.
@@ -81,7 +102,12 @@ impl FastembedOnnxEmbedder {
         backend: &EmbeddingBackend,
         prefix: &std::path::Path,
     ) -> Result<Self, EmbeddingError> {
-        Self::new_inner(backend, EmbeddingOwner::ProviderCensus, Some(prefix))
+        Self::new_inner(
+            backend,
+            EmbeddingOwner::ProviderCensus,
+            Some(prefix),
+            Placement::AsDeclared,
+        )
     }
 
     /// Close the ORT profile and return the path of the written file.
@@ -98,6 +124,7 @@ impl FastembedOnnxEmbedder {
         backend: &EmbeddingBackend,
         owner: EmbeddingOwner,
         profiling_prefix: Option<&std::path::Path>,
+        placement: Placement,
     ) -> Result<Self, EmbeddingError> {
         if !backend.is_fastembed_onnx() {
             return Err(EmbeddingError::model_init(format!(
@@ -106,7 +133,7 @@ impl FastembedOnnxEmbedder {
             )));
         }
         let model = backend.require_fastembed_onnx_model()?;
-        let on_gpu = backend.is_fastembed_onnx_gpu();
+        let on_gpu = placement == Placement::AsDeclared && backend.is_fastembed_onnx_gpu();
 
         tracing::info!(
             target: "embeddings::fastembed_onnx",

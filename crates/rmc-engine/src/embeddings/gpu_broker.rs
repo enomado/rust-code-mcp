@@ -71,6 +71,11 @@ impl Priority {
     }
 }
 
+/// Whether someone is waiting on the answer to a run of `owner`.
+pub(super) fn is_interactive(owner: EmbeddingOwner) -> bool {
+    Priority::of(owner) == Priority::Interactive
+}
+
 enum SlotState<S> {
     /// No session: never created, released while idle, or discarded after a
     /// failed creation or a panic during a run.

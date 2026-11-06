@@ -65,7 +65,8 @@ use fs2::FileExt;
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENV, EMBEDDING_PROFILE_ENV, EP_CENSUS_ENV, RuntimeClearRequest,
     RuntimeClearScope, RuntimeState, RuntimeTaskReport, ServerRuntime, gpu_vram_budget,
-    mem_available_kib, release_free_memory, release_idle_gpu_sessions, rss_kib,
+    mem_available_kib, release_free_memory, release_idle_gpu_sessions,
+    release_query_sessions_once_free, rss_kib,
 };
 use rmc_server::tools::SearchTool;
 use rmcp::ServiceExt;
@@ -1918,6 +1919,7 @@ pub async fn run_daemon(
                 .await
                 .expect("releasing idle GPU sessions does not panic");
         }
+        release_query_sessions_once_free();
 
         // A rebuilt binary at the launch path: every client of this daemon is
         // the same build and moves to the daemon of the new one between

@@ -455,6 +455,9 @@ pub(crate) async fn search(
             drop(writer);
             (None, None)
         } else {
+            // Before the wipe below: a broken index searched during a training
+            // run must not end up as no index at all.
+            super::index::refuse_indexing_under_reservation(&requested_backend, dir_path)?;
             rebuilt = paths.tantivy_path.exists();
             if let Some(search_cache) = search_cache {
                 search_cache.invalidate_workspace(dir_path);

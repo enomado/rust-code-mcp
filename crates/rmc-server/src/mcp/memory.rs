@@ -454,6 +454,12 @@ pub fn release_idle_gpu_sessions(max_idle: std::time::Duration) -> usize {
     rmc_engine::embeddings::release_idle_gpu_sessions(max_idle)
 }
 
+/// Drop the CPU query sessions once the GPU reservation they stood in for is
+/// over; a watchdog tick, like [`release_idle_gpu_sessions`].
+pub fn release_query_sessions_once_free() {
+    rmc_engine::embeddings::release_query_sessions_once_free()
+}
+
 /// The VRAM budget the next GPU session would be checked against, for the
 /// daemon's startup line.
 pub fn gpu_vram_budget() -> Result<rmc_engine::embeddings::VramBudget, String> {

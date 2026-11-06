@@ -35,6 +35,12 @@ mod kernel_cache;
 
 mod gpu_lock;
 
+mod gpu_reservation;
+pub use gpu_reservation::{
+    current_gpu_reservation, release_query_sessions_once_free, reservation_pausing,
+    GpuReservation,
+};
+
 mod vram_ledger;
 pub use vram_ledger::{
     gpu_ledger_report, read_vram, EmbeddingOwner, GpuLedgerReport, LiveSessionReport,
@@ -206,6 +212,14 @@ impl EmbeddingGenerator {
         backend: EmbeddingBackend,
         owner: EmbeddingOwner,
     ) -> Result<Self, EmbeddingError> {
+        // Before anything is built: under a GPU reservation a generator that
+        // would have to wait for the run is refused here, where an indexing
+        // pass has done nothing yet.
+        let route = gpu_reservation::route(
+            &backend,
+            owner,
+            gpu_reservation::reservation_pausing(&backend),
+        )?;
         let inner = match backend.runtime {
             EmbeddingRuntime::LocalQwen3CandleCuda => {
                 #[cfg(feature = "embeddings-cuda")]
@@ -228,8 +242,12 @@ impl EmbeddingGenerator {
             EmbeddingRuntime::LocalFastembedOnnxMigraphx
             | EmbeddingRuntime::LocalFastembedOnnxDirectml => {
                 // Built here if the broker has none, so a broken GPU fails at
-                // construction as it always did; otherwise free.
-                gpu_broker::ensure_session(&backend, owner)?;
+                // construction as it always did; otherwise free. A query
+                // under a reservation leaves the card alone; each run looks
+                // again, so one generator goes back to the GPU after the run.
+                if route == gpu_reservation::Route::Usual {
+                    gpu_broker::ensure_session(&backend, owner)?;
+                }
                 EmbeddingGeneratorInner::GpuBrokered { owner }
             }
         };
@@ -332,14 +350,25 @@ impl EmbeddingGenerator {
                     // first), the flock orders processes; in that order, so
                     // a query never queues behind another process's lock
                     // while holding nothing.
-                    gpu_broker::with_session(&backend, owner, |session| {
-                        let _gpu = gpu_lock::GpuLock::acquire()?;
+                    let run = |session: &fastembed_onnx::FastembedOnnxEmbedder| {
                         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
                         match side {
                             EmbedSide::Documents => session.embed_documents(&refs),
                             EmbedSide::Queries => session.embed_queries(&refs),
                         }
-                    })
+                    };
+                    let reservation = gpu_reservation::reservation_pausing(&backend);
+                    match gpu_reservation::route(&backend, owner, reservation)? {
+                        gpu_reservation::Route::Usual => {
+                            gpu_broker::with_session(&backend, owner, |session| {
+                                let _gpu = gpu_lock::GpuLock::acquire()?;
+                                run(session)
+                            })
+                        }
+                        gpu_reservation::Route::QueryOnCpu => {
+                            gpu_reservation::with_query_session(&backend, owner, run)
+                        }
+                    }
                 })
                 .await
                 .map_err(|e| EmbeddingError::task_join(e.to_string()))?

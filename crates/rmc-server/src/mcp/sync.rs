@@ -348,6 +348,16 @@ impl SyncManager {
                 continue;
             }
 
+            // Nothing is lost: the changes are found again by the first tick
+            // after the run, by the same content comparison.
+            if let Some(reservation) = rmc_engine::embeddings::reservation_pausing(&backend) {
+                tracing::info!(
+                    "Skipping background sync of {}: {reservation}",
+                    dir.display()
+                );
+                continue;
+            }
+
             let mem = rmc_engine::mem_trace::MemSpan::start(format!(
                 "background sync of {}",
                 dir.display()

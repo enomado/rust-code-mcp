@@ -195,6 +195,11 @@ pub fn probe_ep_census_on_startup() -> Result<Option<String>, String> {
         return Ok(None);
     }
 
+    if let Some(reservation) = rmc_engine::embeddings::reservation_pausing(&backend) {
+        tracing::info!(profile, "{EP_CENSUS_ENV} is set, but no census: {reservation}");
+        return Ok(None);
+    }
+
     tracing::info!(
         profile,
         "{EP_CENSUS_ENV} is set: probing which execution provider actually runs the graph \

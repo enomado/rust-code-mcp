@@ -50,6 +50,12 @@ pub enum EmbeddingError {
     /// LanceDB table.
     #[error("Invalid embedder identity: {0}")]
     InvalidIdentity(String),
+
+    /// A training run holds the GPU, and this run cannot move off it. Waiting
+    /// is the answer, unlike every other failure here: the same call succeeds
+    /// once the run ends.
+    #[error("{0}: embedding here waits until that run ends")]
+    GpuReserved(super::gpu_reservation::GpuReservation),
 }
 
 impl EmbeddingError {
