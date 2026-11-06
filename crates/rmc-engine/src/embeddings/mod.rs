@@ -34,6 +34,7 @@ pub use ep_census::{ProviderCensus, CPU_EP, DIRECTML_EP, MIGRAPHX_EP};
 mod kernel_cache;
 
 mod gpu_lock;
+pub use gpu_lock::probe_runtime_dir;
 
 mod gpu_reservation;
 pub use gpu_reservation::{

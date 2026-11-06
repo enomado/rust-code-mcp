@@ -303,4 +303,34 @@ mod tests {
         let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-3, "norm {norm}");
     }
+
+    /// What makes the CPU session usable at all: a query vector from it must
+    /// land where the GPU session's would, because the store was filled by the
+    /// GPU. Texts of different lengths, since only the GPU pads to a fixed shape.
+    ///
+    /// `cargo test --release -p rmc-engine --features embeddings-migraphx
+    /// the_cpu_session_agrees -- --ignored --nocapture`
+    #[cfg(feature = "embeddings-migraphx")]
+    #[test]
+    #[ignore = "needs the card free and the model in the cache"]
+    fn the_cpu_session_agrees_with_the_gpu_session() {
+        let backend = gpu_backend();
+        let owner = EmbeddingOwner::Search;
+        for text in [
+            "fn main",
+            "where is the spawn lock taken",
+            "reciprocal rank fusion of vector and keyword hits with a weight per list",
+            "größte gemeinsame Teilfolge zweier Zeichenketten",
+        ] {
+            let cpu = with_query_session(&backend, owner, |s| s.embed_queries(&[text]))
+                .unwrap()
+                .remove(0);
+            let gpu = gpu_broker::with_session(&backend, owner, |s| s.embed_queries(&[text]))
+                .unwrap()
+                .remove(0);
+            let cosine = cpu.iter().zip(&gpu).map(|(a, b)| a * b).sum::<f32>();
+            eprintln!("{cosine:.6}  {text}");
+            assert!(cosine > 0.999, "{cosine} for {text:?}");
+        }
+    }
 }

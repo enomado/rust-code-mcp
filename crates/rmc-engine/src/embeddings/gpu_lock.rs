@@ -24,6 +24,7 @@
 
 use super::EmbeddingError;
 use fs2::FileExt;
+use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -42,13 +43,45 @@ const GPU_LOCK_POLL: Duration = Duration::from_millis(20);
 /// daemon sockets, or a per-user name in the temp directory without a runtime
 /// directory. One per user, not per daemon key: every process on this machine
 /// shares the GPU, whatever binary or configuration it runs.
+///
+/// A process without `XDG_RUNTIME_DIR` (a client started by an editor or a
+/// service often has none) must land on the same file, or the lock orders
+/// nothing: 2026-11-06, a daemon spawned by such a client saw neither this lock
+/// nor the GPU reservation next to it, and opened a GPU session during a
+/// training run.
 pub fn gpu_lock_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir)
-            .join("rust-code-mcp")
-            .join("gpu-embed.lock"),
-        _ => std::env::temp_dir().join(format!("rust-code-mcp-gpu-embed-{}.lock", user_tag())),
+    resolve_lock_path(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        probe_runtime_dir().as_deref(),
+        &std::env::temp_dir(),
+        &user_tag(),
+    )
+}
+
+/// The pure part of [`gpu_lock_path`], so tests need not mutate the process
+/// environment.
+fn resolve_lock_path(xdg: Option<&OsStr>, probed: Option<&Path>, temp: &Path, user: &str) -> PathBuf {
+    match xdg.filter(|dir| !dir.is_empty()).map(Path::new).or(probed) {
+        Some(dir) => dir.join("rust-code-mcp").join("gpu-embed.lock"),
+        None => temp.join(format!("rust-code-mcp-gpu-embed-{user}.lock")),
     }
+}
+
+/// `/run/user/<uid>`, if it exists — the directory `XDG_RUNTIME_DIR` would name.
+///
+/// Read from the filesystem rather than assumed: the uid comes from
+/// `/proc/self`, and the directory has to be there.
+#[cfg(unix)]
+pub fn probe_runtime_dir() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata("/proc/self").ok()?.uid();
+    let dir = PathBuf::from(format!("/run/user/{uid}"));
+    dir.is_dir().then_some(dir)
+}
+
+#[cfg(not(unix))]
+pub fn probe_runtime_dir() -> Option<PathBuf> {
+    None
 }
 
 fn user_tag() -> String {
@@ -168,6 +201,30 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier, Mutex};
+
+    /// Every process of a user meets on one file, with or without
+    /// `XDG_RUNTIME_DIR`; only with no runtime directory at all does the lock
+    /// fall back to the temp directory.
+    ///
+    /// Mutation that must fail it: dropping `.or(probed)` — the split that let a
+    /// daemon past a GPU reservation.
+    #[test]
+    fn a_process_without_xdg_runtime_dir_finds_the_same_lock() {
+        let runtime = Path::new("/run/user/1000");
+        let shared = runtime.join("rust-code-mcp").join("gpu-embed.lock");
+        let temp = Path::new("/tmp");
+        let xdg = Some(runtime.as_os_str());
+        assert_eq!(resolve_lock_path(xdg, Some(runtime), temp, "u"), shared);
+        assert_eq!(resolve_lock_path(None, Some(runtime), temp, "u"), shared);
+        assert_eq!(
+            resolve_lock_path(Some(OsStr::new("")), Some(runtime), temp, "u"),
+            shared
+        );
+        assert_eq!(
+            resolve_lock_path(None, None, temp, "u"),
+            temp.join("rust-code-mcp-gpu-embed-u.lock")
+        );
+    }
 
     /// Two holders on two descriptors — what two processes have — never run at
     /// once: every pair of hold intervals is disjoint.

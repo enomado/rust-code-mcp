@@ -903,8 +903,14 @@ pub fn growth_trim_is_due(
 
 /// Where sockets live. `$XDG_RUNTIME_DIR` is preferred: it is private, on tmpfs,
 /// and cleaned out at logout together with any orphaned sockets.
+///
+/// A session started outside a login shell (a hook, a cron job, an editor
+/// spawned from a display manager) often has no `XDG_RUNTIME_DIR` at all, and
+/// without the probe it would compute the same key as its neighbours but look
+/// for it in `/tmp` — not find the running daemon, and start a second one. Both
+/// halves of that split were live on this machine at once, on two keys.
 fn socket_dir() -> Result<PathBuf, BoxError> {
-    let probed = probe_runtime_dir();
+    let probed = rmc_engine::embeddings::probe_runtime_dir();
     Ok(resolve_socket_dir(
         std::env::var(DAEMON_DIR_ENV).ok().as_deref(),
         std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
@@ -912,21 +918,6 @@ fn socket_dir() -> Result<PathBuf, BoxError> {
         std::env::var("USER").ok().as_deref(),
         &std::env::temp_dir(),
     ))
-}
-
-/// `/run/user/<uid>`, if it exists — the directory `XDG_RUNTIME_DIR` would name.
-///
-/// Read from the filesystem rather than assumed: the uid comes from
-/// `/proc/self`, and the directory has to be there. A session started outside a
-/// login shell (a hook, a cron job, an editor spawned from a display manager)
-/// often has no `XDG_RUNTIME_DIR` at all, and without this it would compute the
-/// same key as its neighbours but look for it in `/tmp` — not find the running
-/// daemon, and start a second one. Both halves of that split were live on this
-/// machine at once, on two keys.
-fn probe_runtime_dir() -> Option<PathBuf> {
-    let uid = fs::metadata("/proc/self").ok()?.uid();
-    let dir = PathBuf::from(format!("/run/user/{uid}"));
-    dir.is_dir().then_some(dir)
 }
 
 /// The pure part of [`socket_dir`], for the same reason as [`key_from_parts`]:
