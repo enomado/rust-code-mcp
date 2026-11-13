@@ -11,6 +11,7 @@ fn main() {
             data_dir_override: None,
             env: Default::default(),
             release_free_memory: None,
+            crates: None,
         },
     )
     .expect("build");
