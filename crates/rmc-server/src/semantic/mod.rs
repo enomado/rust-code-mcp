@@ -7,6 +7,7 @@ mod loader;
 mod lru_sweep;
 pub(crate) mod position;
 mod rename;
+mod word_index;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -67,6 +68,11 @@ struct ProjectContext {
     /// (file ids ↔ paths) with the slot let go; a refresh writes it after
     /// `apply_change` has cancelled them. See [`SemanticService::with_project`].
     vfs: Arc<RwLock<Vfs>>,
+    /// Which project files hold a word in code: built from the database's
+    /// texts at load, patched by every refresh together with the database, so
+    /// it describes exactly the texts the queries see. Shared with the queries
+    /// like `vfs`, written under the same discipline.
+    words: Arc<RwLock<word_index::WordIndex>>,
     /// Where the load put files, so that a file added since goes where a
     /// reload would put it — see [`apply_tree_change`].
     layout: loader::SourceLayout,
@@ -89,15 +95,11 @@ fn stamp_of(path: &Path) -> Option<FileStamp> {
     })
 }
 
-/// Whether `path` names a file that shapes the workspace rather than holding
+/// Whether `path` names a file that may shape a workspace rather than hold
 /// code: what `cargo metadata` reads to build the crate graph, plus the
-/// toolchain choice (which picks the sysroot). Any `Cargo.toml` counts, not only
-/// the members' the load saw: a new member under a `members = ["crates/*"]`
-/// glob changes nothing but its own new manifest.
-///
-/// Conservative on purpose: an edit to the manifest of an unrelated nested
-/// project reloads too. Telling it apart would need the workspace model, and a
-/// missed member costs a wrong answer where an extra reload costs a minute.
+/// toolchain choice (which picks the sysroot). Stamped wherever they are, since
+/// any new `Cargo.toml` may be a new member; whether a change to one reloads
+/// is the load's to say ([`loader::SourceLayout::reloads_for`]).
 fn is_workspace_shape_file(path: &Path) -> bool {
     let name = path.file_name().and_then(|name| name.to_str());
     match name {
@@ -132,10 +134,15 @@ fn collect_stamps(root: &Path) -> HashMap<PathBuf, FileStamp> {
         .collect()
 }
 
+/// What changed between `old` and `new`, as `layout` judges it: a
+/// workspace-shape change it reloads for wins; the shape files it does not
+/// (a nested project's lockfile) are dropped; the `*.rs` rest is a patch.
 fn classify_staleness(
     old: &HashMap<PathBuf, FileStamp>,
     new: &HashMap<PathBuf, FileStamp>,
+    layout: &loader::SourceLayout,
 ) -> Staleness {
+    use loader::FileChange;
     let mut change = TreeChange::default();
     for (path, stamp) in new {
         match old.get(path) {
@@ -153,13 +160,25 @@ fn classify_staleness(
         list.sort();
     }
 
-    let manifest = [&change.edited, &change.added, &change.removed]
-        .into_iter()
-        .flatten()
-        .filter(|path| is_workspace_shape_file(path))
-        .min();
+    let mut manifest: Option<PathBuf> = None;
+    for (list, kind) in [
+        (&mut change.edited, FileChange::Edited),
+        (&mut change.added, FileChange::Added),
+        (&mut change.removed, FileChange::Removed),
+    ] {
+        list.retain(|path| {
+            if !is_workspace_shape_file(path) {
+                return true;
+            }
+            if layout.reloads_for(path, kind) && manifest.as_ref().is_none_or(|first| path < first)
+            {
+                manifest = Some(path.clone());
+            }
+            false
+        });
+    }
     if let Some(manifest) = manifest {
-        Staleness::ManifestChanged(manifest.clone())
+        Staleness::ManifestChanged(manifest)
     } else if change == TreeChange::default() {
         Staleness::Fresh
     } else {
@@ -537,6 +556,29 @@ fn shared_vfs(vfs: Vfs) -> Arc<RwLock<Vfs>> {
     Arc::new(RwLock::new(vfs))
 }
 
+/// A context's word index for reading; poisoning stepped over as for the `Vfs`.
+fn read_words(words: &RwLock<word_index::WordIndex>) -> RwLockReadGuard<'_, word_index::WordIndex> {
+    words.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The word index of the project's own files (those under `root` the analysis
+/// holds — the files a sweep may read), from the texts in the database.
+///
+/// Cost: every project file's text lexed once — ≈ 1.4 s for 148 MB on a
+/// ~8000-file workspace, beside a 44 s load. Called on a database nobody else
+/// holds yet, so no write can cancel the reads.
+fn build_word_index(host: &AnalysisHost, vfs: &Vfs, root: &Path) -> word_index::WordIndex {
+    let analysis = host.analysis();
+    let mut index = word_index::WordIndex::default();
+    for file_id in position::project_rust_files(vfs, root) {
+        let text = analysis
+            .file_text(file_id)
+            .expect("a database nobody else holds is not cancelled");
+        index.set_file(file_id, Some(&text));
+    }
+    index
+}
+
 /// What one in-place refresh did, for its log line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Patched {
@@ -717,6 +759,15 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
         db.set_source_root_with_durability(root_id, triomphe::Arc::new(root), durability);
         for (file_id, _) in added {
             db.set_file_source_root_with_durability(file_id, root_id, durability);
+        }
+    }
+
+    // The word index follows the same texts (every changed file is under the
+    // project root: the stamps come from walking it).
+    {
+        let mut words = ctx.words.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (file_id, text) in &texts {
+            words.set_file(*file_id, text.as_deref());
         }
     }
 
@@ -1124,9 +1175,18 @@ fn load_into(
         Some(stamp) => stamps.insert(lock, stamp),
         None => stamps.remove(&lock),
     };
+    let indexing = std::time::Instant::now();
+    let words = build_word_index(&host, &vfs, canonical);
+    let (word_count, pairs) = words.size();
+    tracing::info!(
+        "word index of {}: {word_count} words in {pairs} (word, file) pairs, built in {} ms",
+        canonical.display(),
+        indexing.elapsed().as_millis()
+    );
     *context = Some(ProjectContext {
         host,
         vfs: shared_vfs(vfs),
+        words: Arc::new(RwLock::new(words)),
         layout,
         load_kind: requested,
         loaded_at: std::time::Instant::now(),
@@ -1182,8 +1242,13 @@ fn refresh_if_stale(
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
 
-    match classify_staleness(&ctx.stamps, &current) {
-        Staleness::Fresh => Ok(()),
+    match classify_staleness(&ctx.stamps, &current, &ctx.layout) {
+        Staleness::Fresh => {
+            // Unchanged, or changed only in shape files that do not reload (a
+            // nested project's lockfile): either way the stamps are current.
+            ctx.stamps = current;
+            Ok(())
+        }
         Staleness::ManifestChanged(manifest) => {
             tracing::info!(
                 "{} changed since {} was analysed; reloading",
@@ -1366,6 +1431,7 @@ impl SemanticService {
             ProjectContext {
                 host,
                 vfs: shared_vfs(Vfs::default()),
+                words: Arc::default(),
                 layout: loader::SourceLayout::default(),
                 load_kind: LoadKind::Full,
                 loaded_at: std::time::Instant::now(),
@@ -1443,7 +1509,7 @@ impl SemanticService {
         path: &Path,
         work: impl Fn() -> Result<T>,
     ) -> Result<T> {
-        self.with_project(path, LoadKind::Full, |_, _, _| work())
+        self.with_project(path, LoadKind::Full, |_, _, _, _| work())
     }
 
     /// Whether some call holds `path`'s slot right now.
@@ -1654,7 +1720,7 @@ impl SemanticService {
         &self,
         project_path: &Path,
         requested: LoadKind,
-        work: impl Fn(&Path, &Analysis, &Vfs) -> Result<T>,
+        work: impl Fn(&Path, &Analysis, &Vfs, &word_index::WordIndex) -> Result<T>,
     ) -> Result<T> {
         let canonical = project_path.canonicalize()?;
         let slot = self.slot_for(&canonical);
@@ -1664,6 +1730,7 @@ impl SemanticService {
             let ctx = context.as_ref().unwrap();
             let analysis = ctx.host.analysis();
             let vfs = Arc::clone(&ctx.vfs);
+            let words = Arc::clone(&ctx.words);
             let last = attempt == QUERY_ATTEMPTS;
             // Kept only on the last attempt: then no refresh can cancel it.
             let _held = if last {
@@ -1674,8 +1741,9 @@ impl SemanticService {
             };
             let outcome = {
                 let vfs = read_vfs(&vfs);
+                let words = read_words(&words);
                 Cancelled::catch(std::panic::AssertUnwindSafe(|| {
-                    work(&canonical, &analysis, &vfs)
+                    work(&canonical, &analysis, &vfs, &words)
                 }))
             };
             match outcome {
@@ -1746,7 +1814,7 @@ impl SemanticService {
     /// half of — nothing requests it any more.
     #[cfg(test)]
     fn get_or_load_full(&self, project_path: &Path) -> Result<()> {
-        self.with_project(project_path, LoadKind::Full, |_, _, _| Ok(()))
+        self.with_project(project_path, LoadKind::Full, |_, _, _, _| Ok(()))
     }
 
     /// Search for symbols by name (for find_definition)
@@ -1786,11 +1854,11 @@ impl SemanticService {
         limit: usize,
         exact: bool,
     ) -> Result<Vec<Location>> {
-        self.with_project(project_path, LoadKind::Full, |canonical, analysis, vfs| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, words| {
             position::symbol_search_with_exact(
                 analysis,
                 vfs,
-                canonical,
+                words,
                 symbol_name,
                 limit,
                 exact,
@@ -1808,11 +1876,11 @@ impl SemanticService {
         exact: bool,
         budget: std::time::Duration,
     ) -> Result<position::SweptAnswer> {
-        self.with_project(project_path, LoadKind::Full, |canonical, analysis, vfs| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, words| {
             position::symbol_search_within(
                 analysis,
                 vfs,
-                canonical,
+                words,
                 symbol_name,
                 limit,
                 exact,
@@ -1834,7 +1902,7 @@ impl SemanticService {
         symbol_name: &str,
         limit: usize,
     ) -> Result<Vec<Location>> {
-        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, _| {
             position::index_only_search(analysis, vfs, symbol_name, limit)
         })
     }
@@ -1875,11 +1943,11 @@ impl SemanticService {
         symbol_name: &str,
         exact: bool,
     ) -> Result<Vec<Location>> {
-        self.with_project(project_path, LoadKind::Full, |canonical, analysis, vfs| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, words| {
             position::find_references_by_name_with_exact(
                 analysis,
                 vfs,
-                canonical,
+                words,
                 symbol_name,
                 exact,
             )
@@ -1899,11 +1967,11 @@ impl SemanticService {
         exact: bool,
         budget: std::time::Duration,
     ) -> Result<position::SweptAnswer> {
-        self.with_project(project_path, LoadKind::Full, |canonical, analysis, vfs| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, words| {
             position::find_references_within(
                 analysis,
                 vfs,
-                canonical,
+                words,
                 symbol_name,
                 exact,
                 position::SweepBudget::of(budget),
@@ -1918,7 +1986,7 @@ impl SemanticService {
         symbol_name: &str,
         new_name: &str,
     ) -> Result<RenamePreview> {
-        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, _| {
             rename::rename_by_name(analysis, vfs, symbol_name, new_name)
         })
     }
@@ -1933,7 +2001,7 @@ impl SemanticService {
         symbol_name: &str,
         new_name: &str,
     ) -> Result<RenamePreview> {
-        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, _| {
             rename::rename_by_position(
                 analysis,
                 vfs,
@@ -1955,6 +2023,7 @@ impl SemanticService {
             ProjectContext {
                 host: AnalysisHost::new(None),
                 vfs: shared_vfs(Vfs::default()),
+                words: Arc::default(),
                 layout: loader::SourceLayout::default(),
                 load_kind: LoadKind::Fast,
                 loaded_at: std::time::Instant::now(),
@@ -2172,9 +2241,10 @@ pub fn second() {
         );
     }
 
-    /// What reloads and what is patched, decided on stamps alone: any change to
-    /// a workspace-shape file wins over `*.rs` changes beside it, and the rest
-    /// is sorted into edited, added and removed.
+    /// What reloads and what is patched, decided on stamps and the load's
+    /// layout: a shape change the layout reloads for wins over `*.rs` changes
+    /// beside it, one it does not is dropped, and the rest is sorted into
+    /// edited, added and removed.
     #[test]
     fn staleness_tells_manifests_from_code() {
         let at = |secs: u64, len: u64| FileStamp {
@@ -2182,9 +2252,16 @@ pub fn second() {
             len,
         };
         let path = |name: &str| PathBuf::from(format!("/w/{name}"));
+        let layout = loader::SourceLayout::for_test(
+            Path::new("/w"),
+            &[&path("Cargo.toml"), &path("crates/member/Cargo.toml")],
+        );
         let old: HashMap<PathBuf, FileStamp> = [
             (path("Cargo.toml"), at(1, 10)),
             (path("Cargo.lock"), at(1, 10)),
+            (path("crates/member/Cargo.toml"), at(1, 10)),
+            (path("scripts/other/Cargo.toml"), at(1, 10)),
+            (path("scripts/other/Cargo.lock"), at(1, 10)),
             (path("src/lib.rs"), at(1, 10)),
             (path("src/gone.rs"), at(1, 10)),
         ]
@@ -2195,22 +2272,24 @@ pub fn second() {
         code.insert(path("src/lib.rs"), at(2, 11));
         code.remove(&path("src/gone.rs"));
         code.insert(path("src/new.rs"), at(2, 5));
-        match classify_staleness(&old, &code) {
-            Staleness::Changed(change) => assert_eq!(
-                change,
-                TreeChange {
-                    edited: vec![path("src/lib.rs")],
-                    added: vec![path("src/new.rs")],
-                    removed: vec![path("src/gone.rs")],
-                }
-            ),
+        let expected = TreeChange {
+            edited: vec![path("src/lib.rs")],
+            added: vec![path("src/new.rs")],
+            removed: vec![path("src/gone.rs")],
+        };
+        match classify_staleness(&old, &code, &layout) {
+            Staleness::Changed(change) => assert_eq!(change, expected),
             other => panic!("only code changed, got {other:?}"),
         }
 
+        // Reloads: the root's lockfile, toolchain and cargo configuration; a
+        // manifest of the load's packages edited or removed; any new manifest.
         for (shape, change) in [
             ("Cargo.lock", Some(at(2, 12))),
             ("Cargo.toml", None),
+            ("crates/member/Cargo.toml", Some(at(2, 11))),
             ("crates/new/Cargo.toml", Some(at(2, 3))),
+            ("scripts/other/Cargo.toml", None),
             ("rust-toolchain.toml", Some(at(2, 3))),
             (".cargo/config.toml", Some(at(2, 3))),
         ] {
@@ -2219,13 +2298,104 @@ pub fn second() {
                 Some(stamp) => new.insert(path(shape), stamp),
                 None => new.remove(&path(shape)),
             };
-            match classify_staleness(&old, &new) {
+            match classify_staleness(&old, &new, &layout) {
                 Staleness::ManifestChanged(manifest) => assert_eq!(manifest, path(shape)),
                 other => panic!("{shape} changed beside code, got {other:?}"),
             }
         }
+
+        // Does not: a nested project's lockfile (rewritten by each build of
+        // it), its toolchain, an edit to a manifest no package of the load has.
+        for shape in [
+            "scripts/other/Cargo.lock",
+            "scripts/other/Cargo.toml",
+            "scripts/other/rust-toolchain.toml",
+            "scripts/other/.cargo/config.toml",
+        ] {
+            let mut new = code.clone();
+            new.insert(path(shape), at(3, 99));
+            match classify_staleness(&old, &new, &layout) {
+                Staleness::Changed(change) => assert_eq!(change, expected, "{shape}"),
+                other => panic!("{shape} must not reload, got {other:?}"),
+            }
+            let mut alone = old.clone();
+            alone.insert(path(shape), at(3, 99));
+            assert!(
+                matches!(classify_staleness(&old, &alone, &layout), Staleness::Fresh),
+                "{shape} alone"
+            );
+        }
         assert!(!is_workspace_shape_file(Path::new("/w/src/config.toml")));
-        assert!(matches!(classify_staleness(&old, &old), Staleness::Fresh));
+        assert!(matches!(classify_staleness(&old, &old, &layout), Staleness::Fresh));
+    }
+
+    /// A crate with a struct field read once in `lib.rs`, and `fillers` modules
+    /// that mention the field's name only in a comment and a string — what the
+    /// old sweep read and probed one by one, and the word index skips.
+    fn field_and_fillers_workspace(root: &Path, fillers: usize) -> PathBuf {
+        write_file(
+            &root.join("Cargo.toml"),
+            "[package]\nname = \"word_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        let mut lib = String::from(
+            "pub struct Probe {\n    pub radius_override: u32,\n}\n\n\
+             pub fn read(p: &Probe) -> u32 {\n    p.radius_override\n}\n",
+        );
+        for n in 0..fillers {
+            lib.push_str(&format!("pub mod filler{n};\n"));
+            write_file(
+                &root.join(format!("src/filler{n}.rs")),
+                &format!(
+                    "// radius_override is not read here\npub fn filler{n}() -> &'static str {{\n    \
+                     \"radius_override\"\n}}\n"
+                ),
+            );
+        }
+        let lib_path = root.join("src/lib.rs");
+        write_file(&lib_path, &lib);
+        lib_path
+    }
+
+    /// Oracles (c) and (d) of the word index: the sweep for a field costs the
+    /// same on 3 and on 12 files that mention the name outside code — the
+    /// files read and the rust-analyzer queries do not grow with the
+    /// workspace — and a read added in a new file is answered by the next
+    /// query, the index patched with the database, no reload.
+    #[test]
+    fn a_field_sweep_costs_the_same_on_four_times_the_files() {
+        let _analysis = holding_an_analysis();
+        let ample = std::time::Duration::from_secs(600);
+        let mut costs = Vec::new();
+        for fillers in [3, 12] {
+            let workspace = tempfile::tempdir().expect("create workspace tempdir");
+            let root = workspace.path();
+            let lib = field_and_fillers_workspace(root, fillers);
+            let service = SemanticService::new();
+            let refs = service
+                .find_references_within(root, "radius_override", true, ample)
+                .expect("references query");
+            assert!(refs.incomplete.is_none(), "{refs:?}");
+            assert_eq!(call_sites(&refs.locations), 1, "{refs:?}");
+            assert!(refs.cost.files_read > 0, "the sweep did not run: {refs:?}");
+            costs.push(refs.cost);
+
+            if fillers == 3 {
+                let loaded = loaded_at(&service, root);
+                write_file(
+                    &root.join("src/late.rs"),
+                    "pub fn late(p: &crate::Probe) -> u32 {\n    p.radius_override\n}\n",
+                );
+                let lib_text = fs::read_to_string(&lib).expect("read lib.rs");
+                write_file(&lib, &format!("pub mod late;\n{lib_text}"));
+                let after = service
+                    .find_references_within(root, "radius_override", true, ample)
+                    .expect("references query after a new file");
+                assert_eq!(call_sites(&after.locations), 2, "{after:?}");
+                assert_eq!(refs_in(&after.locations, "src/late.rs"), 1, "{after:?}");
+                assert_eq!(loaded_at(&service, root), loaded, "the new file reloaded");
+            }
+        }
+        assert_eq!(costs[0], costs[1], "the sweep's cost grew with files that do not use the name");
     }
 
     /// When the database of `root` was built: unchanged across a query means
@@ -3242,7 +3412,7 @@ pub fn hooked() {
         std_spawn_and_scoped_workspace(root);
         let service = SemanticService::new();
         service
-            .with_project(root, LoadKind::Full, |_, analysis, _| {
+            .with_project(root, LoadKind::Full, |_, analysis, _, _| {
                 for q in ["std::thread::spawn", "thread::Builder::spawn", "spawn"] {
                     for exact in [true, false] {
                         let mut query = ra_ap_ide::Query::new(q.to_string());
@@ -3368,7 +3538,10 @@ pub fn hooked() {
 
         let stamps_after = service.with_context_for_test(&canonical, |ctx| ctx.stamps.clone());
         assert!(
-            matches!(classify_staleness(&stamps_before, &stamps_after), Staleness::Fresh),
+            matches!(
+                classify_staleness(&stamps_before, &stamps_after, &loader::SourceLayout::default()),
+                Staleness::Fresh
+            ),
             "an untouched tree must classify as fresh"
         );
     }

@@ -5,6 +5,8 @@ use ra_ap_ide::{
     Analysis, AnalysisHost, FilePosition, LineCol, NavigationTarget, Query, SymbolKind, TextSize,
 };
 use ra_ap_vfs::{Vfs, VfsPath};
+
+use super::word_index::{WordIndex, code_occurrences};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -40,6 +42,21 @@ pub(crate) struct SweptAnswer {
     /// locations are what was found until then, and the answer must say so
     /// (a short list read as complete is read as "this code is dead").
     pub incomplete: Option<String>,
+    /// What the file sweeps of this answer cost — the number that must not
+    /// grow with the size of the workspace, only with the occurrences of the
+    /// name.
+    pub cost: SweepCost,
+}
+
+/// The work of the name sweeps (`collect_by_token_scan`,
+/// `collect_library_refs`) for one answer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SweepCost {
+    /// Candidate files whose text was read and lexed.
+    pub files_read: usize,
+    /// rust-analyzer queries asked about occurrences (`find_all_refs` /
+    /// `goto_definition`).
+    pub ra_queries: usize,
 }
 
 /// When a file sweep must stop, and what it was doing when it did.
@@ -383,17 +400,6 @@ pub(crate) fn find_references(
     Ok(harvest.into_all())
 }
 
-/// Search for symbols by name
-pub(crate) fn symbol_search(
-    host: &AnalysisHost,
-    vfs: &Vfs,
-    project_root: &Path,
-    symbol_name: &str,
-    limit: usize,
-) -> Result<Vec<Location>> {
-    symbol_search_with_exact(&host.analysis(), vfs, project_root, symbol_name, limit, false)
-}
-
 /// Search for symbols by name, optionally retaining only full-name matches.
 ///
 /// # The blind spot this covers
@@ -421,7 +427,7 @@ pub(crate) fn symbol_search(
 pub(crate) fn symbol_search_with_exact(
     analysis: &Analysis,
     vfs: &Vfs,
-    project_root: &Path,
+    words: &WordIndex,
     symbol_name: &str,
     limit: usize,
     exact_only: bool,
@@ -429,7 +435,7 @@ pub(crate) fn symbol_search_with_exact(
     let answer = symbol_search_within(
         analysis,
         vfs,
-        project_root,
+        words,
         symbol_name,
         limit,
         exact_only,
@@ -443,7 +449,7 @@ pub(crate) fn symbol_search_with_exact(
 pub(crate) fn symbol_search_within(
     analysis: &Analysis,
     vfs: &Vfs,
-    project_root: &Path,
+    words: &WordIndex,
     symbol_name: &str,
     limit: usize,
     exact_only: bool,
@@ -452,14 +458,16 @@ pub(crate) fn symbol_search_within(
     let mut locations = index_matches(&analysis, vfs, symbol_name, limit, exact_only)?;
 
     let mut incomplete = None;
+    let mut cost = SweepCost::default();
     if !locations.iter().any(|location| location.exact) && !is_path_query(symbol_name) {
         incomplete = collect_by_token_scan(
             &analysis,
             vfs,
-            project_root,
+            words,
             leaf_name(symbol_name),
             Wants::DeclOnly,
             budget,
+            &mut cost,
             &mut locations,
         )?;
     }
@@ -472,6 +480,7 @@ pub(crate) fn symbol_search_within(
     Ok(SweptAnswer {
         locations: ranked,
         incomplete,
+        cost,
     })
 }
 
@@ -580,31 +589,20 @@ fn dedup_by_position(locations: &mut Vec<Location>) {
     locations.retain(|location| seen.insert(location_key(location)));
 }
 
-/// Find all references to symbols matching a name
-/// First finds all symbols with that name, then finds references for each
-pub(crate) fn find_references_by_name(
-    host: &AnalysisHost,
-    vfs: &Vfs,
-    project_root: &Path,
-    symbol_name: &str,
-) -> Result<Vec<Location>> {
-    find_references_by_name_with_exact(&host.analysis(), vfs, project_root, symbol_name, false)
-}
-
 /// Find all references to symbols matching a name, optionally retaining only
 /// full-name symbol matches before resolving references. No time budget: see
 /// [`find_references_within`].
 pub(crate) fn find_references_by_name_with_exact(
     analysis: &Analysis,
     vfs: &Vfs,
-    project_root: &Path,
+    words: &WordIndex,
     symbol_name: &str,
     exact_only: bool,
 ) -> Result<Vec<Location>> {
     let answer = find_references_within(
         analysis,
         vfs,
-        project_root,
+        words,
         symbol_name,
         exact_only,
         SweepBudget::unlimited(),
@@ -617,7 +615,7 @@ pub(crate) fn find_references_by_name_with_exact(
 pub(crate) fn find_references_within(
     analysis: &Analysis,
     vfs: &Vfs,
-    project_root: &Path,
+    words: &WordIndex,
     symbol_name: &str,
     exact_only: bool,
     budget: SweepBudget,
@@ -673,13 +671,15 @@ pub(crate) fn find_references_within(
         }
     }
 
+    let mut cost = SweepCost::default();
     if incomplete.is_none() {
         incomplete = collect_library_refs(
             analysis,
             vfs,
-            project_root,
+            words,
             &library_symbols,
             budget,
+            &mut cost,
             &mut all_locations,
         )?;
     }
@@ -694,10 +694,11 @@ pub(crate) fn find_references_within(
         incomplete = collect_by_token_scan(
             &analysis,
             vfs,
-            project_root,
+            words,
             name,
             Wants::DeclAndRefs,
             budget,
+            &mut cost,
             &mut all_locations,
         )?;
     }
@@ -713,6 +714,7 @@ pub(crate) fn find_references_within(
     Ok(SweptAnswer {
         locations: all_locations,
         incomplete,
+        cost,
     })
 }
 
@@ -749,23 +751,34 @@ enum Wants {
 ///
 /// # Scope
 ///
-/// Only `.rs` files under `project_root` are swept. Under a full workspace load
-/// the VFS also holds every dependency's sources, and a name that happens to
-/// exist in a registry crate is not what the caller asked about.
+/// Only the project's own files are swept — the candidates the word index
+/// ([`WordIndex`]) has for the name, i.e. the `.rs` files under the project
+/// root whose code holds it. Under a full workspace load the VFS also holds
+/// every dependency's sources, and a name that happens to exist in a registry
+/// crate is not what the caller asked about.
+///
+/// # Cost
+///
+/// Reads and lexes the candidate files only — for a field, a handful of a
+/// ~8000-file workspace, where this used to read all 148 MB — and asks
+/// rust-analyzer only about occurrences in code, never about a comment or a
+/// string (those used to be a query each, resolving to nothing).
+#[allow(clippy::too_many_arguments)]
 fn collect_by_token_scan(
     analysis: &Analysis,
     vfs: &Vfs,
-    project_root: &Path,
+    words: &WordIndex,
     symbol_name: &str,
     wants: Wants,
     budget: SweepBudget,
+    cost: &mut SweepCost,
     out: &mut Vec<Location>,
 ) -> Result<Option<String>> {
     // Positions already accounted for, so a definition reached through its
     // first occurrence is not re-queried through its remaining twenty.
     let mut covered: HashSet<(PathBuf, u32, u32)> = out.iter().map(location_key).collect();
 
-    let files = project_rust_files(vfs, project_root);
+    let files = words.files_with(symbol_name);
     for (done, &file_id) in files.iter().enumerate() {
         if budget.exhausted() {
             return Ok(Some(budget.note("the token sweep", done, files.len())));
@@ -773,8 +786,9 @@ fn collect_by_token_scan(
         let text = analysis.file_text(file_id)?;
         let line_index = analysis.file_line_index(file_id)?;
         let file_path = file_path_of(vfs, file_id)?;
+        cost.files_read += 1;
 
-        for start in identifier_occurrences(&text, symbol_name) {
+        for start in code_occurrences(&text, symbol_name) {
             let line_col = line_index.line_col(TextSize::new(start as u32));
             let probe = (file_path.clone(), line_col.line + 1, line_col.col + 1);
             if !covered.insert(probe) {
@@ -795,6 +809,7 @@ fn collect_by_token_scan(
                 offset: TextSize::new(inside as u32),
             };
 
+            cost.ra_queries += 1;
             let Some((resolved, harvest)) = harvest_refs_at(analysis, vfs, position, true)? else {
                 continue;
             };
@@ -815,11 +830,13 @@ fn collect_by_token_scan(
     Ok(None)
 }
 
-/// The `.rs` files under `project_root` the analysis knows, sorted.
+/// The `.rs` files under `project_root` the analysis knows, sorted — what the
+/// word index is built over (`build_word_index`); no query walks them.
 ///
 /// Sorted, because the VFS hands files back in load order: two runs that probe
-/// different occurrences first would otherwise answer in different order.
-fn project_rust_files(vfs: &Vfs, project_root: &Path) -> Vec<ra_ap_vfs::FileId> {
+/// different occurrences first would otherwise answer in different order (the
+/// index keeps its lists in the same `FileId` order).
+pub(super) fn project_rust_files(vfs: &Vfs, project_root: &Path) -> Vec<ra_ap_vfs::FileId> {
     let mut files: Vec<ra_ap_vfs::FileId> = vfs
         .iter()
         .filter(|(_, path)| {
@@ -856,12 +873,22 @@ fn project_rust_files(vfs: &Vfs, project_root: &Path) -> Vec<ra_ap_vfs::FileId> 
 /// in `std::thread`): what is wanted is what it resolves to, so each symbol is
 /// put through `goto_definition` too, and both it and its targets count as a
 /// hit. The declarations reported are the resolved targets.
+///
+/// # Cost
+///
+/// The files asked about are the word index's candidates for the names, and in
+/// them only occurrences in code: a `goto_definition` per occurrence of the
+/// name in code, nothing per file of the workspace. That is cheap for `spawn`
+/// (281 of ~8000 files) and still not for `new` (5194): such names wait for the
+/// graph's table of uses (`library-refs-scope` of the plan); the budget stops
+/// them meanwhile.
 fn collect_library_refs(
     analysis: &Analysis,
     vfs: &Vfs,
-    project_root: &Path,
+    words: &WordIndex,
     symbols: &[(&NavigationTarget, bool)],
     budget: SweepBudget,
+    cost: &mut SweepCost,
     out: &mut Vec<Location>,
 ) -> Result<Option<String>> {
     if symbols.is_empty() {
@@ -900,7 +927,11 @@ fn collect_library_refs(
         out.push(location);
     }
 
-    let files = project_rust_files(vfs, project_root);
+    // Every file holding one of the names, once, in `FileId` order.
+    let files: BTreeSet<ra_ap_vfs::FileId> = names
+        .iter()
+        .flat_map(|name| words.files_with(name).iter().copied())
+        .collect();
     for (done, &file_id) in files.iter().enumerate() {
         if budget.exhausted() {
             return Ok(Some(budget.note("the library-item sweep", done, files.len())));
@@ -908,14 +939,16 @@ fn collect_library_refs(
         let text = analysis.file_text(file_id)?;
         let line_index = analysis.file_line_index(file_id)?;
         let file_path = file_path_of(vfs, file_id)?;
+        cost.files_read += 1;
         for name in &names {
-            for start in identifier_occurrences(&text, name) {
+            for start in code_occurrences(&text, name) {
                 // One character into the identifier, as in the token sweep.
                 let inside = if name.len() > 1 { start + 1 } else { start };
                 let position = FilePosition {
                     file_id,
                     offset: TextSize::new(inside as u32),
                 };
+                cost.ra_queries += 1;
                 let Some(info) = analysis
                     .goto_definition(position, &goto_config())
                     .context("goto_definition query failed")?
@@ -960,32 +993,6 @@ fn is_the_wanted_name(decl: &ResolvedDecl, symbol_name: &str) -> bool {
 /// Dedup key: one source position, however it was reached.
 fn location_key(location: &Location) -> (PathBuf, u32, u32) {
     (location.file_path.clone(), location.line, location.column)
-}
-
-/// Byte offsets at which `name` appears as a whole identifier.
-///
-/// The boundary test is on `char`, not on bytes, so that a name butting against
-/// a multi-byte character in a comment is not mistaken for a longer identifier.
-fn identifier_occurrences(text: &str, name: &str) -> Vec<usize> {
-    if name.is_empty() {
-        return Vec::new();
-    }
-    let is_ident_char = |c: char| c.is_alphanumeric() || c == '_';
-
-    text.match_indices(name)
-        .filter(|(start, _)| {
-            let before_ok = text[..*start]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !is_ident_char(c));
-            let after_ok = text[start + name.len()..]
-                .chars()
-                .next()
-                .is_none_or(|c| !is_ident_char(c));
-            before_ok && after_ok
-        })
-        .map(|(start, _)| start)
-        .collect()
 }
 
 fn rank_and_filter_exact(mut locations: Vec<Location>, exact_only: bool) -> Vec<Location> {

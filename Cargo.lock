@@ -7197,6 +7197,7 @@ dependencies = [
  "load-cargo",
  "mimalloc",
  "num_cpus",
+ "parser",
  "project-model",
  "rmc-config",
  "rmc-engine",

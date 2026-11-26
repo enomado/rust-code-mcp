@@ -67,6 +67,7 @@ directories = "5"      # Cross-platform config/data directories
 # Key on the left = the name under which the crate is visible in code (`use ra_ap_ide::…`),
 # `package` = the real package name in the fork. The path is relative: the fork is checked out next to this repo.
 ra_ap_syntax = { path = "../rust-analyzer-bur/crates/syntax", package = "syntax" }
+ra_ap_parser = { path = "../rust-analyzer-bur/crates/parser", package = "parser" }
 ra_ap_ide = { path = "../rust-analyzer-bur/crates/ide", package = "ide" }
 ra_ap_ide_db = { path = "../rust-analyzer-bur/crates/ide-db", package = "ide-db" }
 "ra_ap_load-cargo" = { path = "../rust-analyzer-bur/crates/load-cargo", package = "load-cargo" }

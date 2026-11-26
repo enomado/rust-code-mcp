@@ -229,6 +229,17 @@ fn swept_text(
     if let Some(why) = &answer.incomplete {
         tracing::info!("{tool} '{symbol_name}' in {directory} is INCOMPLETE: {why}");
     }
+    // A sweep that ran at all says what it cost, so a slow call in the log is
+    // told apart by its candidates and queries rather than guessed at.
+    let cost = answer.cost;
+    if cost.files_read > 0 {
+        tracing::info!(
+            "{tool} '{symbol_name}' in {directory}: name sweep read {} candidate file(s), {} \
+             rust-analyzer quer(ies)",
+            cost.files_read,
+            cost.ra_queries
+        );
+    }
     let (plural, none) = match noun {
         Noun::Definition => ("definition(s)", "No definition found"),
         Noun::Reference => ("reference(s)", "No references found"),
@@ -646,6 +657,7 @@ mod tests {
             &SweptAnswer {
                 locations: vec![location.clone()],
                 incomplete: Some("time budget of 30 s exhausted".into()),
+                cost: Default::default(),
             },
         );
         let lines: Vec<&str> = partial.lines().collect();
@@ -656,7 +668,11 @@ mod tests {
             Noun::Definition,
             "spawn",
             "/w",
-            &SweptAnswer { locations: Vec::new(), incomplete: Some("cut".into()) },
+            &SweptAnswer {
+                locations: Vec::new(),
+                incomplete: Some("cut".into()),
+                cost: Default::default(),
+            },
         );
         assert!(empty.starts_with("INCOMPLETE: No definition found"), "{empty}");
         let whole = swept_text(
@@ -664,7 +680,11 @@ mod tests {
             Noun::Reference,
             "spawn",
             "/w",
-            &SweptAnswer { locations: vec![location], incomplete: None },
+            &SweptAnswer {
+                locations: vec![location],
+                incomplete: None,
+                cost: Default::default(),
+            },
         );
         assert!(!whole.contains("INCOMPLETE"), "{whole}");
     }

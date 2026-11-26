@@ -10,10 +10,12 @@ use ra_ap_load_cargo::{
     LoadCargoConfig, ProcMacroServerChoice, ProjectFolders, SourceRootConfig,
     load_workspace_into_db, project_workspace_at,
 };
-use ra_ap_project_model::{CargoConfig, CargoFeatures, RustLibSource};
+use ra_ap_project_model::{
+    CargoConfig, CargoFeatures, ProjectWorkspace, ProjectWorkspaceKind, RustLibSource,
+};
 use ra_ap_vfs::{Vfs, VfsPath};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::mcp::project_paths::data_dir;
 
@@ -36,13 +38,64 @@ pub(crate) struct SourceLayout {
     /// The loader's entries: directories with their extensions and excludes
     /// (`target/`, `.git`), plus single files.
     load: Vec<ra_ap_vfs::loader::Entry>,
+    /// The directory the load was asked about: `cargo metadata` ran there, so
+    /// the lockfile, toolchain file and cargo configuration it read are there.
+    root: PathBuf,
+    /// The manifest of every package in the loaded crate graph (members and
+    /// path dependencies), plus the workspace's own.
+    manifests: HashSet<PathBuf>,
+}
+
+/// How a file changed between two stamp sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileChange {
+    Edited,
+    Added,
+    Removed,
 }
 
 impl SourceLayout {
-    fn of(folders: ProjectFolders) -> Self {
+    fn of(folders: ProjectFolders, root: &Path, workspace: &ProjectWorkspace) -> Self {
         SourceLayout {
             roots: folders.source_root_config,
             load: folders.load,
+            root: root.to_path_buf(),
+            manifests: package_manifests(workspace),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(root: &Path, manifests: &[&Path]) -> Self {
+        SourceLayout {
+            root: root.to_path_buf(),
+            manifests: manifests.iter().map(|path| path.to_path_buf()).collect(),
+            ..SourceLayout::default()
+        }
+    }
+
+    /// Whether a change to the workspace-shape file `path` can change what a
+    /// load builds — and so has to reload.
+    ///
+    /// - `Cargo.toml`: added or removed anywhere (a new member under a
+    ///   `members` glob is nothing but a new manifest), edited when it is the
+    ///   manifest of a package the load has. An edit to the manifest of an
+    ///   unrelated nested project changes nothing here.
+    /// - `Cargo.lock`, `rust-toolchain{,.toml}`, `.cargo/config{,.toml}`: only
+    ///   the root's. A nested project's lockfile is rewritten by every build of
+    ///   it, and reloading for that cost the first live hour two minutes
+    ///   (2026-11-26).
+    pub(crate) fn reloads_for(&self, path: &Path, change: FileChange) -> bool {
+        let name = path.file_name().and_then(|name| name.to_str());
+        let parent = path.parent();
+        match name {
+            Some("Cargo.toml") => change != FileChange::Edited || self.manifests.contains(path),
+            Some("Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml") => {
+                parent == Some(self.root.as_path())
+            }
+            Some("config" | "config.toml") => {
+                parent.and_then(Path::parent) == Some(self.root.as_path())
+            }
+            _ => false,
         }
     }
 
@@ -63,6 +116,25 @@ impl SourceLayout {
     pub(crate) fn root_of(&self, path: &VfsPath) -> Option<usize> {
         self.roots.fsc.classify_path(path)
     }
+}
+
+/// The manifests of every package `cargo metadata` gave the workspace, and the
+/// workspace's own; none for a `rust-project.json` workspace.
+fn package_manifests(workspace: &ProjectWorkspace) -> HashSet<PathBuf> {
+    let cargo = match &workspace.kind {
+        ProjectWorkspaceKind::Cargo { cargo, .. } => Some(cargo),
+        ProjectWorkspaceKind::DetachedFile { cargo, .. } => cargo.as_ref().map(|(cargo, ..)| cargo),
+        ProjectWorkspaceKind::Json(_) => None,
+    };
+    let Some(cargo) = cargo else {
+        return HashSet::new();
+    };
+    let root_manifest: &Path = cargo.workspace_root().as_ref();
+    cargo
+        .packages()
+        .map(|package| AsRef::<Path>::as_ref(&cargo[package].manifest).to_path_buf())
+        .chain(std::iter::once(root_manifest.join("Cargo.toml")))
+        .collect()
 }
 
 /// What a load returns: the database, the paths of its files, and where files go.
@@ -215,11 +287,11 @@ fn load_unprimed(
     // a pure function of it), made here because that function keeps its
     // result to itself. Paths only — the workspace's package roots, nothing read
     // from disk.
-    let layout = SourceLayout::of(ProjectFolders::new(
-        std::slice::from_ref(&workspace),
-        &[],
-        None,
-    ));
+    let layout = SourceLayout::of(
+        ProjectFolders::new(std::slice::from_ref(&workspace), &[], None),
+        path,
+        &workspace,
+    );
     let (vfs, _) =
         load_workspace_into_db(workspace, &cargo_config.extra_env, &load_config, &mut db)
             .context("Failed to load workspace")?;
