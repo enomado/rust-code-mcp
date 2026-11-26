@@ -36,7 +36,10 @@ pub use tantivy_adapter::TantivyAdapter;
 // the semantic cache considers fresh what the index has already reindexed.
 // For the same reason the nested-project boundary is exported too: where this
 // project ends must be understood the same way by everyone asking about its files.
-pub use traversal::{NESTED_ROOT_MARKER, collect_project_rust_files, is_nested_project_root};
+// `collect_project_files` is that walk with another file filter, not a second walk.
+pub use traversal::{
+    NESTED_ROOT_MARKER, collect_project_files, collect_project_rust_files, is_nested_project_root,
+};
 pub use unified::{
     IndexFileResult, IndexStats, UnifiedIndexer, VectorMaintenance,
     rebuild_bm25_from_existing_store,

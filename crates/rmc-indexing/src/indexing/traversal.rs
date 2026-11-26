@@ -74,6 +74,15 @@ pub fn is_nested_project_root(dir: &Path) -> bool {
 /// error must not make the whole tree unindexable. The caller decides
 /// whether to warn — both call sites do.
 pub fn collect_project_rust_files(root: &Path) -> (Vec<PathBuf>, usize) {
+    collect_project_files(root, |path| {
+        path.extension() == Some(std::ffi::OsStr::new("rs"))
+    })
+}
+
+/// [`collect_project_rust_files`] for any file `keep` accepts — the same
+/// boundaries, one walk. The staleness check of the semantic service takes the
+/// `*.rs` files and the manifests in the same pass rather than walking twice.
+pub fn collect_project_files(root: &Path, keep: impl Fn(&Path) -> bool) -> (Vec<PathBuf>, usize) {
     let mut rust_files = Vec::new();
     let mut walk_errors = 0;
     // Filled by the closure below; readable once the walker that borrows it is
@@ -103,10 +112,7 @@ pub fn collect_project_rust_files(root: &Path) -> (Vec<PathBuf>, usize) {
 
     for entry in walker {
         match entry {
-            Ok(e)
-                if e.file_type().is_file()
-                    && e.path().extension() == Some(std::ffi::OsStr::new("rs")) =>
-            {
+            Ok(e) if e.file_type().is_file() && keep(e.path()) => {
                 rust_files.push(e.path().to_path_buf());
             }
             Ok(_) => {}

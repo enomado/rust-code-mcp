@@ -60,6 +60,9 @@ ra_ap_ide_db        = { workspace = true }
 ra_ap_project_model = { workspace = true }
 ra_ap_vfs           = { workspace = true }
 ra_ap_intern        = { workspace = true }
+# The `Arc` rust-analyzer's database inputs are built with (a source root set
+# when a refresh patches an added file in); the lockfile's version.
+triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
 
 # Returning free memory to the kernel: `malloc_trim` on glibc builds; and
 # `mallinfo2`, which says how much of the heap is in use and how much is free.

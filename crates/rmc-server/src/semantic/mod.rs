@@ -21,7 +21,7 @@ use ra_ap_ide_db::ChangeWithProcMacros;
 use ra_ap_ide_db::base_db::salsa::Cancelled;
 use ra_ap_vfs::{FileExcluded, Vfs, VfsPath};
 use anyhow::{Context as _, Result};
-use rmc_indexing::indexing::collect_project_rust_files;
+use rmc_indexing::indexing::collect_project_files;
 use serde::Serialize;
 
 pub(crate) use position::Location;
@@ -40,13 +40,24 @@ struct FileStamp {
 enum Staleness {
     /// Same files, same stamps: the cached analysis still describes the code.
     Fresh,
-    /// The same set of files, some of them edited. Their new text can be
-    /// pushed into the existing database.
-    Edited(Vec<PathBuf>),
-    /// Files appeared or disappeared. A new module, a new crate or a deleted
-    /// file changes the module tree and possibly the crate graph, and neither
-    /// can be patched file-by-file — the project has to be loaded again.
-    StructureChanged,
+    /// A file that shapes the workspace — a manifest, the lockfile, a
+    /// toolchain or cargo configuration file — was edited, added or removed.
+    /// It can change the crate graph (a new member, a dropped dependency, a
+    /// feature) and the source roots, which only `cargo metadata` and a load
+    /// answer: the project has to be loaded again. The path is the first such
+    /// file, for the log.
+    ManifestChanged(PathBuf),
+    /// Only `*.rs` files changed: edited, added or removed. Their new state can
+    /// be pushed into the existing database — see [`apply_tree_change`].
+    Changed(TreeChange),
+}
+
+/// The `*.rs` files that changed between two stamp sets, each list sorted.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TreeChange {
+    edited: Vec<PathBuf>,
+    added: Vec<PathBuf>,
+    removed: Vec<PathBuf>,
 }
 
 /// Cached project context
@@ -56,7 +67,14 @@ struct ProjectContext {
     /// (file ids ↔ paths) with the slot let go; a refresh writes it after
     /// `apply_change` has cancelled them. See [`SemanticService::with_project`].
     vfs: Arc<RwLock<Vfs>>,
+    /// Where the load put files, so that a file added since goes where a
+    /// reload would put it — see [`apply_tree_change`].
+    layout: loader::SourceLayout,
     load_kind: LoadKind,
+    /// When the database was built. A refresh patches it in place and leaves
+    /// this alone; a reload replaces it — which is how a test tells the two
+    /// apart.
+    loaded_at: std::time::Instant,
     /// The working tree as it was when this context was built or last
     /// refreshed. Without it the cache has no way to notice that the code
     /// moved on — see [`refresh_if_stale`].
@@ -71,13 +89,36 @@ fn stamp_of(path: &Path) -> Option<FileStamp> {
     })
 }
 
-/// Stat every `*.rs` file of the project, using the same walker as the indexer
-/// so both sides mean the same thing by "a project file".
+/// Whether `path` names a file that shapes the workspace rather than holding
+/// code: what `cargo metadata` reads to build the crate graph, plus the
+/// toolchain choice (which picks the sysroot). Any `Cargo.toml` counts, not only
+/// the members' the load saw: a new member under a `members = ["crates/*"]`
+/// glob changes nothing but its own new manifest.
+///
+/// Conservative on purpose: an edit to the manifest of an unrelated nested
+/// project reloads too. Telling it apart would need the workspace model, and a
+/// missed member costs a wrong answer where an extra reload costs a minute.
+fn is_workspace_shape_file(path: &Path) -> bool {
+    let name = path.file_name().and_then(|name| name.to_str());
+    match name {
+        Some("Cargo.toml" | "Cargo.lock" | "rust-toolchain" | "rust-toolchain.toml") => true,
+        Some("config" | "config.toml") => {
+            path.parent().and_then(|dir| dir.file_name()) == Some(std::ffi::OsStr::new(".cargo"))
+        }
+        _ => false,
+    }
+}
+
+/// Stat every `*.rs` file and every workspace-shape file of the project
+/// ([`is_workspace_shape_file`]), using the same walker as the indexer so both
+/// sides mean the same thing by "a project file".
 ///
 /// Files that vanish between the walk and the stat are simply absent from the
 /// result, which reads as a deletion — the correct conclusion.
 fn collect_stamps(root: &Path) -> HashMap<PathBuf, FileStamp> {
-    let (files, walk_errors) = collect_project_rust_files(root);
+    let (files, walk_errors) = collect_project_files(root, |path| {
+        path.extension() == Some(std::ffi::OsStr::new("rs")) || is_workspace_shape_file(path)
+    });
     if walk_errors > 0 {
         tracing::warn!(
             "{} unreadable entries while checking {} for staleness",
@@ -95,24 +136,34 @@ fn classify_staleness(
     old: &HashMap<PathBuf, FileStamp>,
     new: &HashMap<PathBuf, FileStamp>,
 ) -> Staleness {
-    if old.len() != new.len() {
-        return Staleness::StructureChanged;
-    }
-
-    let mut edited = Vec::new();
+    let mut change = TreeChange::default();
     for (path, stamp) in new {
         match old.get(path) {
-            None => return Staleness::StructureChanged,
+            None => change.added.push(path.clone()),
             Some(previous) if previous == stamp => {}
-            Some(_) => edited.push(path.clone()),
+            Some(_) => change.edited.push(path.clone()),
         }
     }
+    change.removed = old
+        .keys()
+        .filter(|path| !new.contains_key(*path))
+        .cloned()
+        .collect();
+    for list in [&mut change.edited, &mut change.added, &mut change.removed] {
+        list.sort();
+    }
 
-    if edited.is_empty() {
+    let manifest = [&change.edited, &change.added, &change.removed]
+        .into_iter()
+        .flatten()
+        .filter(|path| is_workspace_shape_file(path))
+        .min();
+    if let Some(manifest) = manifest {
+        Staleness::ManifestChanged(manifest.clone())
+    } else if change == TreeChange::default() {
         Staleness::Fresh
     } else {
-        edited.sort();
-        Staleness::Edited(edited)
+        Staleness::Changed(change)
     }
 }
 
@@ -475,12 +526,6 @@ fn ingredient_rows(host: &mut AnalysisHost) -> Vec<IngredientMemory> {
     rows
 }
 
-/// Push the current contents of `paths` into an already-loaded analysis.
-///
-/// Fails rather than skips when a file cannot be mapped into the analysis: the
-/// caller turns that into a full reload. Silently leaving one file at its old
-/// revision would reproduce the very defect this module now guards against,
-/// only harder to notice.
 /// A context's `Vfs` for reading. A poisoned lock is stepped over: the writer
 /// is a refresh, which writes path by path a table that stays consistent at
 /// every step.
@@ -492,42 +537,197 @@ fn shared_vfs(vfs: Vfs) -> Arc<RwLock<Vfs>> {
     Arc::new(RwLock::new(vfs))
 }
 
-fn apply_edits(ctx: &mut ProjectContext, paths: &[PathBuf]) -> Result<()> {
-    let mut updates = Vec::with_capacity(paths.len());
+/// What one in-place refresh did, for its log line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Patched {
+    edited: usize,
+    added: usize,
+    removed: usize,
+    /// Changed files no load reads (outside every loader entry, or under an
+    /// excluded directory) — a reload would not see them either.
+    outside: usize,
+}
 
-    // Read everything before mutating anything: a change applied halfway
-    // would leave the database describing a mixture of two revisions.
+/// Push the `*.rs` files that changed on disk into an already-loaded analysis:
+/// edited texts, added files into their source root, removed files out of it.
+///
+/// # Why this is the answer a reload would give
+///
+/// A load reads the files its loader entries contain and cuts them into
+/// source roots by path prefix (`SourceRootConfig::partition`); the crate graph
+/// comes from `cargo metadata`, which reads manifests only. With the manifests
+/// unchanged (anything else is [`Staleness::ManifestChanged`]), a reload would
+/// therefore build the same crate graph and the same roots, except that an
+/// added file is in the root its path classifies into and a removed one is in
+/// none — which is exactly what this writes. The module tree then follows from
+/// the texts and roots by the usual salsa recomputation (`mod x;` resolves
+/// through the root's file set). It is what rust-analyzer's own main loop does
+/// for a file its watcher reports as created or deleted.
+///
+/// A file no loader entry contains is left out, as a reload would leave it out;
+/// one the analysis already holds is treated as part of it whatever the
+/// entries say.
+///
+/// # What it costs
+///
+/// Reading the changed files, plus one rebuild of each touched root's file set
+/// — the root of one package, on a ~8000-file workspace at most a few thousand
+/// entries, well under a millisecond — and input writes of `LOW` durability for
+/// local roots. Nothing proportional to the workspace: library roots are not
+/// rewritten (setting every root, as `set_roots` does, would bump the `MEDIUM`
+/// revision and make every library memo re-verify), and only memos reading the
+/// touched roots recompute. A reload of the same workspace is 45–95 s.
+///
+/// # Failure
+///
+/// Fails, mutating nothing, when a changed file cannot be read as UTF-8 text, is
+/// excluded in the analysis, or would be loaded yet belongs to no root; the
+/// caller turns that into a full reload. Silently leaving one file at its old
+/// revision would reproduce the very defect [`refresh_if_stale`] guards against,
+/// only harder to notice.
+fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Patched> {
+    use ra_ap_ide_db::base_db::salsa::Durability;
+    use ra_ap_ide_db::base_db::{FileId, FileSet, SourceDatabase, SourceRoot, SourceRootId};
+
+    let mut patched = Patched::default();
+    // A text to set: the file's id when the analysis already holds it, or the
+    // root an added file goes into.
+    enum Target {
+        Known(FileId),
+        New(SourceRootId),
+    }
+    let mut writes: Vec<(VfsPath, Target, String)> = Vec::new();
+    let mut deletions: Vec<(VfsPath, FileId)> = Vec::new();
+
+    // Read and decide everything before mutating anything: a change applied
+    // halfway would leave the database describing a mixture of two revisions.
     {
         let vfs = read_vfs(&ctx.vfs);
-        for path in paths {
-            let vfs_path = VfsPath::new_real_path(path.to_string_lossy().into_owned());
-            let (file_id, excluded) = vfs.file_id(&vfs_path).ok_or_else(|| {
-                anyhow::anyhow!("{} is not part of the loaded analysis", path.display())
-            })?;
-            if excluded == FileExcluded::Yes {
-                anyhow::bail!("{} is excluded from the loaded analysis", path.display());
+        let held = |path: &Path, vfs_path: &VfsPath| -> Result<Option<FileId>> {
+            match vfs.file_id(vfs_path) {
+                Some((_, FileExcluded::Yes)) => {
+                    anyhow::bail!("{} is excluded from the loaded analysis", path.display())
+                }
+                Some((file_id, FileExcluded::No)) => Ok(Some(file_id)),
+                None => Ok(None),
             }
+        };
+        for path in change.edited.iter().chain(&change.added) {
+            let vfs_path = VfsPath::new_real_path(path.to_string_lossy().into_owned());
+            let target = match held(path, &vfs_path)? {
+                Some(file_id) => Target::Known(file_id),
+                None if ctx.layout.loads(path) => {
+                    let root = ctx.layout.root_of(&vfs_path).ok_or_else(|| {
+                        anyhow::anyhow!("{} would be loaded but is in no source root", path.display())
+                    })?;
+                    Target::New(SourceRootId(root as u32))
+                }
+                None => {
+                    patched.outside += 1;
+                    continue;
+                }
+            };
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            updates.push((vfs_path, file_id, text));
+            match target {
+                Target::Known(_) => patched.edited += 1,
+                Target::New(_) => patched.added += 1,
+            }
+            writes.push((vfs_path, target, text));
+        }
+        for path in &change.removed {
+            let vfs_path = VfsPath::new_real_path(path.to_string_lossy().into_owned());
+            match held(path, &vfs_path)? {
+                Some(file_id) => {
+                    patched.removed += 1;
+                    deletions.push((vfs_path, file_id));
+                }
+                None => patched.outside += 1,
+            }
+        }
+    }
+    if writes.is_empty() && deletions.is_empty() {
+        return Ok(patched);
+    }
+
+    // Queries may still run on snapshots of this project, with the slot let go,
+    // and read the `Vfs` beside their snapshot. Cancelling them first (it waits
+    // for their snapshots to drop) frees the `Vfs` to write; the slot is held,
+    // so no new query starts until the refresh is done.
+    ctx.host.trigger_cancellation();
+
+    // The `Vfs` hands out the ids of added files (a file deleted and added
+    // again gets its old id back).
+    let mut texts: Vec<(FileId, Option<String>)> = Vec::new();
+    let mut new_in_root: HashMap<SourceRootId, Vec<(FileId, VfsPath)>> = HashMap::new();
+    {
+        let mut vfs = ctx.vfs.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (vfs_path, target, text) in writes {
+            vfs.set_file_contents(vfs_path.clone(), Some(text.clone().into_bytes()));
+            let file_id = match target {
+                Target::Known(file_id) => file_id,
+                Target::New(root) => {
+                    let (file_id, _) = vfs
+                        .file_id(&vfs_path)
+                        .expect("the Vfs holds a file it was just given");
+                    new_in_root.entry(root).or_default().push((file_id, vfs_path));
+                    file_id
+                }
+            };
+            texts.push((file_id, Some(text)));
+        }
+        for (vfs_path, file_id) in &deletions {
+            vfs.set_file_contents(vfs_path.clone(), None);
+            texts.push((*file_id, None));
+        }
+    }
+
+    // Roots before texts: storing a text asks the file's root whether it is a
+    // library and where the file lives (`Files::stored_text`), and the first
+    // text of an added file asks for a root it would not have yet.
+    let db = ctx.host.raw_database_mut();
+    let mut removed_from_root: HashMap<SourceRootId, Vec<FileId>> = HashMap::new();
+    for (_, file_id) in &deletions {
+        let root = db.file_source_root(*file_id).source_root_id(db);
+        removed_from_root.entry(root).or_default().push(*file_id);
+    }
+    let touched: std::collections::BTreeSet<SourceRootId> = new_in_root
+        .keys()
+        .chain(removed_from_root.keys())
+        .copied()
+        .collect();
+    for root_id in touched {
+        let old = db.source_root(root_id).source_root(db);
+        let removed = removed_from_root.get(&root_id).map_or(&[][..], Vec::as_slice);
+        let added = new_in_root.remove(&root_id).unwrap_or_default();
+        let mut files = FileSet::default();
+        for file_id in old.iter().filter(|file_id| !removed.contains(file_id)) {
+            let path = old.path_for_file(&file_id).expect("a root names its own files");
+            files.insert(file_id, path.clone());
+        }
+        for (file_id, path) in &added {
+            files.insert(*file_id, path.clone());
+        }
+        // The durability `FileChange::apply` gives a root of this kind.
+        let (root, durability) = if old.is_library {
+            (SourceRoot::new_library(files), Durability::MEDIUM)
+        } else {
+            (SourceRoot::new_local(files), Durability::LOW)
+        };
+        db.set_source_root_with_durability(root_id, triomphe::Arc::new(root), durability);
+        for (file_id, _) in added {
+            db.set_file_source_root_with_durability(file_id, root_id, durability);
         }
     }
 
     let mut change = ChangeWithProcMacros::default();
-    for (_, file_id, text) in &updates {
-        change.change_file(*file_id, Some(text.clone()));
+    for (file_id, text) in texts {
+        // `None` empties the text: a file cannot be removed from the
+        // database, only from its root, as rust-analyzer does it.
+        change.change_file(file_id, text);
     }
-    // The database first: `apply_change` cancels the queries still running on
-    // snapshots of this project and waits for them to drop, so the `Vfs`
-    // they read beside their snapshot is free to write a moment later (the
-    // slot is held, no new query starts in between).
     ctx.host.apply_change(change);
-    let mut vfs = ctx.vfs.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-    for (vfs_path, _, text) in updates {
-        vfs.set_file_contents(vfs_path, Some(text.into_bytes()));
-    }
-
-    Ok(())
+    Ok(patched)
 }
 
 /// How many project contexts may stay loaded at once. `0` means unlimited.
@@ -838,20 +1038,22 @@ enum LoadReason {
     NotLoaded,
     /// A `Full` query on a `Fast` context.
     FastToFull,
-    /// `.rs` files appeared or disappeared since the load
-    /// ([`Staleness::StructureChanged`]).
-    FilesAddedOrRemoved,
-    /// Edited files could not be patched into the database.
+    /// A manifest, the lockfile or a toolchain file changed since the load
+    /// ([`Staleness::ManifestChanged`]).
+    ManifestChanged,
+    /// Changed `*.rs` files could not be patched into the database
+    /// ([`apply_tree_change`] failed).
     CannotPatch,
 }
 
 impl LoadReason {
+    /// Fixed words, no paths: `--tool-latency` sums loads per reason text.
     fn as_log_text(self) -> &'static str {
         match self {
             LoadReason::NotLoaded => "not loaded",
             LoadReason::FastToFull => "fast to full",
-            LoadReason::FilesAddedOrRemoved => "files added or removed",
-            LoadReason::CannotPatch => "cannot patch edits",
+            LoadReason::ManifestChanged => "manifest changed",
+            LoadReason::CannotPatch => "cannot patch changes",
         }
     }
 }
@@ -906,14 +1108,28 @@ fn load_into(
         drop(previous);
         crate::mcp::memory::release_free_memory();
     }
-    let (host, vfs) = match requested {
+    let (host, vfs, layout) = match requested {
         LoadKind::Fast => loader::load_project(canonical)?,
         LoadKind::Full => loader::load_project_full(canonical)?,
+    };
+    // The one exception to stamping before the load: `cargo metadata` writes
+    // the workspace's lockfile itself (creates it, or updates it after a
+    // manifest changed). Stamped before, the load's own write would read as a
+    // manifest change on the next query and reload again for nothing. A lock
+    // somebody else rewrites during the load is missed — the crate graph just
+    // read was resolved against it anyway.
+    let mut stamps = stamps;
+    let lock = canonical.join("Cargo.lock");
+    match stamp_of(&lock) {
+        Some(stamp) => stamps.insert(lock, stamp),
+        None => stamps.remove(&lock),
     };
     *context = Some(ProjectContext {
         host,
         vfs: shared_vfs(vfs),
+        layout,
         load_kind: requested,
+        loaded_at: std::time::Instant::now(),
         stamps,
     });
     slot.publish(Some(requested));
@@ -936,23 +1152,25 @@ fn load_into(
 /// suspecting the answer, which is exactly what a confident wrong answer
 /// prevents.
 ///
-/// # Why two repair paths
+/// # Two repair paths
 ///
-/// Edits to existing files are pushed straight into the salsa database
-/// (`apply_change`), which invalidates precisely the derived queries that
-/// depended on those files — milliseconds, and it is what a real IDE does
-/// on every keystroke. Added or deleted files are not patchable that way:
-/// they change the module tree, and a new crate changes the crate graph,
-/// so those force a reload. Reloading costs seconds (`Fast`, `no_deps`) to
-/// minutes (`Full`), which is why it is reserved for the case that needs
-/// it rather than used for everything.
+/// Changed `*.rs` files — edited, added, removed — are pushed straight into
+/// the salsa database ([`apply_tree_change`]), which invalidates precisely the
+/// derived queries that depended on them: milliseconds, and what a real IDE
+/// does on every keystroke and every file its watcher reports. A new module is
+/// a new file in its package's source root plus the edited `mod x;` of its
+/// parent; the module tree follows.
 ///
-/// # Known limit
+/// A changed manifest, lockfile or toolchain file reloads
+/// ([`Staleness::ManifestChanged`]): the crate graph comes from `cargo
+/// metadata`, and a new package is a new `Cargo.toml` (that is how a package
+/// under a `members` glob is noticed). So does a change that cannot be patched.
+/// Reloading costs seconds (`Fast`, `no_deps`) to minutes (`Full`: 45–95 s on
+/// a ~8000-file workspace), which is why it is reserved for these.
 ///
-/// Only `*.rs` files are watched. A `Cargo.toml` edited on its own —
-/// dropping a dependency, renaming a feature — is invisible here. Adding a
-/// crate is not: its sources are new files, which trips the structural
-/// path anyway.
+/// Before the patch path for added files, every new `*.rs` reloaded: on a
+/// workspace where a fleet of agents adds test modules all day that was 72
+/// reloads in four days (6638 s of loading), most of the calls over 40 s.
 fn refresh_if_stale(
     slot: &ProjectSlot,
     context: &mut Option<ProjectContext>,
@@ -966,36 +1184,41 @@ fn refresh_if_stale(
 
     match classify_staleness(&ctx.stamps, &current) {
         Staleness::Fresh => Ok(()),
-        Staleness::StructureChanged => {
+        Staleness::ManifestChanged(manifest) => {
             tracing::info!(
-                "Project {} gained or lost files since it was analysed; reloading",
+                "{} changed since {} was analysed; reloading",
+                manifest.display(),
                 canonical.display()
             );
-            load_into(slot, context, canonical, requested, LoadReason::FilesAddedOrRemoved)
+            load_into(slot, context, canonical, requested, LoadReason::ManifestChanged)
         }
-        Staleness::Edited(paths) => {
-            match apply_edits(ctx, &paths).map(|()| ctx.stamps = current) {
-                Ok(()) => {
-                    tracing::info!(
-                        "Refreshed {} edited file(s) in {}",
-                        paths.len(),
-                        canonical.display()
-                    );
-                    Ok(())
-                }
-                Err(e) => {
-                    // A file the analysis does not know (excluded from the
-                    // build, unreadable, non-UTF-8) cannot be patched in.
-                    // Falling back to a reload is slow but honest; keeping
-                    // the stale context would be the original defect.
-                    tracing::info!(
-                        "Cannot patch {} incrementally ({e}); reloading",
-                        canonical.display()
-                    );
-                    load_into(slot, context, canonical, requested, LoadReason::CannotPatch)
-                }
+        Staleness::Changed(change) => match apply_tree_change(ctx, &change) {
+            Ok(patched) => {
+                ctx.stamps = current;
+                tracing::info!(
+                    "Refreshed {} without a reload: {} edited, {} added, {} removed, {} outside \
+                     the analysis; database loaded {} s ago",
+                    canonical.display(),
+                    patched.edited,
+                    patched.added,
+                    patched.removed,
+                    patched.outside,
+                    ctx.loaded_at.elapsed().as_secs()
+                );
+                Ok(())
             }
-        }
+            Err(e) => {
+                // A file excluded in the analysis, unreadable, non-UTF-8, or
+                // loadable yet in no root cannot be patched in. Falling back
+                // to a reload is slow but honest; keeping the stale context
+                // would be the original defect.
+                tracing::info!(
+                    "Cannot patch {} incrementally ({e}); reloading",
+                    canonical.display()
+                );
+                load_into(slot, context, canonical, requested, LoadReason::CannotPatch)
+            }
+        },
     }
 }
 
@@ -1143,7 +1366,9 @@ impl SemanticService {
             ProjectContext {
                 host,
                 vfs: shared_vfs(Vfs::default()),
+                layout: loader::SourceLayout::default(),
                 load_kind: LoadKind::Full,
+                loaded_at: std::time::Instant::now(),
                 stamps: HashMap::new(),
             },
         );
@@ -1730,7 +1955,9 @@ impl SemanticService {
             ProjectContext {
                 host: AnalysisHost::new(None),
                 vfs: shared_vfs(Vfs::default()),
+                layout: loader::SourceLayout::default(),
                 load_kind: LoadKind::Fast,
+                loaded_at: std::time::Instant::now(),
                 stamps: HashMap::new(),
             },
         );
@@ -1945,39 +2172,120 @@ pub fn second() {
         );
     }
 
-    /// A new file changes the module tree, which cannot be patched into the
-    /// database file-by-file — the refresh has to notice and reload.
+    /// What reloads and what is patched, decided on stamps alone: any change to
+    /// a workspace-shape file wins over `*.rs` changes beside it, and the rest
+    /// is sorted into edited, added and removed.
     #[test]
-    fn references_see_a_call_site_added_in_a_new_file() {
+    fn staleness_tells_manifests_from_code() {
+        let at = |secs: u64, len: u64| FileStamp {
+            modified: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            len,
+        };
+        let path = |name: &str| PathBuf::from(format!("/w/{name}"));
+        let old: HashMap<PathBuf, FileStamp> = [
+            (path("Cargo.toml"), at(1, 10)),
+            (path("Cargo.lock"), at(1, 10)),
+            (path("src/lib.rs"), at(1, 10)),
+            (path("src/gone.rs"), at(1, 10)),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut code = old.clone();
+        code.insert(path("src/lib.rs"), at(2, 11));
+        code.remove(&path("src/gone.rs"));
+        code.insert(path("src/new.rs"), at(2, 5));
+        match classify_staleness(&old, &code) {
+            Staleness::Changed(change) => assert_eq!(
+                change,
+                TreeChange {
+                    edited: vec![path("src/lib.rs")],
+                    added: vec![path("src/new.rs")],
+                    removed: vec![path("src/gone.rs")],
+                }
+            ),
+            other => panic!("only code changed, got {other:?}"),
+        }
+
+        for (shape, change) in [
+            ("Cargo.lock", Some(at(2, 12))),
+            ("Cargo.toml", None),
+            ("crates/new/Cargo.toml", Some(at(2, 3))),
+            ("rust-toolchain.toml", Some(at(2, 3))),
+            (".cargo/config.toml", Some(at(2, 3))),
+        ] {
+            let mut new = code.clone();
+            match change {
+                Some(stamp) => new.insert(path(shape), stamp),
+                None => new.remove(&path(shape)),
+            };
+            match classify_staleness(&old, &new) {
+                Staleness::ManifestChanged(manifest) => assert_eq!(manifest, path(shape)),
+                other => panic!("{shape} changed beside code, got {other:?}"),
+            }
+        }
+        assert!(!is_workspace_shape_file(Path::new("/w/src/config.toml")));
+        assert!(matches!(classify_staleness(&old, &old), Staleness::Fresh));
+    }
+
+    /// When the database of `root` was built: unchanged across a query means
+    /// the query patched it in place, changed means it reloaded.
+    fn loaded_at(service: &SemanticService, root: &Path) -> std::time::Instant {
+        let canonical = root.canonicalize().expect("canonicalize");
+        service.with_context_for_test(&canonical, |ctx| ctx.loaded_at)
+    }
+
+    /// An answer in a form two services can be compared by.
+    fn answer(locations: &[Location]) -> Vec<(PathBuf, u32, u32, String)> {
+        let mut rows: Vec<_> = locations
+            .iter()
+            .map(|location| {
+                (
+                    location.file_path.clone(),
+                    location.line,
+                    location.column,
+                    location.name.clone(),
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// The oracle of the in-place refresh: what a service loading the tree as
+    /// it is now — a full load, nothing patched — answers.
+    fn answer_of_a_fresh_load(root: &Path, name: &str) -> Vec<(PathBuf, u32, u32, String)> {
+        let fresh = SemanticService::new();
+        let found = fresh
+            .find_references_by_name_with_exact(root, name, true)
+            .expect("query on a fresh load");
+        answer(&found)
+    }
+
+    /// A new module — a new file plus the `mod x;` naming it — and its removal
+    /// are patched into the loaded database, not reloaded, and each answer is
+    /// the one a full load of the same tree gives.
+    ///
+    /// The reload this replaces was 45–95 s on a large workspace, and fleets of
+    /// agents adding test modules made it the most common cause of a slow call.
+    #[test]
+    fn a_module_added_and_removed_is_patched_in_without_a_reload() {
         let _analysis = holding_an_analysis();
         let workspace = tempfile::tempdir().expect("create workspace tempdir");
         let root = workspace.path();
         let lib = one_crate_workspace(root);
+        let lib_text = fs::read_to_string(&lib).expect("read lib.rs");
 
         let service = SemanticService::new();
         let before = service
             .find_references_by_name_with_exact(root, "target", true)
             .expect("first query");
         assert_eq!(call_sites(&before), 1, "positive control: {before:?}");
+        let loaded = loaded_at(&service, root);
 
-        write_file(
-            &root.join("src/extra.rs"),
-            r#"pub fn third() {
-    crate::target();
-}
-"#,
-        );
-        write_file(
-            &lib,
-            r#"pub mod extra;
-
-pub fn target() {}
-
-pub fn first() {
-    target();
-}
-"#,
-        );
+        let extra = root.join("src/extra.rs");
+        write_file(&extra, "pub fn third() {\n    crate::target();\n}\n");
+        write_file(&lib, &format!("pub mod extra;\n\n{lib_text}"));
 
         let after = service
             .find_references_by_name_with_exact(root, "target", true)
@@ -1986,6 +2294,94 @@ pub fn first() {
             call_sites(&after),
             2,
             "a call site in a file added after load must be visible, got {after:?}"
+        );
+        assert_eq!(refs_in(&after, "src/extra.rs"), 1, "{after:?}");
+        assert_eq!(loaded_at(&service, root), loaded, "the new file reloaded the project");
+        assert_eq!(answer(&after), answer_of_a_fresh_load(root, "target"));
+
+        fs::remove_file(&extra).expect("remove the module file");
+        write_file(&lib, &lib_text);
+        let removed = service
+            .find_references_by_name_with_exact(root, "target", true)
+            .expect("query after removal");
+        assert_eq!(call_sites(&removed), 1, "the removed file still answers: {removed:?}");
+        assert_eq!(loaded_at(&service, root), loaded, "the removal reloaded the project");
+        assert_eq!(answer(&removed), answer_of_a_fresh_load(root, "target"));
+    }
+
+    /// The paths that must still reload, beside one that must not:
+    ///
+    /// 1. a `*.rs` outside every package of a virtual workspace — no load reads
+    ///    it, so the refresh leaves it out, no reload, the answer a fresh load
+    ///    gives;
+    /// 2. an edited `Cargo.toml` — the crate graph may have changed — reloads
+    ///    (this was invisible before: only `*.rs` were stamped);
+    /// 3. a new package under the `members` glob, the workspace manifest
+    ///    untouched — noticed by its new `Cargo.toml`, reloads, and its call is
+    ///    in the answer. Patched in as plain files, its sources would have
+    ///    landed in no crate and the call been missed.
+    #[test]
+    fn a_manifest_change_reloads_and_a_file_outside_the_packages_does_not() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        let package = |name: &str, deps: &str| {
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\n{deps}"
+            )
+        };
+        write_file(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+        );
+        let base_manifest = root.join("crates/base/Cargo.toml");
+        write_file(&base_manifest, &package("base", ""));
+        write_file(
+            &root.join("crates/base/src/lib.rs"),
+            "pub fn target() {}\n\npub fn first() {\n    target();\n}\n",
+        );
+
+        let service = SemanticService::new();
+        let before = service
+            .find_references_by_name_with_exact(root, "target", true)
+            .expect("first query");
+        assert_eq!(call_sites(&before), 1, "positive control: {before:?}");
+        let loaded = loaded_at(&service, root);
+
+        write_file(
+            &root.join("scratch/loose.rs"),
+            "fn loose() {\n    base::target();\n}\n",
+        );
+        let loose = service
+            .find_references_by_name_with_exact(root, "target", true)
+            .expect("query after a loose file");
+        assert_eq!(loaded_at(&service, root), loaded, "a file outside the packages reloaded");
+        assert_eq!(answer(&loose), answer_of_a_fresh_load(root, "target"));
+
+        write_file(&base_manifest, &format!("{}\n[features]\nextra = []\n", package("base", "")));
+        service
+            .find_references_by_name_with_exact(root, "target", true)
+            .expect("query after a manifest edit");
+        let reloaded = loaded_at(&service, root);
+        assert_ne!(reloaded, loaded, "an edited Cargo.toml must reload");
+
+        write_file(
+            &root.join("crates/user/Cargo.toml"),
+            &package("user", "base = { path = \"../base\" }\n"),
+        );
+        write_file(
+            &root.join("crates/user/src/lib.rs"),
+            "pub fn user() {\n    base::target();\n}\n",
+        );
+        let with_user = service
+            .find_references_by_name_with_exact(root, "target", true)
+            .expect("query after a new package");
+        assert_ne!(loaded_at(&service, root), reloaded, "a new package must reload");
+        assert_eq!(
+            refs_in(&with_user, "crates/user/src/lib.rs"),
+            1,
+            "the new package's call must be found: {with_user:?}"
         );
     }
 
@@ -3867,21 +4263,22 @@ pub fn hooked() {
         assert!(rounds > 0, "the work phase ran no round");
     }
 
-    /// How high does RSS go while a project that gained a file is reloaded?
+    /// How high does RSS go while a project whose manifest changed is reloaded?
     ///
-    /// A file added or removed under a loaded project is a structural change:
-    /// `refresh_if_stale` reloads the whole analysis. If the old database is
+    /// A changed manifest under a loaded project is a structural change:
+    /// `refresh_if_stale` reloads the whole analysis (until `apply_tree_change`
+    /// an added `.rs` file did too, which is how the peak was found). If the old database is
     /// still in `projects` while the new one is built, the reload's peak is
     /// both of them — on a ~49 000-file workspace the allocator probe's work phase went from
     /// ≈ 8 to ≈ 11 GiB whenever a neighbour's edit added a file mid-run.
     ///
     /// The probe loads the project with the kernel's peak counter reset
-    /// (`clear_refs` 5), so the first load's climb is known; then adds a file,
-    /// queries again — which reloads — and compares the reload's peak with
-    /// that climb. One database at a time keeps the reload at the load's own
-    /// peak; two put the whole held database under it.
+    /// (`clear_refs` 5), so the first load's climb is known; then touches the
+    /// manifest, queries again — which reloads — and compares the reload's
+    /// peak with that climb. One database at a time keeps the reload at the
+    /// load's own peak; two put the whole held database under it.
     ///
-    /// The project is MUTATED (a file is added and removed again), so point it
+    /// The project is MUTATED (the manifest is edited and restored), so point it
     /// at a scratch copy, never at a tree someone else works in.
     ///
     /// ```text
@@ -3929,12 +4326,15 @@ pub fn hooked() {
         reset_peak();
         let baseline = kib("VmHWM:");
 
-        // A module nobody declares is still a new `.rs` file under the root:
-        // the stamps see it and the next query reloads.
-        let added = project.join("src/reload_peak_probe.rs");
-        std::fs::write(&added, "pub fn reload_peak_probe() {}\n").expect("add a file");
+        // A comment appended to the root manifest changes its stamp, and a
+        // manifest change is what still reloads (a new `.rs` file is patched in
+        // since `apply_tree_change`).
+        let manifest = project.join("Cargo.toml");
+        let manifest_text = std::fs::read_to_string(&manifest).expect("read the root manifest");
+        std::fs::write(&manifest, format!("{manifest_text}\n# reload_peak_probe\n"))
+            .expect("touch the manifest");
         let second = service.find_references_by_name_with_exact(&project, &symbol, true);
-        std::fs::remove_file(&added).expect("remove the added file");
+        std::fs::write(&manifest, manifest_text).expect("restore the manifest");
         let second = second.expect("reference search after the reload");
         let peak = kib("VmHWM:");
         println!(

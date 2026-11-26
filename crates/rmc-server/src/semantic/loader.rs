@@ -7,25 +7,77 @@ use ra_ap_ide_db::base_db::file_text_store::FileTextStore;
 use ra_ap_ide_db::base_db::{AbsPathBuf, Crate, SourceDatabase, all_crates, salsa};
 use ra_ap_ide_db::prime_caches::parallel_prime_caches;
 use ra_ap_load_cargo::{
-    LoadCargoConfig, ProcMacroServerChoice, load_workspace_into_db, project_workspace_at,
+    LoadCargoConfig, ProcMacroServerChoice, ProjectFolders, SourceRootConfig,
+    load_workspace_into_db, project_workspace_at,
 };
 use ra_ap_project_model::{CargoConfig, CargoFeatures, RustLibSource};
-use ra_ap_vfs::Vfs;
+use ra_ap_vfs::{Vfs, VfsPath};
 use std::collections::HashSet;
 use std::path::Path;
 
 use crate::mcp::project_paths::data_dir;
 
+/// Where a load put files: which directories its file loader read, and how
+/// their files were cut into source roots. Kept beside the database so a file
+/// added afterwards goes where a reload would put it, without the reload —
+/// see `refresh_if_stale` in the parent module.
+///
+/// This is what rust-analyzer's own main loop keeps for the same purpose
+/// (`GlobalState::{vfs_config, source_root_config}`): a created file the
+/// watcher reports is loaded when one of the loader's entries contains it, and
+/// the roots are re-cut from the configuration, not by reloading the
+/// workspace.
+#[derive(Default)]
+pub(crate) struct SourceLayout {
+    /// The prefix map from paths to source root indices, and which of them are
+    /// local. Indices are fixed for the life of the load: the partition always
+    /// has one set per configured root plus the catch-all.
+    roots: SourceRootConfig,
+    /// The loader's entries: directories with their extensions and excludes
+    /// (`target/`, `.git`), plus single files.
+    load: Vec<ra_ap_vfs::loader::Entry>,
+}
+
+impl SourceLayout {
+    fn of(folders: ProjectFolders) -> Self {
+        SourceLayout {
+            roots: folders.source_root_config,
+            load: folders.load,
+        }
+    }
+
+    /// Whether the file loader of a fresh load would read `path` — the test
+    /// rust-analyzer applies to a file its watcher reports as created.
+    pub(crate) fn loads(&self, path: &Path) -> bool {
+        let Some(path) = path
+            .to_str()
+            .and_then(|path| AbsPathBuf::try_from(path).ok())
+        else {
+            return false;
+        };
+        self.load.iter().any(|entry| entry.contains_file(&path))
+    }
+
+    /// The index of the source root `path` belongs to, or `None` for the
+    /// catch-all set of files under no configured root.
+    pub(crate) fn root_of(&self, path: &VfsPath) -> Option<usize> {
+        self.roots.fsc.classify_path(path)
+    }
+}
+
+/// What a load returns: the database, the paths of its files, and where files go.
+pub(crate) type Loaded = (AnalysisHost, Vfs, SourceLayout);
+
 /// Load a Cargo project for semantic analysis
 ///
 /// Uses no_deps=true for fast loading (~120ms).
 /// Only local project code is analyzed.
-pub(crate) fn load_project(path: &Path) -> Result<(AnalysisHost, Vfs)> {
+pub(crate) fn load_project(path: &Path) -> Result<Loaded> {
     load_project_with_config(path, fast_project_cargo_config())
 }
 
 /// Load a Cargo project with full workspace dependency edges for rename.
-pub(super) fn load_project_full(path: &Path) -> Result<(AnalysisHost, Vfs)> {
+pub(super) fn load_project_full(path: &Path) -> Result<Loaded> {
     load_project_with_config(path, full_workspace_cargo_config()?)
 }
 
@@ -120,18 +172,21 @@ fn parse_build_scripts(value: Option<&str>) -> bool {
     )
 }
 
-fn load_project_with_config(path: &Path, cargo_config: CargoConfig) -> Result<(AnalysisHost, Vfs)> {
-    let (mut db, vfs) = load_unprimed(path, &cargo_config)?;
+fn load_project_with_config(path: &Path, cargo_config: CargoConfig) -> Result<Loaded> {
+    let (mut db, vfs, layout) = load_unprimed(path, &cargo_config)?;
 
     prime_in_batches(&mut db, prime_batch_files(), num_cpus::get_physical());
 
     let host = AnalysisHost::with_database(db);
 
-    Ok((host, vfs))
+    Ok((host, vfs, layout))
 }
 
 /// The workspace loaded into a database, caches cold.
-fn load_unprimed(path: &Path, cargo_config: &CargoConfig) -> Result<(RootDatabase, Vfs)> {
+fn load_unprimed(
+    path: &Path,
+    cargo_config: &CargoConfig,
+) -> Result<(RootDatabase, Vfs, SourceLayout)> {
     let load_config = LoadCargoConfig {
         load_out_dirs_from_check: build_scripts_enabled(),
         with_proc_macro_server: ProcMacroServerChoice::None,
@@ -156,10 +211,19 @@ fn load_unprimed(path: &Path, cargo_config: &CargoConfig) -> Result<(RootDatabas
     if let Some(store) = file_text_store()? {
         db.set_file_text_store(store);
     }
+    // The same call `load_workspace_into_db` makes on the same workspace (it is
+    // a pure function of it), made here because that function keeps its
+    // result to itself. Paths only — the workspace's package roots, nothing read
+    // from disk.
+    let layout = SourceLayout::of(ProjectFolders::new(
+        std::slice::from_ref(&workspace),
+        &[],
+        None,
+    ));
     let (vfs, _) =
         load_workspace_into_db(workspace, &cargo_config.extra_env, &load_config, &mut db)
             .context("Failed to load workspace")?;
-    Ok((db, vfs))
+    Ok((db, vfs, layout))
 }
 
 /// Per-query LRU capacities applied at load, before any memo exists:
@@ -436,7 +500,7 @@ mod tests {
         );
         write_file(&root.join("top/src/lib.rs"), "pub use base::Base;\n");
 
-        let (db, _vfs) = load_unprimed(
+        let (db, _vfs, _layout) = load_unprimed(
             root,
             &full_workspace_cargo_config().expect("the default config"),
         )
@@ -575,7 +639,8 @@ mod tests {
                 load_weak_only_optional_deps: load_weak,
                 ..full_workspace_cargo_config().expect("the default config")
             };
-            let (db, _vfs) = load_unprimed(&root.join("ws"), &config).expect("load the fixture");
+            let (db, _vfs, _layout) =
+                load_unprimed(&root.join("ws"), &config).expect("load the fixture");
             all_crates(&db)
                 .iter()
                 .filter_map(|krate| {
@@ -603,10 +668,16 @@ mod tests {
         use super::{apply_query_lru_capacities, parse_query_lru_capacities};
 
         assert!(parse_query_lru_capacities(None).expect("unset").is_empty());
-        assert!(parse_query_lru_capacities(Some(" ")).expect("blank").is_empty());
+        assert!(
+            parse_query_lru_capacities(Some(" "))
+                .expect("blank")
+                .is_empty()
+        );
         assert_eq!(
-            parse_query_lru_capacities(Some("MacroCallId::macro_arg_=0, EditionedFileId::parse_=64"))
-                .expect("two pairs"),
+            parse_query_lru_capacities(Some(
+                "MacroCallId::macro_arg_=0, EditionedFileId::parse_=64"
+            ))
+            .expect("two pairs"),
             vec![
                 ("MacroCallId::macro_arg_".to_owned(), 0),
                 ("EditionedFileId::parse_".to_owned(), 64)
@@ -620,8 +691,12 @@ mod tests {
         // the fork's `lru` attribute it is not, and the override fails loudly.
         apply_query_lru_capacities(&mut db, &[("MacroCallId::macro_arg_".to_owned(), 0)])
             .expect("`macro_arg` carries an LRU in the fork");
-        let error = apply_query_lru_capacities(&mut db, &[("MacroCallId::macro_arg".to_owned(), 1)])
-            .expect_err("the name without salsa's trailing `_` matches nothing");
-        assert!(error.to_string().contains("MacroCallId::macro_arg_"), "{error}");
+        let error =
+            apply_query_lru_capacities(&mut db, &[("MacroCallId::macro_arg".to_owned(), 1)])
+                .expect_err("the name without salsa's trailing `_` matches nothing");
+        assert!(
+            error.to_string().contains("MacroCallId::macro_arg_"),
+            "{error}"
+        );
     }
 }

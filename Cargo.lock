@@ -7210,6 +7210,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "triomphe",
  "vfs",
 ]
 
