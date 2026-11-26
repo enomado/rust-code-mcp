@@ -22,7 +22,7 @@ pub(crate) struct FileContentParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct FindDefinitionParams {
-    #[schemars(description = "Symbol name to find the definition for (function, struct, trait, const, etc.)")]
+    #[schemars(description = "Symbol name to find the definition for (function, struct, trait, const, etc.). An item of std or a dependency is named by its path: `std::thread::spawn`.")]
     pub symbol_name: String,
     #[schemars(description = "Project root directory containing Cargo.toml")]
     pub directory: String,
@@ -33,7 +33,7 @@ pub(crate) struct FindDefinitionParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct FindReferencesParams {
-    #[schemars(description = "Symbol name to find all references for")]
+    #[schemars(description = "Symbol name to find all references for. An item of std or a dependency is named by its path (`std::thread::spawn`); its references are searched in the project's own files.")]
     pub symbol_name: String,
     #[schemars(description = "Project root directory containing Cargo.toml")]
     pub directory: String,

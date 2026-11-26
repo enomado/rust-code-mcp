@@ -2532,6 +2532,159 @@ pub fn a_local_of_the_same_name() -> u32 {
         );
     }
 
+    /// A crate declaring `spawn` once and calling it once, behind sixty
+    /// functions whose names hold `s…p…a…w…n` as a subsequence and sort before
+    /// it — the shape of a real workspace's long test names.
+    fn crowded_name_workspace(root: &Path) {
+        write_file(
+            &root.join("Cargo.toml"),
+            r#"
+[package]
+name = "crowded_probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+        );
+        let decoys: String = (0..60)
+            .map(|i| format!("pub fn a_s_p_a_w_n_decoy_{i}() {{}}\n"))
+            .collect();
+        write_file(
+            &root.join("src/lib.rs"),
+            &format!("{decoys}\npub fn spawn() {{}}\n\npub fn caller() {{\n    spawn();\n}}\n"),
+        );
+    }
+
+    /// The fuzzy query filled its `limit` with names that merely hold the
+    /// letters in order, in the index's lexicographic order, and the full-name
+    /// filter ran after that cut: on a 4000-file workspace `spawn` (declared
+    /// three times) answered "no definition found" and "no references found".
+    #[test]
+    fn a_full_name_is_not_crowded_out_by_fuzzy_matches() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        crowded_name_workspace(root);
+
+        let service = SemanticService::new();
+        let exact = service
+            .symbol_search_with_exact(root, "spawn", 8, true)
+            .expect("exact definition query");
+        assert_eq!(exact.len(), 1, "`spawn` is declared exactly once, got {exact:?}");
+        assert_eq!(exact[0].name, "spawn");
+
+        let fuzzy = service
+            .symbol_search_with_exact(root, "spawn", 8, false)
+            .expect("fuzzy definition query");
+        assert_eq!(fuzzy.len(), 8, "the fuzzy matches still fill the limit, got {fuzzy:?}");
+        assert!(
+            fuzzy[0].exact && fuzzy[0].name == "spawn",
+            "the full-name match leads the fuzzy answer, got {fuzzy:?}"
+        );
+
+        let references = service
+            .find_references_by_name_with_exact(root, "spawn", true)
+            .expect("exact references query");
+        assert_eq!(
+            call_sites(&references),
+            1,
+            "the one call of `spawn`, got {references:?}"
+        );
+    }
+
+    /// `std::thread::spawn` called twice — by full path and through the
+    /// imported module — next to two things spelled `spawn` that are not it: a
+    /// local function and `Builder::spawn`.
+    fn std_spawn_workspace(root: &Path) {
+        write_file(
+            &root.join("Cargo.toml"),
+            r#"
+[package]
+name = "std_spawn_probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+        );
+        write_file(
+            &root.join("src/lib.rs"),
+            r#"
+use std::thread;
+
+pub fn spawn() {}
+
+pub fn by_path() {
+    std::thread::spawn(|| {}).join().unwrap();
+}
+
+pub fn by_module() {
+    thread::spawn(|| {}).join().unwrap();
+}
+
+pub fn not_it() {
+    spawn();
+    thread::Builder::new().spawn(|| {}).unwrap().join().unwrap();
+}
+"#,
+        );
+    }
+
+    /// Whether a location is inside the sysroot's `std::thread` sources.
+    fn in_std_thread(location: &Location) -> bool {
+        location
+            .file_path
+            .to_string_lossy()
+            .contains("library/std/src/thread")
+    }
+
+    /// A path query names an item outside the workspace. Every hit was marked
+    /// `exact=false` (its name, `spawn`, compared against the whole path), so
+    /// `exact=true` dropped them all; and the references of a library item
+    /// were never looked for.
+    #[test]
+    fn a_std_function_is_defined_and_referenced_by_its_path() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        std_spawn_workspace(root);
+
+        let service = SemanticService::new();
+        let definitions = service
+            .symbol_search_with_exact(root, "std::thread::spawn", 8, true)
+            .expect("definition query");
+        assert!(!definitions.is_empty(), "std::thread::spawn must be found");
+        assert!(
+            definitions
+                .iter()
+                .all(|d| d.exact && d.name == "spawn" && in_std_thread(d)),
+            "full-name matches in std::thread only, got {definitions:?}"
+        );
+
+        let found = service
+            .find_references_by_name_with_exact(root, "std::thread::spawn", true)
+            .expect("references query");
+        assert_eq!(
+            refs_in(&found, "src/lib.rs"),
+            2,
+            "the full-path and module-path calls, not the local fn or Builder::spawn, got {found:?}"
+        );
+        assert_eq!(
+            call_sites(&found),
+            2,
+            "no reference outside the project, got {found:?}"
+        );
+        let declarations: Vec<&Location> =
+            found.iter().filter(|l| l.name != "reference").collect();
+        assert!(
+            !declarations.is_empty() && declarations.iter().all(|d| in_std_thread(d)),
+            "the declaration reported is std's, got {declarations:?}"
+        );
+    }
+
     /// Untouched code must not pay for the check: same stamps, no reload, and
     /// crucially the same answer.
     #[test]

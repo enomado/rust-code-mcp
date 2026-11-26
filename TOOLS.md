@@ -160,7 +160,8 @@ Found 1 definition(s) for 'RustParser':
 **Notes:**
 - First query triggers lazy loading of rust-analyzer (~120ms)
 - Subsequent queries are instant (<10ms)
-- Only searches local project code (not dependencies)
+- A bare name searches the project's own code; an item of std or a dependency is found by its path: `std::thread::spawn`, `tokio::spawn`. Hits are named by the path's last segment, which is what `exact` compares.
+- `exact=true` asks the index for full-name matches directly, so a short name (`new`, `spawn`) is not crowded out by long names that merely contain its letters.
 
 ---
 
@@ -192,6 +193,9 @@ Found 21 reference(s) for 'RustParser':
 /path/to/project/src/parser/mod.rs:121:12 (RustParser)
 ...
 ```
+
+**Notes:**
+- Name an item of std or a dependency by its path (`std::thread::spawn`): its references are collected from the project's own files only — each occurrence of the name is resolved with goto-definition and kept if it lands on that item, so `Builder::spawn` or a local `fn spawn` do not count. The declaration line points into the library's sources.
 
 ---
 

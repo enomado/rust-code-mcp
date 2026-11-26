@@ -5,7 +5,7 @@ use ra_ap_ide::{
     Analysis, AnalysisHost, FilePosition, LineCol, NavigationTarget, Query, SymbolKind, TextSize,
 };
 use ra_ap_vfs::{Vfs, VfsPath};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// A source code location
@@ -105,6 +105,37 @@ fn nav_target_to_location(
     })
 }
 
+/// The one goto-definition configuration this module uses.
+fn goto_config() -> ra_ap_ide::GotoDefinitionConfig<'static> {
+    ra_ap_ide::GotoDefinitionConfig {
+        ra_fixture: ra_ap_ide_db::ra_fixture::RaFixtureConfig::default(),
+    }
+}
+
+/// Where a navigation target points: its name if it has one, else its whole span.
+fn nav_offset(nav: &NavigationTarget) -> TextSize {
+    nav.focus_range.unwrap_or(nav.full_range).start()
+}
+
+/// Identity of a declaration for comparing answers of different queries: the
+/// file and the offset `nav_offset` picks. Two navigation targets with the same
+/// key are the same declaration.
+fn nav_key(nav: &NavigationTarget) -> (ra_ap_vfs::FileId, TextSize) {
+    (nav.file_id, nav_offset(nav))
+}
+
+/// The item name a query asks about: the last segment of a path query
+/// (`std::thread::spawn` → `spawn`), the query itself otherwise.
+///
+/// rust-analyzer's symbol index takes the path apart itself — the leading
+/// segments pick the modules, the last one is matched against item names — so
+/// a found symbol is named by the last segment only. Comparing that name with
+/// the whole query marked every hit of a path query `exact=false`, and
+/// `exact=true` then dropped all of them.
+fn leaf_name(symbol_name: &str) -> &str {
+    symbol_name.rsplit("::").next().unwrap()
+}
+
 /// Goto definition at position
 pub(crate) fn goto_definition(
     host: &AnalysisHost,
@@ -115,12 +146,9 @@ pub(crate) fn goto_definition(
 ) -> Result<Vec<Location>> {
     let analysis = host.analysis();
     let position = file_position(&analysis, vfs, file_path, line, column)?;
-    let config = ra_ap_ide::GotoDefinitionConfig {
-        ra_fixture: ra_ap_ide_db::ra_fixture::RaFixtureConfig::default(),
-    };
 
     let result = analysis
-        .goto_definition(position, &config)
+        .goto_definition(position, &goto_config())
         .context("goto_definition query failed")?;
 
     match result {
@@ -317,14 +345,14 @@ pub(crate) fn symbol_search_with_exact(
     limit: usize,
     exact_only: bool,
 ) -> Result<Vec<Location>> {
-    let mut locations = index_matches(&analysis, vfs, symbol_name, limit)?;
+    let mut locations = index_matches(&analysis, vfs, symbol_name, limit, exact_only)?;
 
     if !locations.iter().any(|location| location.exact) {
         collect_by_token_scan(
             &analysis,
             vfs,
             project_root,
-            symbol_name,
+            leaf_name(symbol_name),
             Wants::DeclOnly,
             &mut locations,
         )?;
@@ -351,20 +379,68 @@ fn index_matches(
     vfs: &Vfs,
     symbol_name: &str,
     limit: usize,
+    exact_only: bool,
 ) -> Result<Vec<Location>> {
-    let query = Query::new(symbol_name.to_string());
-    let results = analysis
-        .symbol_search(query, limit)
-        .context("symbol_search query failed")?;
-
-    results
+    let name = leaf_name(symbol_name);
+    index_navs(analysis, symbol_name, limit, exact_only)?
         .iter()
         .map(|target| {
             let mut location = nav_target_to_location(vfs, analysis, target)?;
-            location.exact = location.name == symbol_name;
+            location.exact = location.name == name;
             Ok(location)
         })
         .collect()
+}
+
+/// The symbol index's declarations for a name: full-name matches first, then —
+/// unless `exact_only` — fuzzy matches up to `limit`.
+///
+/// # Why two queries
+///
+/// A fuzzy query matches the name as a *subsequence* and comes back in the
+/// index's lexicographic order, cut at `limit`. Any long name that happens to
+/// contain the letters in order sorts ahead: on a 4000-file workspace the first
+/// 50 fuzzy hits for `spawn` were test functions like
+/// `a_batch_builds_one_record_with_a_channel_per_taken_row_or_none`, and the
+/// three functions actually named `spawn` were cut off. Filtering for full
+/// names after that cut then answered "no definition found" for a name declared
+/// three times. The exact query cannot be crowded out that way; the fuzzy one
+/// only fills what is left.
+///
+/// The exact query is case-insensitive in the index, so it is filtered to the
+/// case-sensitive name when `exact_only` asks for full-name matches.
+fn index_navs(
+    analysis: &Analysis,
+    symbol_name: &str,
+    limit: usize,
+    exact_only: bool,
+) -> Result<Vec<NavigationTarget>> {
+    let name = leaf_name(symbol_name);
+    let mut exact_query = Query::new(symbol_name.to_string());
+    exact_query.exact();
+    let mut navs: Vec<NavigationTarget> = analysis
+        .symbol_search(exact_query, limit)
+        .context("symbol_search query failed")?
+        .into_iter()
+        .filter(|nav| !exact_only || nav.name.as_str() == name)
+        .collect();
+    navs.sort_by_key(|nav| nav.name.as_str() != name);
+
+    if !exact_only && navs.len() < limit {
+        let mut seen: HashSet<_> = navs.iter().map(nav_key).collect();
+        let fuzzy = analysis
+            .symbol_search(Query::new(symbol_name.to_string()), limit)
+            .context("symbol_search query failed")?;
+        for nav in fuzzy {
+            if navs.len() == limit {
+                break;
+            }
+            if seen.insert(nav_key(&nav)) {
+                navs.push(nav);
+            }
+        }
+    }
+    Ok(navs)
 }
 
 /// The index's answer with the sweep deliberately not run — the mutant that
@@ -377,7 +453,7 @@ pub(crate) fn index_only_search(
     symbol_name: &str,
     limit: usize,
 ) -> Result<Vec<Location>> {
-    let matches = index_matches(&analysis, vfs, symbol_name, limit)?;
+    let matches = index_matches(&analysis, vfs, symbol_name, limit, true)?;
     Ok(rank_and_filter_exact(matches, true))
 }
 
@@ -415,33 +491,40 @@ pub(crate) fn find_references_by_name_with_exact(
     symbol_name: &str,
     exact_only: bool,
 ) -> Result<Vec<Location>> {
-    // First, find all symbols matching the name
-    let query = Query::new(symbol_name.to_string());
-    let mut symbols = analysis
-        .symbol_search(query, 50)
-        .context("symbol_search query failed")?;
-    symbols.sort_by_key(|symbol| symbol.name.to_string() != symbol_name);
+    let name = leaf_name(symbol_name);
+    // First, find all symbols matching the name, full-name matches first.
+    let symbols = index_navs(analysis, symbol_name, 50, exact_only)?;
 
     let mut all_locations = Vec::new();
     let mut resolved_the_name = false;
+    let mut library_symbols = Vec::new();
 
     // For each symbol found, find its references
     for symbol in &symbols {
-        let symbol_exact = symbol.name.to_string() == symbol_name;
+        let symbol_exact = symbol.name.as_str() == name;
         if exact_only && !symbol_exact {
             continue;
         }
         resolved_the_name |= symbol_exact;
 
-        // Get the position of this symbol definition
-        let file_id = symbol.file_id;
-        let offset = symbol.focus_range.unwrap_or(symbol.full_range).start();
-        let position = FilePosition { file_id, offset };
+        if analysis
+            .is_library_file(symbol.file_id)
+            .context("is_library_file query failed")?
+        {
+            library_symbols.push((symbol, symbol_exact));
+            continue;
+        }
 
+        let position = FilePosition {
+            file_id: symbol.file_id,
+            offset: nav_offset(symbol),
+        };
         if let Some((_, harvest)) = harvest_refs_at(&analysis, vfs, position, symbol_exact)? {
             all_locations.extend(harvest.into_all());
         }
     }
+
+    collect_library_refs(analysis, vfs, project_root, &library_symbols, &mut all_locations)?;
 
     // The symbol index carries module-scope declarations plus impl and trait
     // members. It does NOT carry fields — a struct's, a union's, or a
@@ -454,7 +537,7 @@ pub(crate) fn find_references_by_name_with_exact(
             &analysis,
             vfs,
             project_root,
-            symbol_name,
+            name,
             Wants::DeclAndRefs,
             &mut all_locations,
         )?;
@@ -515,26 +598,11 @@ fn collect_by_token_scan(
     wants: Wants,
     out: &mut Vec<Location>,
 ) -> Result<()> {
-    // Sorted, because the VFS hands files back in load order: two runs that
-    // probe different occurrences first would otherwise answer in different
-    // order.
-    let mut files: Vec<ra_ap_vfs::FileId> = vfs
-        .iter()
-        .filter(|(_, path)| {
-            path.as_path().is_some_and(|path| {
-                let path: &Path = path.as_ref();
-                path.extension().is_some_and(|ext| ext == "rs") && path.starts_with(project_root)
-            })
-        })
-        .map(|(file_id, _)| file_id)
-        .collect();
-    files.sort();
-
     // Positions already accounted for, so a definition reached through its
     // first occurrence is not re-queried through its remaining twenty.
     let mut covered: HashSet<(PathBuf, u32, u32)> = out.iter().map(location_key).collect();
 
-    for file_id in files {
+    for file_id in project_rust_files(vfs, project_root) {
         let text = analysis.file_text(file_id)?;
         let line_index = analysis.file_line_index(file_id)?;
         let file_path = file_path_of(vfs, file_id)?;
@@ -577,6 +645,126 @@ fn collect_by_token_scan(
         }
     }
 
+    Ok(())
+}
+
+/// The `.rs` files under `project_root` the analysis knows, sorted.
+///
+/// Sorted, because the VFS hands files back in load order: two runs that probe
+/// different occurrences first would otherwise answer in different order.
+fn project_rust_files(vfs: &Vfs, project_root: &Path) -> Vec<ra_ap_vfs::FileId> {
+    let mut files: Vec<ra_ap_vfs::FileId> = vfs
+        .iter()
+        .filter(|(_, path)| {
+            path.as_path().is_some_and(|path| {
+                let path: &Path = path.as_ref();
+                path.extension().is_some_and(|ext| ext == "rs") && path.starts_with(project_root)
+            })
+        })
+        .map(|(file_id, _)| file_id)
+        .collect();
+    files.sort();
+    files
+}
+
+/// References inside the project to declarations that live in a library — the
+/// sysroot (`std::thread::spawn`) or a dependency — plus those declarations.
+///
+/// # Why not `find_all_refs` from the declaration
+///
+/// rust-analyzer scopes a search for a public item to every crate that depends
+/// on the item's crate. For an item of `std` that is the entire crate graph: on
+/// a workspace with ~2000 packages, every dependency's sources would be scanned
+/// for the name and every candidate in them type-checked — in the daemon's
+/// shared memory, for answers outside the project that are then thrown away.
+///
+/// So the question is turned around: each occurrence of the name in the
+/// project's own files is asked where it goes (`goto_definition`), and kept if
+/// it lands on the wanted declaration. The scope is the project by
+/// construction, and the per-occurrence answer is exact — a method of the same
+/// name on another type (`Builder::spawn` next to `thread::spawn`), a local
+/// binding or a word in a comment goes elsewhere or nowhere.
+///
+/// A symbol the index returns can be a re-export (`pub use functions::spawn`
+/// in `std::thread`): what is wanted is what it resolves to, so each symbol is
+/// put through `goto_definition` too, and both it and its targets count as a
+/// hit. The declarations reported are the resolved targets.
+fn collect_library_refs(
+    analysis: &Analysis,
+    vfs: &Vfs,
+    project_root: &Path,
+    symbols: &[(&NavigationTarget, bool)],
+    out: &mut Vec<Location>,
+) -> Result<()> {
+    if symbols.is_empty() {
+        return Ok(());
+    }
+
+    // Declaration key → whether a full-name match led to it.
+    let mut wanted: HashMap<(ra_ap_vfs::FileId, TextSize), bool> = HashMap::new();
+    let mut declarations: Vec<(NavigationTarget, bool)> = Vec::new();
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for &(symbol, exact) in symbols {
+        names.insert(symbol.name.to_string());
+        *wanted.entry(nav_key(symbol)).or_default() |= exact;
+        let position = FilePosition {
+            file_id: symbol.file_id,
+            offset: nav_offset(symbol),
+        };
+        // `None` or empty: the symbol is itself the declaration.
+        let targets = analysis
+            .goto_definition(position, &goto_config())
+            .context("goto_definition query failed")?
+            .map(|info| info.info)
+            .filter(|targets| !targets.is_empty())
+            .unwrap_or_else(|| vec![symbol.clone()]);
+        for target in targets {
+            *wanted.entry(nav_key(&target)).or_default() |= exact;
+            declarations.push((target, exact));
+        }
+    }
+
+    // The final dedup of the caller keeps the first of a position after
+    // ranking exact first, so a declaration reached twice is reported once.
+    for (declaration, exact) in &declarations {
+        let mut location = nav_target_to_location(vfs, analysis, declaration)?;
+        location.exact = *exact;
+        out.push(location);
+    }
+
+    for file_id in project_rust_files(vfs, project_root) {
+        let text = analysis.file_text(file_id)?;
+        let line_index = analysis.file_line_index(file_id)?;
+        let file_path = file_path_of(vfs, file_id)?;
+        for name in &names {
+            for start in identifier_occurrences(&text, name) {
+                // One character into the identifier, as in the token sweep.
+                let inside = if name.len() > 1 { start + 1 } else { start };
+                let position = FilePosition {
+                    file_id,
+                    offset: TextSize::new(inside as u32),
+                };
+                let Some(info) = analysis
+                    .goto_definition(position, &goto_config())
+                    .context("goto_definition query failed")?
+                else {
+                    continue;
+                };
+                let Some(&exact) = info.info.iter().find_map(|target| wanted.get(&nav_key(target)))
+                else {
+                    continue;
+                };
+                let line_col = line_index.line_col(TextSize::new(start as u32));
+                out.push(Location {
+                    file_path: file_path.clone(),
+                    line: line_col.line + 1,
+                    column: line_col.col + 1,
+                    name: "reference".to_string(),
+                    exact,
+                });
+            }
+        }
+    }
     Ok(())
 }
 
