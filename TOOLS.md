@@ -162,6 +162,7 @@ Found 1 definition(s) for 'RustParser':
 - Subsequent queries are instant (<10ms)
 - A bare name searches the project's own code; an item of std or a dependency is found by its path: `std::thread::spawn`, `tokio::spawn`. Hits are named by the path's last segment, which is what `exact` compares.
 - `exact=true` asks the index for full-name matches directly, so a short name (`new`, `spawn`) is not crowded out by long names that merely contain its letters.
+- A name the index lacks (a struct field) is looked for by a sweep over the project's files, bounded like `find_references`' (`RMC_SWEEP_BUDGET_SECS`); a cut answer starts with `INCOMPLETE:`.
 
 ---
 
@@ -195,7 +196,8 @@ Found 21 reference(s) for 'RustParser':
 ```
 
 **Notes:**
-- Name an item of std or a dependency by its path (`std::thread::spawn`): its references are collected from the project's own files only — each occurrence of the name is resolved with goto-definition and kept if it lands on that item, so `Builder::spawn` or a local `fn spawn` do not count. The declaration line points into the library's sources.
+- Name an item of std or a dependency by its path (`std::thread::spawn`): its references are collected from the project's own files only — each occurrence of the name is resolved with goto-definition and kept if it lands on that item, so `Builder::spawn` or a local `fn spawn` do not count. The declaration line points into the library's sources. Only library items whose name matches in full are searched this way; a loose (fuzzy) library hit is not.
+- **Time budget.** The two file sweeps — the library-item sweep above and the token sweep for names the symbol index lacks (struct fields) — stop after `RMC_SWEEP_BUDGET_SECS` (default 30 s; the same budget applies to `find_definition`'s token sweep). A cut answer lists what was found until then and says so on its first and last lines: `INCOMPLETE: Found N reference(s) …` / `INCOMPLETE: time budget of 30 s exhausted in the library-item sweep: K of M project files searched …`. Narrow the query (`exact=true`, a full path) and ask again. The daemon log gets a `… is INCOMPLETE` line for the call.
 
 ---
 

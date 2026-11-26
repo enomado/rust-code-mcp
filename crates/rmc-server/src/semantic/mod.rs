@@ -5,7 +5,7 @@ mod loader;
 /// next query pays for them. Measurement only, so it ships with the tests.
 #[cfg(test)]
 mod lru_sweep;
-mod position;
+pub(crate) mod position;
 mod rename;
 
 use std::collections::HashMap;
@@ -816,11 +816,43 @@ fn bring_up_to_date(
         None => true,
     };
     if needs_load {
-        load_into(slot, context, canonical, requested)
+        let reason = if context.is_some() {
+            LoadReason::FastToFull
+        } else {
+            LoadReason::NotLoaded
+        };
+        load_into(slot, context, canonical, requested, reason)
     } else {
         // Cached — but "cached" said nothing about "current" until this call
         // existed. See [`refresh_if_stale`].
         refresh_if_stale(slot, context, canonical, requested)
+    }
+}
+
+/// Why a project is (re)loaded — the `because …` of its `analysis load` line,
+/// so a slow call that paid for a load can be told apart by cause
+/// (`--tool-latency` counts loads per reason).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadReason {
+    /// Nothing in the slot: first use, or evicted / cleared since.
+    NotLoaded,
+    /// A `Full` query on a `Fast` context.
+    FastToFull,
+    /// `.rs` files appeared or disappeared since the load
+    /// ([`Staleness::StructureChanged`]).
+    FilesAddedOrRemoved,
+    /// Edited files could not be patched into the database.
+    CannotPatch,
+}
+
+impl LoadReason {
+    fn as_log_text(self) -> &'static str {
+        match self {
+            LoadReason::NotLoaded => "not loaded",
+            LoadReason::FastToFull => "fast to full",
+            LoadReason::FilesAddedOrRemoved => "files added or removed",
+            LoadReason::CannotPatch => "cannot patch edits",
+        }
     }
 }
 
@@ -829,6 +861,7 @@ fn load_into(
     context: &mut Option<ProjectContext>,
     canonical: &Path,
     requested: LoadKind,
+    reason: LoadReason,
 ) -> Result<()> {
     tracing::info!(
         "Loading {:?} IDE for project: {}",
@@ -841,9 +874,10 @@ fn load_into(
     // says which load ended. `--tool-latency` reads it to tell a query's own
     // load (cost) from another project's (it must not be waited for).
     let mem = rmc_engine::mem_trace::MemSpan::start(format!(
-        "analysis load {:?} of {}",
+        "analysis load {:?} of {} because {}",
         requested,
-        canonical.display()
+        canonical.display(),
+        reason.as_log_text()
     ));
     // Stamps are taken BEFORE the load, not after: a file edited while
     // rust-analyzer was reading the workspace must come out stale on the
@@ -937,7 +971,7 @@ fn refresh_if_stale(
                 "Project {} gained or lost files since it was analysed; reloading",
                 canonical.display()
             );
-            load_into(slot, context, canonical, requested)
+            load_into(slot, context, canonical, requested, LoadReason::FilesAddedOrRemoved)
         }
         Staleness::Edited(paths) => {
             match apply_edits(ctx, &paths).map(|()| ctx.stamps = current) {
@@ -958,7 +992,7 @@ fn refresh_if_stale(
                         "Cannot patch {} incrementally ({e}); reloading",
                         canonical.display()
                     );
-                    load_into(slot, context, canonical, requested)
+                    load_into(slot, context, canonical, requested, LoadReason::CannotPatch)
                 }
             }
         }
@@ -1539,6 +1573,29 @@ impl SemanticService {
         })
     }
 
+    /// [`Self::symbol_search_with_exact`] with its token sweep bounded by
+    /// `budget` — the served path; see [`Self::find_references_within`].
+    pub(crate) fn symbol_search_within(
+        &self,
+        project_path: &Path,
+        symbol_name: &str,
+        limit: usize,
+        exact: bool,
+        budget: std::time::Duration,
+    ) -> Result<position::SweptAnswer> {
+        self.with_project(project_path, LoadKind::Full, |canonical, analysis, vfs| {
+            position::symbol_search_within(
+                analysis,
+                vfs,
+                canonical,
+                symbol_name,
+                limit,
+                exact,
+                position::SweepBudget::of(budget),
+            )
+        })
+    }
+
     /// The symbol index's own answer, with the source sweep not run.
     ///
     /// Only the survey of "which kinds does the index carry" uses this; the
@@ -1600,6 +1657,31 @@ impl SemanticService {
                 canonical,
                 symbol_name,
                 exact,
+            )
+        })
+    }
+
+    /// [`Self::find_references_by_name_with_exact`] with its file sweeps
+    /// bounded by `budget` — the served path: an unbounded sweep keeps the
+    /// project's slot on its last attempt and every other call waits.
+    ///
+    /// The budget counts from each attempt's start: an attempt a refresh
+    /// cancelled did not hold the slot while it ran.
+    pub(crate) fn find_references_within(
+        &self,
+        project_path: &Path,
+        symbol_name: &str,
+        exact: bool,
+        budget: std::time::Duration,
+    ) -> Result<position::SweptAnswer> {
+        self.with_project(project_path, LoadKind::Full, |canonical, analysis, vfs| {
+            position::find_references_within(
+                analysis,
+                vfs,
+                canonical,
+                symbol_name,
+                exact,
+                position::SweepBudget::of(budget),
             )
         })
     }
@@ -2683,6 +2765,188 @@ pub fn not_it() {
             !declarations.is_empty() && declarations.iter().all(|d| in_std_thread(d)),
             "the declaration reported is std's, got {declarations:?}"
         );
+    }
+
+    /// `std::thread::spawn` called once, next to `add_spawn_hook` — the std
+    /// item the fuzzy query for `std::thread::spawn` also matches (measured,
+    /// `probe_index_hits_for_path_queries`).
+    fn std_spawn_and_scoped_workspace(root: &Path) {
+        write_file(
+            &root.join("Cargo.toml"),
+            r#"
+[package]
+name = "std_scoped_probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+        );
+        write_file(
+            &root.join("src/lib.rs"),
+            r#"
+use std::thread;
+
+pub fn plain() {
+    thread::spawn(|| {}).join().unwrap();
+}
+
+// Unstable, but rust-analyzer resolves it all the same.
+pub fn hooked() {
+    thread::add_spawn_hook(|_| || {});
+}
+"#,
+        );
+    }
+
+    /// A fuzzy query (`exact=false`) for a library item put every loosely
+    /// matching library item into the library sweep: the project was swept
+    /// for each of their names too — slow on a large workspace, and the
+    /// answer carried their call sites (`add_spawn_hook`) as references of
+    /// `spawn`. Only the full-name match is swept; with or without `exact`,
+    /// the one call of `spawn` is the answer.
+    #[test]
+    fn a_fuzzy_query_does_not_sweep_for_library_items_of_other_names() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        std_spawn_and_scoped_workspace(root);
+
+        let service = SemanticService::new();
+        for exact in [true, false] {
+            let found = service
+                .find_references_by_name_with_exact(root, "std::thread::spawn", exact)
+                .expect("references query");
+            let lines: Vec<u32> = found
+                .iter()
+                .filter(|l| l.name == "reference" && l.file_path.ends_with("src/lib.rs"))
+                .map(|l| l.line)
+                .collect();
+            // `thread::spawn(|| {})…` is line 4 of the trimmed fixture.
+            assert_eq!(
+                lines,
+                vec![4],
+                "exact={exact}: the one call of spawn, not add_spawn_hook, got {found:?}"
+            );
+        }
+    }
+
+    /// Probe kept for the record (run with `--ignored --nocapture`): what the
+    /// symbol index returns for path and bare queries. Measured 2026-11-26: a
+    /// `Type::method` path (`App::new`) finds nothing — the index reads the
+    /// leading segments as modules — and a bare local name brings no library
+    /// hits; `std::…` paths do.
+    #[test]
+    #[ignore]
+    fn probe_index_hits_for_path_queries() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        std_spawn_and_scoped_workspace(root);
+        let service = SemanticService::new();
+        service
+            .with_project(root, LoadKind::Full, |_, analysis, _| {
+                for q in ["std::thread::spawn", "thread::Builder::spawn", "spawn"] {
+                    for exact in [true, false] {
+                        let mut query = ra_ap_ide::Query::new(q.to_string());
+                        if exact {
+                            query.exact();
+                        }
+                        let navs = analysis.symbol_search(query, 50).unwrap();
+                        let library = navs
+                            .iter()
+                            .filter(|n| analysis.is_library_file(n.file_id).unwrap())
+                            .count();
+                        let names: Vec<String> =
+                            navs.iter().take(12).map(|n| n.name.to_string()).collect();
+                        eprintln!(
+                            "PROBE {q} exact={exact}: {} hits, {library} in libraries: {names:?}",
+                            navs.len()
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// A sweep out of time answers with what it has and says it is partial;
+    /// with time to spare the same query is complete and finds everything.
+    #[test]
+    fn an_exhausted_sweep_budget_marks_the_answer_incomplete() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        std_spawn_workspace(root);
+
+        let service = SemanticService::new();
+        let cut = service
+            .find_references_within(root, "std::thread::spawn", true, std::time::Duration::ZERO)
+            .expect("references query");
+        let why = cut.incomplete.as_deref().expect("a zero budget is exhausted");
+        // The first loop to look at the clock is the one over index matches.
+        assert!(
+            why.contains("per-match search") && why.contains("0 of 1 index matches"),
+            "{why}"
+        );
+        assert!(cut.locations.is_empty(), "nothing was resolved, got {cut:?}");
+
+        let whole = service
+            .find_references_within(root, "std::thread::spawn", true, std::time::Duration::from_secs(600))
+            .expect("references query");
+        assert!(whole.incomplete.is_none(), "{whole:?}");
+        assert_eq!(refs_in(&whole.locations, "src/lib.rs"), 2, "{whole:?}");
+    }
+
+    /// The token sweep (fields: not in the symbol index) of both tools stops
+    /// at the budget and says so; with time to spare it finds the field.
+    #[test]
+    fn the_token_sweep_of_both_tools_stops_at_the_budget() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        two_crate_oracle_workspace(root);
+        let zero = std::time::Duration::ZERO;
+        let ample = std::time::Duration::from_secs(600);
+
+        let service = SemanticService::new();
+        let refs = service
+            .find_references_within(root, "radius_override", true, zero)
+            .expect("references query");
+        let why = refs.incomplete.as_deref().expect("zero budget: incomplete");
+        assert!(why.contains("token sweep") && why.contains("0 of "), "{why}");
+        assert!(refs.locations.is_empty(), "{refs:?}");
+
+        let defs = service
+            .symbol_search_within(root, "radius_override", 8, true, zero)
+            .expect("definition query");
+        assert!(defs.incomplete.is_some() && defs.locations.is_empty(), "{defs:?}");
+
+        // A path query does not sweep at all (the sweep looked for the leaf —
+        // every `new` of a project for `Widget::new`); with no time, a
+        // sweep that ran would say so.
+        for exact in [true, false] {
+            let refs = service
+                .find_references_within(root, "Probe::radius_override", exact, zero)
+                .expect("references query");
+            assert!(refs.incomplete.is_none(), "exact={exact}: no sweep ran, got {refs:?}");
+            let defs = service
+                .symbol_search_within(root, "Probe::radius_override", 8, exact, zero)
+                .expect("definition query");
+            assert!(defs.incomplete.is_none(), "exact={exact}: no sweep ran, got {defs:?}");
+        }
+
+        let defs = service
+            .symbol_search_within(root, "radius_override", 8, true, ample)
+            .expect("definition query");
+        assert!(defs.incomplete.is_none(), "{defs:?}");
+        assert_eq!(defs.locations.len(), 1, "the one field declaration, got {defs:?}");
+        let refs = service
+            .find_references_within(root, "radius_override", true, ample)
+            .expect("references query");
+        assert!(refs.incomplete.is_none(), "{refs:?}");
+        assert_eq!(call_sites(&refs.locations), 4, "{refs:?}");
     }
 
     /// Untouched code must not pay for the check: same stamps, no reload, and

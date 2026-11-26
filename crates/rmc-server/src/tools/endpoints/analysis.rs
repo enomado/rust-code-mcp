@@ -145,32 +145,20 @@ pub(crate) async fn find_definition_with_semantic(
 
     let project = project_path.to_path_buf();
     let symbol = symbol_name.to_string();
-    let locations = with_semantic(semantic, "find_definition", move |service| {
+    let budget = sweep_budget();
+    let answer = with_semantic(semantic, "find_definition", move |service| {
         service
-            .symbol_search_with_exact(&project, &symbol, 50, exact)
+            .symbol_search_within(&project, &symbol, 50, exact, budget)
             .map_err(|e| McpError::internal_error(format!("Symbol search failed: {}", e), None))
     })
     .await?;
-
-    if locations.is_empty() {
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "No definition found for symbol '{}'",
-            symbol_name
-        ))]))
-    } else {
-        let result = locations
-            .iter()
-            .map(|loc| loc.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Found {} definition(s) for '{}':\n{}",
-            locations.len(),
-            symbol_name,
-            result
-        ))]))
-    }
+    Ok(CallToolResult::success(vec![Content::text(swept_text(
+        "find_definition",
+        Noun::Definition,
+        symbol_name,
+        directory,
+        &answer,
+    ))]))
 }
 
 /// Find all references to a symbol using an explicit semantic service.
@@ -191,31 +179,83 @@ pub(crate) async fn find_references_with_semantic(
 
     let project = project_path.to_path_buf();
     let symbol = symbol_name.to_string();
-    let locations = with_semantic(semantic, "find_references", move |service| {
+    let budget = sweep_budget();
+    let answer = with_semantic(semantic, "find_references", move |service| {
         service
-            .find_references_by_name_with_exact(&project, &symbol, exact)
+            .find_references_within(&project, &symbol, exact, budget)
             .map_err(|e| McpError::internal_error(format!("Find references failed: {}", e), None))
     })
     .await?;
+    Ok(CallToolResult::success(vec![Content::text(swept_text(
+        "find_references",
+        Noun::Reference,
+        symbol_name,
+        directory,
+        &answer,
+    ))]))
+}
 
-    if locations.is_empty() {
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "No references found for symbol '{}'",
-            symbol_name
-        ))]))
+/// The time budget of a file sweep of `find_definition` / `find_references`:
+/// `RMC_SWEEP_BUDGET_SECS`, 30 s by default (fractions allowed).
+pub(crate) const SWEEP_BUDGET_ENV: &str = "RMC_SWEEP_BUDGET_SECS";
+const DEFAULT_SWEEP_BUDGET_SECS: f64 = 30.0;
+
+fn sweep_budget() -> std::time::Duration {
+    let secs = std::env::var(SWEEP_BUDGET_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|secs| secs.is_finite() && *secs >= 0.0)
+        .unwrap_or(DEFAULT_SWEEP_BUDGET_SECS);
+    std::time::Duration::from_secs_f64(secs)
+}
+
+/// What a swept answer lists.
+#[derive(Clone, Copy)]
+enum Noun {
+    Definition,
+    Reference,
+}
+
+/// The tool's text. An incomplete answer says so on its FIRST line, so a
+/// reader skimming the head of the list cannot take it for the whole, and
+/// the daemon log gets a line naming the call.
+fn swept_text(
+    tool: &str,
+    noun: Noun,
+    symbol_name: &str,
+    directory: &str,
+    answer: &crate::semantic::position::SweptAnswer,
+) -> String {
+    if let Some(why) = &answer.incomplete {
+        tracing::info!("{tool} '{symbol_name}' in {directory} is INCOMPLETE: {why}");
+    }
+    let (plural, none) = match noun {
+        Noun::Definition => ("definition(s)", "No definition found"),
+        Noun::Reference => ("reference(s)", "No references found"),
+    };
+    let head = match &answer.incomplete {
+        Some(_) => "INCOMPLETE: ",
+        None => "",
+    };
+    let tail = answer
+        .incomplete
+        .as_deref()
+        .map_or_else(String::new, |why| format!("\nINCOMPLETE: {why}"));
+    if answer.locations.is_empty() {
+        format!("{head}{none} for symbol '{symbol_name}'{tail}")
     } else {
-        let result = locations
+        let result = answer
+            .locations
             .iter()
             .map(|loc| loc.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Found {} reference(s) for '{}':\n{}",
-            locations.len(),
+        format!(
+            "{head}Found {} {plural} for '{}':\n{}{tail}",
+            answer.locations.len(),
             symbol_name,
             result
-        ))]))
+        )
     }
 }
 
@@ -584,6 +624,49 @@ mod tests {
     async fn test_get_dependencies_nonexistent_file() {
         let result = get_dependencies("/nonexistent/file.rs").await;
         assert!(result.is_err());
+    }
+
+    /// A partial answer says so in its first line and its last; a complete
+    /// one carries no marker.
+    #[test]
+    fn an_incomplete_reference_answer_says_so_first() {
+        use crate::semantic::position::SweptAnswer;
+        let location = crate::semantic::Location {
+            file_path: "/w/src/lib.rs".into(),
+            line: 3,
+            column: 5,
+            name: "reference".into(),
+            exact: true,
+        };
+        let partial = swept_text(
+            "find_references",
+            Noun::Reference,
+            "spawn",
+            "/w",
+            &SweptAnswer {
+                locations: vec![location.clone()],
+                incomplete: Some("time budget of 30 s exhausted".into()),
+            },
+        );
+        let lines: Vec<&str> = partial.lines().collect();
+        assert!(lines[0].starts_with("INCOMPLETE: Found 1 reference(s)"), "{partial}");
+        assert_eq!(lines.last().unwrap(), &"INCOMPLETE: time budget of 30 s exhausted");
+        let empty = swept_text(
+            "find_definition",
+            Noun::Definition,
+            "spawn",
+            "/w",
+            &SweptAnswer { locations: Vec::new(), incomplete: Some("cut".into()) },
+        );
+        assert!(empty.starts_with("INCOMPLETE: No definition found"), "{empty}");
+        let whole = swept_text(
+            "find_references",
+            Noun::Reference,
+            "spawn",
+            "/w",
+            &SweptAnswer { locations: vec![location], incomplete: None },
+        );
+        assert!(!whole.contains("INCOMPLETE"), "{whole}");
     }
 
     #[tokio::test]

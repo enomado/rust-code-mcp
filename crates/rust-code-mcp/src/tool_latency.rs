@@ -32,11 +32,13 @@
 //!
 //! # Lines it reads
 //!
-//! - `mem: tool <name>[ <dir>] took …`
+//! - `mem: tool <name>[ <dir>][ [<arguments>]] took …` — the bracket names
+//!   what the call asked (`symbol_name="spawn" exact=true`, see
+//!   `rmc_server::tools::router::call_arguments_summary`)
 //! - `mem: background sync of <dir> took …`
 //! - `mem: vector store maintenance[ of <dir>] took …`
 //! - `mem: index changes[ of <dir>] (…) took …`
-//! - `mem: analysis load <kind> of <dir> took …`
+//! - `mem: analysis load <kind> of <dir>[ because <reason>] took …`
 //! - `mem: index build of <dir> took …`
 //!
 //! Older binaries wrote maintenance and index lines without the directory and
@@ -48,6 +50,26 @@
 //! That pairing is exact only while such work did not overlap in a process;
 //! the report counts the closes that had more than one open.
 //!
+//! Binaries before the load reason logged the cause of a reload as a text
+//! line just before the load (`Project <dir> gained or lost files since it
+//! was analysed; reloading`, `Cannot patch <dir> incrementally (…);
+//! reloading`); a load without `because` takes its reason from such a line
+//! of its process and directory at its start.
+//!
+//! # Unfinished calls
+//!
+//! A tool call also logs `start: tool …` when it begins (newer binaries). A
+//! start of a process with no `mem:` line of the same text after it is a call
+//! that never ended — stuck, or still running when the log was read. Such a
+//! call has no `mem:` line, so nothing else here can see it.
+//!
+//! # Slow calls
+//!
+//! Besides the blocked ones, every reading call longer than [`SLOW_SECS`] is
+//! listed with its arguments and its own load (with the reason) when it had
+//! one: a call that paid for a reload and a call that is long by itself are
+//! different defects.
+//!
 //! Intervals of different processes (daemons sharing a log over a binary
 //! swap) never overlap here: the locks in question are per process.
 
@@ -57,6 +79,9 @@ use std::path::PathBuf;
 /// The slack of the criterion, seconds: what a reader may lose beside other
 /// work before it counts as blocked (the plan's `max(own work) + 2 s`).
 pub const SLACK_SECS: f64 = 2.0;
+
+/// A reading call longer than this is listed under "slow calls".
+pub const SLOW_SECS: f64 = 5.0;
 
 /// `took` is printed with one decimal; an interval's start is that much less
 /// exact than its end. Used when deciding which sync encloses a dir-less line.
@@ -114,6 +139,9 @@ pub struct Span {
     pub pid: u32,
     pub kind: Kind,
     pub workspace: Option<String>,
+    /// A tool call: what it asked (the bracket of its line, without the
+    /// brackets). An analysis load: why it ran.
+    pub detail: Option<String>,
     pub start: f64,
     pub end: f64,
 }
@@ -140,6 +168,19 @@ pub struct Parsed {
     /// …of which the close had more than one open (paired with the latest;
     /// exact only while such work did not overlap in a process).
     pub paired_by_guess: usize,
+    /// Tool calls with a `start:` line and no `mem:` line after it.
+    pub unfinished: Vec<Unfinished>,
+    /// The latest timestamp read: what "still open" is measured against.
+    pub log_end: Option<f64>,
+}
+
+/// A tool call that started and did not end in the log.
+#[derive(Debug, Clone)]
+pub struct Unfinished {
+    pub pid: u32,
+    pub start: f64,
+    /// `tool <name>[ <dir>][ [<arguments>]]`, as logged.
+    pub what: String,
 }
 
 /// Seconds since the Unix epoch of `2026-10-31T15:34:46.421517Z` (the
@@ -204,15 +245,34 @@ fn split_line(line: &str) -> Option<(f64, u32, &str)> {
     Some((at, pid, rest))
 }
 
+/// The parts of a `mem:` line: `<what> took <secs>s, …`.
+struct MemLine {
+    kind: Kind,
+    workspace: Option<String>,
+    detail: Option<String>,
+    secs: f64,
+}
+
 /// What a `mem:` line measured: `<what> took <secs>s, …`.
-fn parse_mem(what_and_rest: &str) -> Option<(Kind, Option<String>, f64)> {
+fn parse_mem(what_and_rest: &str) -> Option<MemLine> {
     let (what, rest) = what_and_rest.rsplit_once(" took ")?;
     let secs: f64 = rest.split_once("s,")?.0.parse().ok()?;
+    let mut detail = None;
     let (kind, workspace) = if let Some(tool) = what.strip_prefix("tool ") {
-        match tool.split_once(' ') {
-            Some((name, dir)) => (Kind::Tool(name.to_string()), Some(dir.to_string())),
-            None => (Kind::Tool(tool.to_string()), None),
-        }
+        let (name, rest) = tool.split_once(' ').unwrap_or((tool, ""));
+        // `<dir> [<args>]`, `[<args>]` or `<dir>`: the directory is a path
+        // and comes first, so the FIRST ` [` opens the arguments (a quoted
+        // argument may itself contain one).
+        let (dir, args) = match rest.strip_prefix('[') {
+            Some(args) => ("", Some(args)),
+            None => match rest.split_once(" [") {
+                Some((dir, args)) => (dir, Some(args)),
+                None => (rest, None),
+            },
+        };
+        detail = args.map(|args| args.strip_suffix(']').unwrap_or(args).to_string());
+        let dir = (!dir.is_empty()).then(|| dir.to_string());
+        (Kind::Tool(name.to_string()), dir)
     } else if let Some(dir) = what.strip_prefix("background sync of ") {
         (Kind::Sync, Some(dir.to_string()))
     } else if let Some(tail) = what.strip_prefix("vector store maintenance") {
@@ -227,6 +287,13 @@ fn parse_mem(what_and_rest: &str) -> Option<(Kind, Option<String>, f64)> {
         (Kind::IndexChanges, dir)
     } else if let Some(tail) = what.strip_prefix("analysis load ") {
         let (_, dir) = tail.split_once(" of ")?;
+        let dir = match dir.rsplit_once(" because ") {
+            Some((dir, reason)) => {
+                detail = Some(reason.to_string());
+                dir
+            }
+            None => dir,
+        };
         (Kind::AnalysisLoad, Some(dir.to_string()))
     } else if let Some(dir) = what.strip_prefix("index build of ") {
         (Kind::IndexBuild, Some(dir.to_string()))
@@ -234,7 +301,26 @@ fn parse_mem(what_and_rest: &str) -> Option<(Kind, Option<String>, f64)> {
         // `indexer init for …` and anything newer: not work a reader waits for.
         return None;
     };
-    Some((kind, workspace, secs))
+    Some(MemLine {
+        kind,
+        workspace,
+        detail,
+        secs,
+    })
+}
+
+/// The reload cause an older binary logged as a text line before the load:
+/// `(directory, reason)`, the reason in the words the `because` of a newer
+/// binary uses (`LoadReason::as_log_text` in `rmc_server::semantic`).
+fn reload_cause(rest: &str) -> Option<(&str, &'static str)> {
+    if let Some((_, tail)) = rest.split_once("Project ")
+        && let Some((dir, _)) = tail.split_once(" gained or lost files since it was analysed")
+    {
+        return Some((dir, "files added or removed"));
+    }
+    let (_, tail) = rest.split_once("Cannot patch ")?;
+    let (dir, _) = tail.split_once(" incrementally (")?;
+    Some((dir, "cannot patch edits"))
 }
 
 /// Work an older binary logged as an opening and a closing text line instead
@@ -272,23 +358,42 @@ pub fn parse_log(text: &str) -> Parsed {
     // `mem:` line of a kind itself has its text pairs of that kind ignored.
     let mut open: BTreeMap<(usize, u32), Vec<(f64, String)>> = BTreeMap::new();
     let mut from_text: Vec<(Span, bool)> = Vec::new();
+    // (pid, time, dir, reason) of old binaries' reload-cause lines.
+    let mut causes: Vec<(u32, f64, String, &'static str)> = Vec::new();
+    // (pid, what) → start times of tool calls not yet ended, oldest first.
+    let mut started: BTreeMap<(u32, String), Vec<f64>> = BTreeMap::new();
     for line in text.lines() {
         let Some((at, pid, rest)) = split_line(line) else {
             continue;
         };
-        if let Some((_, what)) = rest.split_once(" mem: ") {
+        parsed.log_end = Some(parsed.log_end.map_or(at, |end: f64| end.max(at)));
+        if let Some((_, what)) = rest.split_once(" rmc_mem: start: ") {
+            started
+                .entry((pid, what.trim_end().to_string()))
+                .or_default()
+                .push(at);
+        } else if let Some((_, what)) = rest.split_once(" mem: ") {
             if !rest.contains("rmc_mem:") {
                 continue;
             }
-            if let Some((kind, workspace, secs)) = parse_mem(what) {
+            if let Some((call, _)) = what.rsplit_once(" took ")
+                && let Some(starts) = started.get_mut(&(pid, call.to_string()))
+                && !starts.is_empty()
+            {
+                starts.remove(0);
+            }
+            if let Some(line) = parse_mem(what) {
                 parsed.spans.push(Span {
                     pid,
-                    kind,
-                    workspace,
-                    start: at - secs,
+                    kind: line.kind,
+                    workspace: line.workspace,
+                    detail: line.detail,
+                    start: at - line.secs,
                     end: at,
                 });
             }
+        } else if let Some((dir, reason)) = reload_cause(rest) {
+            causes.push((pid, at, dir.trim().to_string(), reason));
         } else {
             for (index, pair) in TEXT_PAIRS.iter().enumerate() {
                 if let Some(dir) = (pair.opens)(rest) {
@@ -306,6 +411,7 @@ pub fn parse_log(text: &str) -> Parsed {
                             pid,
                             kind: pair.kind.clone(),
                             workspace: Some(dir),
+                            detail: None,
                             start,
                             end: at,
                         };
@@ -329,7 +435,18 @@ pub fn parse_log(text: &str) -> Parsed {
         parsed.paired_by_guess += usize::from(guessed);
         parsed.spans.push(span);
     }
+    for ((pid, what), starts) in started {
+        for start in starts {
+            parsed.unfinished.push(Unfinished {
+                pid,
+                start,
+                what: what.clone(),
+            });
+        }
+    }
+    parsed.unfinished.sort_by(|a, b| a.start.total_cmp(&b.start));
     attribute_dirless(&mut parsed.spans);
+    attribute_load_causes(&mut parsed.spans, &causes);
     parsed.spans.sort_by(|a, b| a.end.total_cmp(&b.end));
     parsed
 }
@@ -340,6 +457,12 @@ impl Parsed {
         self.rebuilt_from_text += other.rebuilt_from_text;
         self.paired_by_guess += other.paired_by_guess;
         self.spans.sort_by(|a, b| a.end.total_cmp(&b.end));
+        self.unfinished.extend(other.unfinished);
+        self.unfinished.sort_by(|a, b| a.start.total_cmp(&b.start));
+        self.log_end = match (self.log_end, other.log_end) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
     }
 }
 
@@ -371,6 +494,25 @@ fn attribute_dirless(spans: &mut [Span]) {
     }
 }
 
+/// Give a load without a `because` the reason of the cause line its process
+/// wrote for its directory at its start (the line is logged right before
+/// the load begins; one second covers the rounding of `took`).
+fn attribute_load_causes(spans: &mut [Span], causes: &[(u32, f64, String, &'static str)]) {
+    for span in spans.iter_mut() {
+        if span.kind != Kind::AnalysisLoad || span.detail.is_some() {
+            continue;
+        }
+        span.detail = causes
+            .iter()
+            .find(|(pid, at, dir, _)| {
+                *pid == span.pid
+                    && span.workspace.as_deref() == Some(dir.as_str())
+                    && (at - span.start).abs() <= 1.0
+            })
+            .map(|(.., reason)| reason.to_string());
+    }
+}
+
 /// Length of the union of intervals.
 fn union_len(mut parts: Vec<(f64, f64)>) -> f64 {
     parts.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -398,6 +540,8 @@ pub struct Judged {
     pub call: Span,
     /// Its own project's rust-analyzer load during the call, seconds.
     pub own: f64,
+    /// The own work behind `own`: loads (with their reason) and index builds.
+    pub own_work: Vec<Span>,
     /// Longest clean call of the same tool (see the module docs).
     pub base: f64,
     /// `base` came from the tool on other workspaces, or is 0 (never clean).
@@ -426,6 +570,7 @@ pub fn judge(parsed: &Parsed, since: Option<f64>, until: Option<f64>) -> Vec<Jud
         call: Span,
         wake: f64,
         own: f64,
+        own_work: Vec<Span>,
         others: Vec<Span>,
         overlapped: f64,
     }
@@ -436,6 +581,7 @@ pub fn judge(parsed: &Parsed, since: Option<f64>, until: Option<f64>) -> Vec<Jud
         };
         let analysis = ANALYSIS_TOOLS.contains(&name);
         let mut own_parts = Vec::new();
+        let mut own_work = Vec::new();
         let mut other_parts = Vec::new();
         let mut others = Vec::new();
         for span in &parsed.spans {
@@ -454,6 +600,7 @@ pub fn judge(parsed: &Parsed, since: Option<f64>, until: Option<f64>) -> Vec<Jud
                 && span.start >= call.start - ROUNDING_SECS;
             if own_load || own_build {
                 own_parts.push(part);
+                own_work.push(span.clone());
             } else {
                 other_parts.push(part);
                 others.push(span.clone());
@@ -470,6 +617,7 @@ pub fn judge(parsed: &Parsed, since: Option<f64>, until: Option<f64>) -> Vec<Jud
             call: call.clone(),
             wake,
             own: union_len(own_parts),
+            own_work,
             others,
             overlapped: union_len(other_parts),
         });
@@ -512,6 +660,7 @@ pub fn judge(parsed: &Parsed, since: Option<f64>, until: Option<f64>) -> Vec<Jud
                 blocked: excess > SLACK_SECS && raw.overlapped > SLACK_SECS,
                 call: raw.call,
                 own: raw.own,
+                own_work: raw.own_work,
                 base,
                 base_borrowed,
                 overlapped: raw.overlapped,
@@ -679,15 +828,21 @@ pub fn report(parsed: &Parsed, judged: &[Judged]) -> (String, usize) {
             span.took()
         )
     };
+    let asked = |span: &Span| {
+        span.detail
+            .as_deref()
+            .map_or_else(String::new, |detail| format!(" [{detail}]"))
+    };
     for j in &blocked {
         let culprit = j.culprit.as_ref().unwrap();
         write!(
             out,
-            "  {} pid {} {} {}: took {:.1} s = own {:.1} + base {:.1}{} + excess {:.1}; beside work {:.1} s\n      waited for: {}",
+            "  {} pid {} {} {}{}: took {:.1} s = own {:.1} + base {:.1}{} + excess {:.1}; beside work {:.1} s\n      waited for: {}",
             clock(j.call.end),
             j.call.pid,
             j.call.kind.label(),
             short(&j.call.workspace),
+            asked(&j.call),
             j.call.took(),
             j.own,
             j.base,
@@ -710,7 +865,97 @@ pub fn report(parsed: &Parsed, judged: &[Judged]) -> (String, usize) {
     }
     writeln!(
         out,
-        "(* base from the tool on other workspaces, or 0: never ran clean here)\nverdict: {} blocked call(s)",
+        "(* base from the tool on other workspaces, or 0: never ran clean here)"
+    )
+    .unwrap();
+
+    // Long calls, blocked or not, longest first: what was asked, and whether
+    // the call paid for a load of its own project (and why that load ran).
+    let mut slow: Vec<&Judged> = judged
+        .iter()
+        .filter(|j| j.call.took() > SLOW_SECS)
+        .collect();
+    slow.sort_by(|a, b| b.call.took().total_cmp(&a.call.took()));
+    let with_own_load = slow.iter().filter(|j| j.own > 0.0).count();
+    writeln!(
+        out,
+        "\nslow: {} reading call(s) longer than {SLOW_SECS} s, {with_own_load} of them with an own load",
+        slow.len()
+    )
+    .unwrap();
+    for j in &slow {
+        let own = if j.own_work.is_empty() {
+            "no own load".to_string()
+        } else {
+            let work: Vec<String> = j
+                .own_work
+                .iter()
+                .map(|span| {
+                    format!(
+                        "{} {:.1} s{}",
+                        span.kind.label(),
+                        span.took(),
+                        span.detail
+                            .as_deref()
+                            .map_or_else(String::new, |why| format!(" because {why}"))
+                    )
+                })
+                .collect();
+            format!("OWN {}", work.join(", "))
+        };
+        writeln!(
+            out,
+            "  {} pid {} {} {}{}: took {:.1} s; {own}{}",
+            clock(j.call.end),
+            j.call.pid,
+            j.call.kind.label(),
+            short(&j.call.workspace),
+            asked(&j.call),
+            j.call.took(),
+            if j.blocked { "; BLOCKED" } else { "" },
+        )
+        .unwrap();
+    }
+
+    // Every analysis load in the logs (not only the window's: a reload that
+    // no call waited for still cost the daemon its time and memory).
+    let mut loads: BTreeMap<&str, (usize, f64)> = BTreeMap::new();
+    for span in parsed
+        .spans
+        .iter()
+        .filter(|span| span.kind == Kind::AnalysisLoad)
+    {
+        let slot = loads
+            .entry(span.detail.as_deref().unwrap_or("unknown"))
+            .or_default();
+        slot.0 += 1;
+        slot.1 += span.took();
+    }
+    writeln!(
+        out,
+        "\nunfinished: {} tool call(s) started and never ended in the log (stuck, or running when it was read)",
+        parsed.unfinished.len()
+    )
+    .unwrap();
+    for call in &parsed.unfinished {
+        writeln!(
+            out,
+            "  {} pid {} {}: open {:.1} s at the log's end",
+            clock(call.start),
+            call.pid,
+            call.what,
+            parsed.log_end.unwrap_or(call.start) - call.start,
+        )
+        .unwrap();
+    }
+
+    writeln!(out, "\nanalysis loads by reason (whole log):").unwrap();
+    for (reason, (count, secs)) in &loads {
+        writeln!(out, "  {reason:<24} {count:>4} load(s), {secs:>8.1} s").unwrap();
+    }
+    writeln!(
+        out,
+        "verdict: {} blocked call(s)",
         blocked.len()
     )
     .unwrap();
@@ -744,6 +989,10 @@ mod tests {
         format!(
             "2026-10-31T{at}Z [{pid}]  INFO rmc_mem: mem: {what} took {took:.1}s, RSS 1 -> 2 MB (+1), peak 3 MB\n"
         )
+    }
+
+    fn start(at: &str, pid: u32, what: &str) -> String {
+        format!("2026-10-31T{at}Z [{pid}]  INFO rmc_mem: start: {what}\n")
     }
 
     fn text(at: &str, pid: u32, target: &str, message: &str) -> String {
@@ -936,6 +1185,128 @@ mod tests {
                 (Kind::IndexChanges, Some("/w/b")),
                 (Kind::IndexBuild, Some("/w/c")),
             ]
+        );
+    }
+
+    /// What a call asked is read back from its line and shown with the slow
+    /// calls; a call that paid for its project's reload is told apart from one
+    /// that is long by itself, with the reload's reason — from `because` of a
+    /// new line or from the cause line an older binary wrote before the load.
+    /// The shape of 2026-11-26 on a large workspace: `find_references` 50–109 s on reloads
+    /// after files appeared, and one 34 s call without any load.
+    #[test]
+    fn slow_calls_name_what_they_asked_and_why_their_load_ran() {
+        let mut log = String::new();
+        // Old binary: the cause is a text line, the load line has no reason.
+        log += &text(
+            "17:00:00.000",
+            7,
+            "rmc_server::semantic",
+            "Project /w/big gained or lost files since it was analysed; reloading",
+        );
+        log += &text(
+            "17:00:00.010",
+            7,
+            "rmc_server::semantic",
+            "Loading Full IDE for project: /w/big",
+        );
+        log += &mem("17:00:50.000", 7, "analysis load Full of /w/big", 50.0);
+        log += &mem(
+            "17:00:50.600",
+            7,
+            r#"tool find_references /w/big [symbol_name="Point" exact=true]"#,
+            50.6,
+        );
+        // New binary: the reason rides on the load line.
+        log += &mem(
+            "17:10:40.000",
+            7,
+            "analysis load Full of /w/big because cannot patch edits",
+            39.0,
+        );
+        log += &mem(
+            "17:10:40.500",
+            7,
+            r#"tool find_definition /w/big [symbol_name="a [b"]"#,
+            40.0,
+        );
+        // Long by itself, no load: a std path scan. It logged its start; the
+        // call beside it, started a second later, never ended.
+        let spawn = r#"tool find_references /w/big [symbol_name="std::thread::spawn"]"#;
+        log += &start("17:22:13.000", 7, spawn);
+        log += &start("17:22:14.000", 7, r#"tool find_references /w/big [symbol_name="App::new"]"#);
+        log += &mem(
+            "17:22:47.000",
+            7,
+            r#"tool find_references /w/big [symbol_name="std::thread::spawn"]"#,
+            34.0,
+        );
+        log += &mem("17:23:00.000", 7, "tool search [keyword_len=4]", 0.3);
+        log += &mem("17:23:01.000", 7, "tool health_check", 0.1);
+
+        let parsed = parse_log(&log);
+        let tool = |at: f64| {
+            parsed
+                .spans
+                .iter()
+                .find(|s| matches!(s.kind, Kind::Tool(_)) && (s.took() - at).abs() < 0.05)
+                .unwrap()
+        };
+        assert_eq!(tool(50.6).workspace.as_deref(), Some("/w/big"));
+        assert_eq!(
+            tool(50.6).detail.as_deref(),
+            Some(r#"symbol_name="Point" exact=true"#)
+        );
+        // The first ` [` after the directory opens the arguments.
+        assert_eq!(tool(40.0).detail.as_deref(), Some(r#"symbol_name="a [b""#));
+        assert_eq!(tool(0.3).workspace, None);
+        assert_eq!(tool(0.3).detail.as_deref(), Some("keyword_len=4"));
+        assert_eq!((tool(0.1).workspace.clone(), tool(0.1).detail.clone()), (None, None));
+        let reasons: Vec<Option<&str>> = parsed
+            .spans
+            .iter()
+            .filter(|s| s.kind == Kind::AnalysisLoad)
+            .map(|s| s.detail.as_deref())
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![Some("files added or removed"), Some("cannot patch edits")]
+        );
+
+        let judged = judge(&parsed, None, None);
+        let (report, blocked) = report(&parsed, &judged);
+        assert_eq!(blocked, 0, "{report}");
+        assert!(
+            report.contains("slow: 3 reading call(s) longer than 5 s, 2 of them with an own load"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                r#"tool find_references big [symbol_name="Point" exact=true]: took 50.6 s; OWN analysis load 50.0 s because files added or removed"#
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                r#"tool find_references big [symbol_name="std::thread::spawn"]: took 34.0 s; no own load"#
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("files added or removed      1 load(s),     50.0 s"),
+            "{report}"
+        );
+        assert!(report.trim_end().ends_with("verdict: 0 blocked call(s)"), "{report}");
+        // The ended call's start is matched; the other is open until the
+        // last line of the log (17:23:01).
+        assert_eq!(parsed.unfinished.len(), 1, "{:?}", parsed.unfinished);
+        assert!(
+            report.contains(
+                r#"unfinished: 1 tool call(s)"#
+            ) && report.contains(
+                r#"10-31 17:22:14.0 pid 7 tool find_references /w/big [symbol_name="App::new"]: open 47.0 s at the log's end"#
+            ),
+            "{report}"
         );
     }
 

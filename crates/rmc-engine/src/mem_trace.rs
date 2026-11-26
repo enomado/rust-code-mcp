@@ -110,6 +110,18 @@ impl MemSpan {
         }
     }
 
+    /// [`MemSpan::start`] that also logs `start: <what>` now.
+    ///
+    /// The `mem:` line is written at the END: an operation that never ends
+    /// (a query stuck for hours, 2026-11-26) left no line at all, and the log
+    /// read as if it had never been asked. With the start line,
+    /// `--tool-latency` lists starts without an end.
+    pub fn start_logged(what: impl Into<String>) -> Self {
+        let span = Self::start(what);
+        tracing::info!(target: LOG_TARGET, "start: {}", span.what);
+        span
+    }
+
     pub fn finish(mut self) {
         self.log("");
         self.finished = true;

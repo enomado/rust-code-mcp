@@ -32,6 +32,72 @@ impl std::fmt::Display for Location {
     }
 }
 
+/// The references of a name, and whether the search was cut short.
+#[derive(Debug)]
+pub(crate) struct SweptAnswer {
+    pub locations: Vec<Location>,
+    /// `Some(why)` when a file sweep ran out of its time budget: the
+    /// locations are what was found until then, and the answer must say so
+    /// (a short list read as complete is read as "this code is dead").
+    pub incomplete: Option<String>,
+}
+
+/// When a file sweep must stop, and what it was doing when it did.
+///
+/// # Why a budget
+///
+/// The sweeps (`collect_library_refs`, `collect_by_token_scan`) ask
+/// rust-analyzer about every occurrence of a name in every project file, and
+/// the per-match loop runs one `find_all_refs` for each of up to 50 fuzzy
+/// matches. For a common name on a large workspace that is unbounded: on a
+/// ~8000-file workspace a fuzzy `find_references` of `Widget::new` ran
+/// for over 100 minutes (2026-11-26; which of the three loops it sat in was
+/// not observable — the budget bounds all three). The last attempt of a
+/// query keeps its project's slot for its whole run (`with_project`), so every
+/// other call on the project waited behind it — 22 of them, none answered.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SweepBudget {
+    started: std::time::Instant,
+    deadline: Option<std::time::Instant>,
+}
+
+impl SweepBudget {
+    pub(crate) fn unlimited() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            deadline: None,
+        }
+    }
+
+    pub(crate) fn of(limit: std::time::Duration) -> Self {
+        let started = std::time::Instant::now();
+        Self {
+            started,
+            deadline: Some(started + limit),
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
+
+    /// The note an answer carries when `sweep` stopped before file `done`
+    /// of `total`.
+    fn note(&self, sweep: &str, done: usize, total: usize) -> String {
+        self.note_of(sweep, done, total, "project files searched")
+    }
+
+    fn note_of(&self, sweep: &str, done: usize, total: usize, unit: &str) -> String {
+        format!(
+            "time budget of {:.0} s exhausted in {sweep}: {done} of {total} {unit}; \
+             the list above is partial (a full-name query, `exact=true`, or a full path narrows the search)",
+            self.deadline
+                .map_or(0.0, |deadline| (deadline - self.started).as_secs_f64()),
+        )
+    }
+}
+
 /// Convert file path to FileId
 fn path_to_file_id(vfs: &Vfs, file_path: &Path) -> Result<ra_ap_vfs::FileId> {
     let abs_path = file_path
@@ -134,6 +200,21 @@ fn nav_key(nav: &NavigationTarget) -> (ra_ap_vfs::FileId, TextSize) {
 /// `exact=true` then dropped all of them.
 fn leaf_name(symbol_name: &str) -> &str {
     symbol_name.rsplit("::").next().unwrap()
+}
+
+/// Whether the query names a path (`Widget::new`, `std::thread::spawn`)
+/// rather than a bare name.
+///
+/// A path query never runs the token sweep. The sweep is for what the symbol
+/// index lacks — fields — and it looks for the LEAF: for an unresolved
+/// `Widget::new` that is every `new` in the project, each asked
+/// `find_all_refs` (an occurrence that is not a field is not marked covered),
+/// which ran for over 100 minutes on a ~8000-file workspace (2026-11-26).
+/// Before the leaf existed the sweep looked for the literal path, which no
+/// identifier is, so a path query never swept; this keeps that. A field is
+/// asked about by its bare name.
+fn is_path_query(symbol_name: &str) -> bool {
+    symbol_name.contains("::")
 }
 
 /// Goto definition at position
@@ -345,15 +426,40 @@ pub(crate) fn symbol_search_with_exact(
     limit: usize,
     exact_only: bool,
 ) -> Result<Vec<Location>> {
+    let answer = symbol_search_within(
+        analysis,
+        vfs,
+        project_root,
+        symbol_name,
+        limit,
+        exact_only,
+        SweepBudget::unlimited(),
+    )?;
+    Ok(answer.locations)
+}
+
+/// [`symbol_search_with_exact`] whose token sweep stops at `budget`; a
+/// stopped sweep is named in [`SweptAnswer::incomplete`].
+pub(crate) fn symbol_search_within(
+    analysis: &Analysis,
+    vfs: &Vfs,
+    project_root: &Path,
+    symbol_name: &str,
+    limit: usize,
+    exact_only: bool,
+    budget: SweepBudget,
+) -> Result<SweptAnswer> {
     let mut locations = index_matches(&analysis, vfs, symbol_name, limit, exact_only)?;
 
-    if !locations.iter().any(|location| location.exact) {
-        collect_by_token_scan(
+    let mut incomplete = None;
+    if !locations.iter().any(|location| location.exact) && !is_path_query(symbol_name) {
+        incomplete = collect_by_token_scan(
             &analysis,
             vfs,
             project_root,
             leaf_name(symbol_name),
             Wants::DeclOnly,
+            budget,
             &mut locations,
         )?;
     }
@@ -363,7 +469,10 @@ pub(crate) fn symbol_search_with_exact(
     // The index was asked for `limit` and the sweep may have added to that;
     // the caller's cap is on the answer, not on either source of it.
     ranked.truncate(limit);
-    Ok(ranked)
+    Ok(SweptAnswer {
+        locations: ranked,
+        incomplete,
+    })
 }
 
 /// What rust-analyzer's symbol index alone answers for a name.
@@ -483,7 +592,8 @@ pub(crate) fn find_references_by_name(
 }
 
 /// Find all references to symbols matching a name, optionally retaining only
-/// full-name symbol matches before resolving references.
+/// full-name symbol matches before resolving references. No time budget: see
+/// [`find_references_within`].
 pub(crate) fn find_references_by_name_with_exact(
     analysis: &Analysis,
     vfs: &Vfs,
@@ -491,6 +601,27 @@ pub(crate) fn find_references_by_name_with_exact(
     symbol_name: &str,
     exact_only: bool,
 ) -> Result<Vec<Location>> {
+    let answer = find_references_within(
+        analysis,
+        vfs,
+        project_root,
+        symbol_name,
+        exact_only,
+        SweepBudget::unlimited(),
+    )?;
+    Ok(answer.locations)
+}
+
+/// [`find_references_by_name_with_exact`] whose file sweeps stop at `budget`;
+/// a stopped sweep is named in [`SweptAnswer::incomplete`].
+pub(crate) fn find_references_within(
+    analysis: &Analysis,
+    vfs: &Vfs,
+    project_root: &Path,
+    symbol_name: &str,
+    exact_only: bool,
+    budget: SweepBudget,
+) -> Result<SweptAnswer> {
     let name = leaf_name(symbol_name);
     // First, find all symbols matching the name, full-name matches first.
     let symbols = index_navs(analysis, symbol_name, 50, exact_only)?;
@@ -499,8 +630,19 @@ pub(crate) fn find_references_by_name_with_exact(
     let mut resolved_the_name = false;
     let mut library_symbols = Vec::new();
 
-    // For each symbol found, find its references
-    for symbol in &symbols {
+    // For each symbol found, find its references. One `find_all_refs` per
+    // match, up to 50 matches of a fuzzy query: bounded by the budget too.
+    let mut incomplete = None;
+    for (done, symbol) in symbols.iter().enumerate() {
+        if budget.exhausted() {
+            incomplete = Some(budget.note_of(
+                "the per-match search",
+                done,
+                symbols.len(),
+                "index matches resolved",
+            ));
+            break;
+        }
         let symbol_exact = symbol.name.as_str() == name;
         if exact_only && !symbol_exact {
             continue;
@@ -511,7 +653,14 @@ pub(crate) fn find_references_by_name_with_exact(
             .is_library_file(symbol.file_id)
             .context("is_library_file query failed")?
         {
-            library_symbols.push((symbol, symbol_exact));
+            // Only a full-name match is asked about: a fuzzy library hit
+            // (`add_spawn_hook` for `std::thread::spawn`) is not what
+            // was asked, and sweeping the project for its name answered with
+            // foreign call sites — slowly, as every occurrence of the name is
+            // resolved (see `SweepBudget`).
+            if symbol_exact {
+                library_symbols.push((symbol, symbol_exact));
+            }
             continue;
         }
 
@@ -524,7 +673,16 @@ pub(crate) fn find_references_by_name_with_exact(
         }
     }
 
-    collect_library_refs(analysis, vfs, project_root, &library_symbols, &mut all_locations)?;
+    if incomplete.is_none() {
+        incomplete = collect_library_refs(
+            analysis,
+            vfs,
+            project_root,
+            &library_symbols,
+            budget,
+            &mut all_locations,
+        )?;
+    }
 
     // The symbol index carries module-scope declarations plus impl and trait
     // members. It does NOT carry fields — a struct's, a union's, or a
@@ -532,13 +690,14 @@ pub(crate) fn find_references_by_name_with_exact(
     // answer would be an empty list, which reads exactly like "nobody touches
     // this field". Ask the source instead. (Enum variants were expected to
     // share this fate and measurably do not; see `symbol_search_with_exact`.)
-    if !resolved_the_name {
-        collect_by_token_scan(
+    if !resolved_the_name && incomplete.is_none() && !is_path_query(symbol_name) {
+        incomplete = collect_by_token_scan(
             &analysis,
             vfs,
             project_root,
             name,
             Wants::DeclAndRefs,
+            budget,
             &mut all_locations,
         )?;
     }
@@ -551,7 +710,10 @@ pub(crate) fn find_references_by_name_with_exact(
         .dedup_by(|a, b| a.file_path == b.file_path && a.line == b.line && a.column == b.column);
     all_locations.sort_by_key(|location| !location.exact);
 
-    Ok(all_locations)
+    Ok(SweptAnswer {
+        locations: all_locations,
+        incomplete,
+    })
 }
 
 /// What the caller wants out of each definition the sweep resolves.
@@ -596,13 +758,18 @@ fn collect_by_token_scan(
     project_root: &Path,
     symbol_name: &str,
     wants: Wants,
+    budget: SweepBudget,
     out: &mut Vec<Location>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     // Positions already accounted for, so a definition reached through its
     // first occurrence is not re-queried through its remaining twenty.
     let mut covered: HashSet<(PathBuf, u32, u32)> = out.iter().map(location_key).collect();
 
-    for file_id in project_rust_files(vfs, project_root) {
+    let files = project_rust_files(vfs, project_root);
+    for (done, &file_id) in files.iter().enumerate() {
+        if budget.exhausted() {
+            return Ok(Some(budget.note("the token sweep", done, files.len())));
+        }
         let text = analysis.file_text(file_id)?;
         let line_index = analysis.file_line_index(file_id)?;
         let file_path = file_path_of(vfs, file_id)?;
@@ -645,7 +812,7 @@ fn collect_by_token_scan(
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 /// The `.rs` files under `project_root` the analysis knows, sorted.
@@ -694,10 +861,11 @@ fn collect_library_refs(
     vfs: &Vfs,
     project_root: &Path,
     symbols: &[(&NavigationTarget, bool)],
+    budget: SweepBudget,
     out: &mut Vec<Location>,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if symbols.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     // Declaration key → whether a full-name match led to it.
@@ -732,7 +900,11 @@ fn collect_library_refs(
         out.push(location);
     }
 
-    for file_id in project_rust_files(vfs, project_root) {
+    let files = project_rust_files(vfs, project_root);
+    for (done, &file_id) in files.iter().enumerate() {
+        if budget.exhausted() {
+            return Ok(Some(budget.note("the library-item sweep", done, files.len())));
+        }
         let text = analysis.file_text(file_id)?;
         let line_index = analysis.file_line_index(file_id)?;
         let file_path = file_path_of(vfs, file_id)?;
@@ -765,7 +937,7 @@ fn collect_library_refs(
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Whether a resolved definition is the thing the token sweep went looking for.
