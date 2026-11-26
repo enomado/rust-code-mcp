@@ -48,8 +48,13 @@ pub(crate) struct WordIndex {
     ids: HashMap<Box<str>, u32>,
     /// By word id; sorted, no duplicates.
     files_of: Vec<Vec<FileId>>,
-    /// By file; sorted, no duplicates. A file without words is absent.
-    words_of: HashMap<FileId, Vec<u32>>,
+    /// By word id: the files where the word stands as `word:` — the shape of
+    /// every named field's declaration (and of struct literal fields, typed
+    /// parameters and bindings, which only add candidates). Sorted.
+    field_files_of: Vec<Vec<FileId>>,
+    /// By file: its words, and those of them in field shape; sorted, no
+    /// duplicates. A file without words is absent.
+    words_of: HashMap<FileId, (Vec<u32>, Vec<u32>)>,
 }
 
 impl WordIndex {
@@ -60,29 +65,38 @@ impl WordIndex {
     /// word. A file indexed in increasing `FileId` order — as a build goes —
     /// appends to every list.
     pub(crate) fn set_file(&mut self, file: FileId, text: Option<&str>) {
-        if let Some(old) = self.words_of.remove(&file) {
+        if let Some((old, old_fields)) = self.words_of.remove(&file) {
             for word in old {
-                let files = &mut self.files_of[word as usize];
-                if let Ok(at) = files.binary_search(&file) {
-                    files.remove(at);
-                }
+                remove_sorted(&mut self.files_of[word as usize], file);
+            }
+            for word in old_fields {
+                remove_sorted(&mut self.field_files_of[word as usize], file);
             }
         }
         let Some(text) = text else {
             return;
         };
         let mut words: Vec<u32> = Vec::new();
-        for_each_code_word(text, |_, word| words.push(self.intern(word)));
-        words.sort_unstable();
-        words.dedup();
-        for &word in &words {
-            let files = &mut self.files_of[word as usize];
-            if let Err(at) = files.binary_search(&file) {
-                files.insert(at, file);
+        let mut field_words: Vec<u32> = Vec::new();
+        for_each_code_word(text, |_, word, field_shape| {
+            let id = self.intern(word);
+            words.push(id);
+            if field_shape {
+                field_words.push(id);
             }
+        });
+        for list in [&mut words, &mut field_words] {
+            list.sort_unstable();
+            list.dedup();
+        }
+        for &word in &words {
+            insert_sorted(&mut self.files_of[word as usize], file);
+        }
+        for &word in &field_words {
+            insert_sorted(&mut self.field_files_of[word as usize], file);
         }
         if !words.is_empty() {
-            self.words_of.insert(file, words);
+            self.words_of.insert(file, (words, field_words));
         }
     }
 
@@ -96,9 +110,22 @@ impl WordIndex {
         }
     }
 
+    /// The files where `word` stands in field shape (`word:`) — a subset of
+    /// [`Self::files_with`] holding every declaration of a named field `word`.
+    pub(crate) fn field_shape_files_with(&self, word: &str) -> &[FileId] {
+        let word = word.strip_prefix("r#").unwrap_or(word);
+        match self.ids.get(word) {
+            Some(&id) => &self.field_files_of[id as usize],
+            None => &[],
+        }
+    }
+
     /// Distinct words, and (word, file) pairs — for the load's log line.
     pub(crate) fn size(&self) -> (usize, usize) {
-        (self.ids.len(), self.words_of.values().map(Vec::len).sum())
+        (
+            self.ids.len(),
+            self.words_of.values().map(|(words, _)| words.len()).sum(),
+        )
     }
 
     fn intern(&mut self, word: &str) -> u32 {
@@ -108,29 +135,68 @@ impl WordIndex {
         let id = u32::try_from(self.files_of.len()).expect("fewer than 2^32 distinct words");
         self.ids.insert(word.into(), id);
         self.files_of.push(Vec::new());
+        self.field_files_of.push(Vec::new());
         id
+    }
+}
+
+fn insert_sorted(files: &mut Vec<FileId>, file: FileId) {
+    if let Err(at) = files.binary_search(&file) {
+        files.insert(at, file);
+    }
+}
+
+fn remove_sorted(files: &mut Vec<FileId>, file: FileId) {
+    if let Ok(at) = files.binary_search(&file) {
+        files.remove(at);
     }
 }
 
 /// Byte offsets of `word` in the code of `text` — the start of the identifier
 /// proper (after `r#`), in text order. What a sweep probes in a candidate file.
 pub(crate) fn code_occurrences(text: &str, word: &str) -> Vec<usize> {
+    occurrences(text, word, false)
+}
+
+/// [`code_occurrences`] in field shape only (`word:`, not `word::`): where a
+/// named field `word` can be declared.
+pub(crate) fn field_shape_occurrences(text: &str, word: &str) -> Vec<usize> {
+    occurrences(text, word, true)
+}
+
+fn occurrences(text: &str, word: &str, field_shape_only: bool) -> Vec<usize> {
     let word = word.strip_prefix("r#").unwrap_or(word);
     let mut found = Vec::new();
     if word.is_empty() {
         return found;
     }
-    for_each_code_word(text, |start, seen| {
-        if seen == word {
+    for_each_code_word(text, |start, seen, field_shape| {
+        if seen == word && (field_shape || !field_shape_only) {
             found.push(start);
         }
     });
     found
 }
 
-/// Call `visit(offset, word)` for every word in code; see the module header.
-fn for_each_code_word<'t>(text: &'t str, mut visit: impl FnMut(usize, &'t str)) {
+/// Call `visit(offset, word, field_shape)` for every word in code; see the
+/// module header. `field_shape`: the next token past whitespace and comments
+/// is a single `:` (a `::` path separator is two adjacent `:` tokens).
+fn for_each_code_word<'t>(text: &'t str, mut visit: impl FnMut(usize, &'t str, bool)) {
     let lexed = LexedStr::new(Edition::Edition2015, text);
+    let field_shape = |token: usize| {
+        let mut next = token + 1;
+        while next < lexed.len()
+            && matches!(
+                lexed.kind(next),
+                SyntaxKind::WHITESPACE | SyntaxKind::COMMENT
+            )
+        {
+            next += 1;
+        }
+        next < lexed.len()
+            && lexed.kind(next) == SyntaxKind::COLON
+            && (next + 1 >= lexed.len() || lexed.kind(next + 1) != SyntaxKind::COLON)
+    };
     for token in 0..lexed.len() {
         // Sliced from `text` itself, so the words outlive the lexer.
         let range = lexed.text_range(token);
@@ -138,12 +204,12 @@ fn for_each_code_word<'t>(text: &'t str, mut visit: impl FnMut(usize, &'t str)) 
         let token_text = &text[range];
         match lexed.kind(token) {
             SyntaxKind::IDENT => match token_text.strip_prefix("r#") {
-                Some(raw) => visit(start + 2, raw),
-                None => visit(start, token_text),
+                Some(raw) => visit(start + 2, raw, field_shape(token)),
+                None => visit(start, token_text, field_shape(token)),
             },
             SyntaxKind::STRING => {
                 for (offset, word) in format_captures(token_text) {
-                    visit(start + offset, word);
+                    visit(start + offset, word, false);
                 }
             }
             _ => {}
@@ -226,6 +292,28 @@ fn f(p: &Probe) -> u32 {
         }
         assert!(code_occurrences(text, "comment").is_empty());
         assert!(code_occurrences(text, "string").is_empty());
+    }
+
+    /// Field shape is `word:` — a declaration, a struct literal field, a typed
+    /// parameter — and not a call, a method, a path segment (`word::`), or the
+    /// word in a comment.
+    #[test]
+    fn field_shape_is_a_word_before_a_single_colon() {
+        let text = "struct Bit { pub rop: u32 }\n\
+                    fn rop(rop : u32) {}\n\
+                    fn f(b: Bit) { b.rop; rop(1); rop::x(); Bit { rop: 2 }; } // rop: no\n";
+        let lines: Vec<usize> = field_shape_occurrences(text, "rop")
+            .iter()
+            .map(|&at| text[..at].matches('\n').count())
+            .collect();
+        assert_eq!(lines, [0, 1, 2], "declaration, parameter, literal");
+        let mut index = WordIndex::default();
+        index.set_file(file(1), Some(text));
+        index.set_file(file(2), Some("fn g() { rop(); x.rop; }"));
+        assert_eq!(index.files_with("rop"), [file(1), file(2)]);
+        assert_eq!(index.field_shape_files_with("rop"), [file(1)]);
+        index.set_file(file(1), None);
+        assert!(index.field_shape_files_with("rop").is_empty());
     }
 
     #[test]

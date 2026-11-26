@@ -2329,6 +2329,55 @@ pub fn second() {
         assert!(matches!(classify_staleness(&old, &old, &layout), Staleness::Fresh));
     }
 
+    /// A field that shares its name with an indexed item — here a method on
+    /// another type, as accessors do — is answered too, by both tools. Before,
+    /// the index's match stopped the sweep and the field was left out (live on a
+    /// ~8000-file workspace: `rop`, `lenght`, 2026-11-26).
+    #[test]
+    fn a_field_named_like_a_method_is_found_beside_it() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        write_file(
+            &root.join("Cargo.toml"),
+            "[package]\nname = \"field_beside\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write_file(
+            &root.join("src/lib.rs"),
+            "pub struct Bit {\n    pub rop: u32,\n}\n\
+             pub struct Other;\n\
+             impl Other {\n    pub fn rop(&self) -> u32 {\n        0\n    }\n}\n\
+             pub fn reads(b: &Bit, o: &Other) -> u32 {\n    b.rop + o.rop() + Bit { rop: 1 }.rop\n}\n",
+        );
+        let ample = std::time::Duration::from_secs(600);
+        let service = SemanticService::new();
+
+        let defs = service
+            .symbol_search_within(root, "rop", 8, true, ample)
+            .expect("definition query");
+        let mut def_lines: Vec<u32> = defs.locations.iter().map(|location| location.line).collect();
+        def_lines.sort();
+        assert_eq!(def_lines, [2, 6], "the field and the method: {defs:?}");
+
+        let refs = service
+            .find_references_within(root, "rop", true, ample)
+            .expect("references query");
+        assert!(refs.incomplete.is_none(), "{refs:?}");
+        let mut at: Vec<(u32, u32)> = refs
+            .locations
+            .iter()
+            .filter(|location| location.name == "reference")
+            .map(|location| (location.line, location.column))
+            .collect();
+        at.sort();
+        // `b.rop`, `o.rop()`, the literal's `rop: 1`, the literal's `.rop`.
+        assert_eq!(at, [(11, 7), (11, 15), (11, 29), (11, 38)], "{refs:?}");
+        assert!(
+            refs.locations.iter().any(|location| location.line == 2),
+            "the field's declaration: {refs:?}"
+        );
+    }
+
     /// A crate with a struct field read once in `lib.rs`, and `fillers` modules
     /// that mention the field's name only in a comment and a string — what the
     /// old sweep read and probed one by one, and the word index skips.

@@ -6,7 +6,7 @@ use ra_ap_ide::{
 };
 use ra_ap_vfs::{Vfs, VfsPath};
 
-use super::word_index::{WordIndex, code_occurrences};
+use super::word_index::{WordIndex, code_occurrences, field_shape_occurrences};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -459,13 +459,21 @@ pub(crate) fn symbol_search_within(
 
     let mut incomplete = None;
     let mut cost = SweepCost::default();
-    if !locations.iter().any(|location| location.exact) && !is_path_query(symbol_name) {
+    // A full-name index match may still leave a field of the same name out:
+    // see `Occurrences`.
+    if !is_path_query(symbol_name) {
+        let scope = if locations.iter().any(|location| location.exact) {
+            Occurrences::FieldShape
+        } else {
+            Occurrences::AllCode
+        };
         incomplete = collect_by_token_scan(
             &analysis,
             vfs,
             words,
             leaf_name(symbol_name),
             Wants::DeclOnly,
+            scope,
             budget,
             &mut cost,
             &mut locations,
@@ -690,13 +698,21 @@ pub(crate) fn find_references_within(
     // answer would be an empty list, which reads exactly like "nobody touches
     // this field". Ask the source instead. (Enum variants were expected to
     // share this fate and measurably do not; see `symbol_search_with_exact`.)
-    if !resolved_the_name && incomplete.is_none() && !is_path_query(symbol_name) {
+    // A name the index did resolve may still be a field's too: see
+    // `Occurrences`.
+    if incomplete.is_none() && !is_path_query(symbol_name) {
+        let scope = if resolved_the_name {
+            Occurrences::FieldShape
+        } else {
+            Occurrences::AllCode
+        };
         incomplete = collect_by_token_scan(
             &analysis,
             vfs,
             words,
             name,
             Wants::DeclAndRefs,
+            scope,
             budget,
             &mut cost,
             &mut all_locations,
@@ -716,6 +732,26 @@ pub(crate) fn find_references_within(
         incomplete,
         cost,
     })
+}
+
+/// Which occurrences of the name the token sweep probes.
+///
+/// # Why a field beside an indexed name needs its own pass
+///
+/// The sweep used to run only when the symbol index resolved nothing of the
+/// name. A field that shares its name with an indexed item — `rop` with a
+/// `fn rop`, `lenght` with a method `lenght()`, very common for accessors —
+/// was then never looked for: on a ~8000-file workspace both answered without
+/// the field (2026-11-26), "fewer references than exist". Probing every
+/// occurrence of an indexed name would ask rust-analyzer about every call of
+/// it; a field's declaration always stands as `name:`, so that shape alone is
+/// probed, in the files the word index has it in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Occurrences {
+    /// Every occurrence in code: the index resolved nothing of the name.
+    AllCode,
+    /// Only `name:` — fields beside index matches of the same name.
+    FieldShape,
 }
 
 /// What the caller wants out of each definition the sweep resolves.
@@ -770,6 +806,7 @@ fn collect_by_token_scan(
     words: &WordIndex,
     symbol_name: &str,
     wants: Wants,
+    scope: Occurrences,
     budget: SweepBudget,
     cost: &mut SweepCost,
     out: &mut Vec<Location>,
@@ -778,7 +815,10 @@ fn collect_by_token_scan(
     // first occurrence is not re-queried through its remaining twenty.
     let mut covered: HashSet<(PathBuf, u32, u32)> = out.iter().map(location_key).collect();
 
-    let files = words.files_with(symbol_name);
+    let files = match scope {
+        Occurrences::AllCode => words.files_with(symbol_name),
+        Occurrences::FieldShape => words.field_shape_files_with(symbol_name),
+    };
     for (done, &file_id) in files.iter().enumerate() {
         if budget.exhausted() {
             return Ok(Some(budget.note("the token sweep", done, files.len())));
@@ -788,7 +828,11 @@ fn collect_by_token_scan(
         let file_path = file_path_of(vfs, file_id)?;
         cost.files_read += 1;
 
-        for start in code_occurrences(&text, symbol_name) {
+        let starts = match scope {
+            Occurrences::AllCode => code_occurrences(&text, symbol_name),
+            Occurrences::FieldShape => field_shape_occurrences(&text, symbol_name),
+        };
+        for start in starts {
             let line_col = line_index.line_col(TextSize::new(start as u32));
             let probe = (file_path.clone(), line_col.line + 1, line_col.col + 1);
             if !covered.insert(probe) {
