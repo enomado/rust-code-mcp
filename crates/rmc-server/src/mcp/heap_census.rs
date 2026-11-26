@@ -243,10 +243,17 @@ mod tests {
         let held = PRIVATE.read().expect("allocated through it");
         assert_eq!(held.requested_bytes, 25 * n as i64);
         if CHUNKS_MEASURED {
-            assert_eq!(
-                held.chunk_bytes,
-                Some(48 * n as i64),
-                "a 25-byte request occupies a 48-byte glibc chunk"
+            // 48 bytes each on a fresh heap — but this test binary's heap is
+            // not fresh: glibc serves a request from a free chunk it finds in
+            // a bin and hands over the whole chunk when the rest would be
+            // smaller than a chunk can be (32 bytes), so a chunk can be 16
+            // bytes bigger. Seen under the full parallel suite: 48016 for
+            // 48000, one 64-byte chunk. Still far from the 25 000 requested
+            // bytes a census mixing the two would report.
+            let chunks = held.chunk_bytes.unwrap();
+            assert!(
+                (48 * n as i64..=64 * n as i64).contains(&chunks),
+                "{n} chunks of 25 requested bytes occupy {chunks} bytes, not 48 to 64 each"
             );
         }
 

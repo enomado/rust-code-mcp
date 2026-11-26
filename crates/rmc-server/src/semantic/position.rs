@@ -264,7 +264,7 @@ pub(crate) fn goto_definition(
 /// Both exclusions are off on purpose: a `use` line and a `#[cfg(test)]` call
 /// site *are* references, and dropping either makes "who uses this" read lower
 /// than the truth — the failure this module is built to avoid.
-fn all_refs_config() -> ra_ap_ide::FindAllRefsConfig<'static> {
+pub(super) fn all_refs_config() -> ra_ap_ide::FindAllRefsConfig<'static> {
     ra_ap_ide::FindAllRefsConfig {
         ra_fixture: ra_ap_ide_db::ra_fixture::RaFixtureConfig::default(),
         search_scope: None,

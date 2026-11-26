@@ -771,4 +771,113 @@ mod tests {
             "{error}"
         );
     }
+
+    /// Probe, not a test: where one fixture load spends its time. Prints
+    /// the phases of a `Full` load of a one-file crate — `cargo metadata` of
+    /// the fixture, the sysroot's own workspace, build scripts, reading the
+    /// files into the database, priming — and the first query on it.
+    ///
+    /// `cargo test -p rmc-server --lib -- --ignored --nocapture fixture_load_phases`
+    #[test]
+    #[ignore = "probe: prints the phases of one fixture load"]
+    fn fixture_load_phases() {
+        use ra_ap_project_model::{ProjectManifest, ProjectWorkspace};
+        use std::time::Instant;
+
+        let fixture = tempfile::tempdir().expect("create fixture tempdir");
+        let root = fixture.path();
+        write_file(
+            &root.join("Cargo.toml"),
+            "[package]\nname = \"phases\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write_file(
+            &root.join("src/lib.rs"),
+            "pub fn target() {}\npub fn first() { target(); }\n",
+        );
+        let manifest = || {
+            ProjectManifest::discover_single(&super::AbsPathBuf::assert_utf8(
+                root.canonicalize().expect("fixture root"),
+            ))
+            .expect("discover the fixture")
+        };
+        let full = full_workspace_cargo_config().expect("the default config");
+        let no_sysroot = ra_ap_project_model::CargoConfig {
+            sysroot: None,
+            ..full.clone()
+        };
+
+        let at = Instant::now();
+        ProjectWorkspace::load(manifest(), &no_sysroot, &|_| {}).expect("metadata only");
+        let metadata = at.elapsed();
+        let at = Instant::now();
+        let workspace = ProjectWorkspace::load(manifest(), &full, &|_| {}).expect("with sysroot");
+        let with_sysroot = at.elapsed();
+        let at = Instant::now();
+        let scripts = workspace
+            .run_build_scripts(&full, &|_| {})
+            .expect("build scripts");
+        let build_scripts = at.elapsed();
+        drop(scripts);
+
+        let at = Instant::now();
+        let (mut db, primed_vfs, _layout) = load_unprimed(root, &full).expect("load unprimed");
+        let unprimed = at.elapsed();
+        let crates = all_crates(&db).len();
+        let at = Instant::now();
+        super::prime_in_batches(
+            &mut db,
+            super::prime_batch_files(),
+            num_cpus::get_physical(),
+        );
+        let prime = at.elapsed();
+        let primed = ra_ap_ide::AnalysisHost::with_database(db);
+        let (primed_query, primed_refs) = time_refs(&primed, &primed_vfs, root);
+
+        let (lazy, vfs, _layout) = load_unprimed(root, &full).expect("load unprimed again");
+        let lazy = ra_ap_ide::AnalysisHost::with_database(lazy);
+        let (lazy_query, lazy_refs) = time_refs(&lazy, &vfs, root);
+
+        eprintln!(
+            "fixture load phases ({crates} crates):\n  \
+             cargo metadata, no sysroot   {metadata:?}\n  \
+             metadata + sysroot workspace {with_sysroot:?}\n  \
+             build scripts                {build_scripts:?}\n  \
+             load_unprimed (all of it)    {unprimed:?}\n  \
+             prime_in_batches             {prime:?}\n  \
+             find_all_refs, primed        {primed_query:?} ({primed_refs} refs)\n  \
+             find_all_refs, unprimed      {lazy_query:?} ({lazy_refs} refs)"
+        );
+    }
+
+    /// `find_all_refs` on `target` at its declaration (offset 7 of
+    /// `src/lib.rs`): its time and the number of references found.
+    fn time_refs(
+        host: &ra_ap_ide::AnalysisHost,
+        vfs: &ra_ap_vfs::Vfs,
+        root: &Path,
+    ) -> (std::time::Duration, usize) {
+        let path = root.join("src/lib.rs").canonicalize().expect("lib.rs");
+        let (file_id, _) = vfs
+            .file_id(&ra_ap_vfs::VfsPath::new_real_path(
+                path.to_string_lossy().into_owned(),
+            ))
+            .expect("lib.rs is loaded");
+        let at = std::time::Instant::now();
+        let refs = host
+            .analysis()
+            .find_all_refs(
+                ra_ap_ide::FilePosition {
+                    file_id,
+                    offset: 7.into(),
+                },
+                &super::super::position::all_refs_config(),
+            )
+            .expect("not cancelled")
+            .unwrap_or_default();
+        let count = refs
+            .iter()
+            .map(|found| found.references.values().map(Vec::len).sum::<usize>())
+            .sum();
+        (at.elapsed(), count)
+    }
 }

@@ -30,7 +30,8 @@ use std::{
 };
 use tempfile::{Builder, TempDir};
 
-// Default-snapshot cases share `~/.local/share/search/graphs/...`. heed forbids
+// Default-snapshot cases share the default data directory's `graphs/` — the
+// test binary's own, not the user's (`test_data_dir` in `lib.rs`). heed forbids
 // opening the same env twice in the same process, so one async test runs those
 // cases sequentially instead of relying on `--test-threads=1`.
 static DEFAULT_SNAPSHOT_BUILT: OnceLock<()> = OnceLock::new();

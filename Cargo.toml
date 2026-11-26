@@ -140,3 +140,24 @@ fs2 = "0.4"
 
 [patch.crates-io]
 fastembed = { path = "vendor/fastembed" }
+
+# Dependencies optimised in dev and test builds; the workspace's own crates stay
+# at opt-level 0 for quick rebuilds. `test` inherits these from `dev`.
+#
+# Why: every semantic test loads a fixture with the sysroot, and the first query
+# computes the def maps of `core`/`alloc`/`std`. With rust-analyzer and salsa at
+# opt-level 0 that alone took 27 s on a two-line crate (the probe
+# `fixture_load_phases`: metadata + sysroot + build scripts + reading the files
+# 0.36 s, priming 27.4 s, or the same 27.1 s paid lazily by the first
+# `find_all_refs` when not primed), and the library suite ran 805 s.
+[profile.dev.package."*"]
+opt-level = 2
+codegen-units = 16
+debug = "line-tables-only"
+
+# Build scripts and proc macros: no debuginfo, the same in dev and test, so the
+# two profiles share these units.
+[profile.dev.build-override]
+debug = 0
+[profile.test.build-override]
+debug = 0

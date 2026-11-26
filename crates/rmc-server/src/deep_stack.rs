@@ -78,6 +78,7 @@ fn enter_shared() -> RwLockReadGuard<'static, ()> {
 /// whichever sweep test happened to be waiting beside them.
 #[cfg(test)]
 fn enter_exclusive() -> RwLockWriteGuard<'static, ()> {
+    let _waiting = TestWriterWaiting::announce();
     loop {
         match ANALYSIS_GATE.try_write() {
             Ok(guard) => return guard,
@@ -86,6 +87,45 @@ fn enter_exclusive() -> RwLockWriteGuard<'static, ()> {
                 std::thread::sleep(std::time::Duration::from_millis(5))
             }
         }
+    }
+}
+
+/// Test writers waiting for the gate; while there is one,
+/// [`test_holding_an_analysis`] lets it in first.
+///
+/// # Why
+///
+/// A writer that only polls starves while readers overlap: the semantic tests
+/// each hold the gate shared for their whole body (tens of seconds), the test
+/// harness runs many at once, and the gate was not free once in a minute —
+/// `a_collection_neither_overlaps_…`'s positive control failed so under the full
+/// suite, and the sweeping tests queued to the very end of it. Readers that
+/// arrive while a writer waits now wait too, so the gate drains.
+///
+/// Only the tests' own door yields. The served [`run_analysis`] does not look at
+/// this — that is the property `a_collection_neither_overlaps_…` checks — and
+/// it is never nested inside `test_holding_an_analysis` by a caller who would
+/// then wait on itself (a test takes its guard once, first thing).
+#[cfg(test)]
+static TEST_WRITERS_WAITING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// One waiting writer for as long as it lives.
+#[cfg(test)]
+pub(crate) struct TestWriterWaiting(());
+
+#[cfg(test)]
+impl TestWriterWaiting {
+    pub(crate) fn announce() -> Self {
+        TEST_WRITERS_WAITING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestWriterWaiting {
+    fn drop(&mut self) {
+        TEST_WRITERS_WAITING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -106,6 +146,9 @@ fn enter_exclusive() -> RwLockWriteGuard<'static, ()> {
 /// schedule. One gate, the real one, or none.
 #[cfg(test)]
 pub(crate) fn test_holding_an_analysis() -> RwLockReadGuard<'static, ()> {
+    while TEST_WRITERS_WAITING.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     enter_shared()
 }
 
@@ -484,8 +527,11 @@ mod tests {
         );
 
         // Positive control: once the gate is free the same attempt runs.
-        // Retried, because other tests in this binary hold the gate too.
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        // Retried, because other tests in this binary hold the gate too; the
+        // announcement makes the tests that hold it for long wait to enter, so
+        // the gate does come free (see `TestWriterWaiting`).
+        let _waiting = super::TestWriterWaiting::announce();
+        let deadline = std::time::Instant::now() + Duration::from_secs(300);
         loop {
             let ran = try_run_exclusive_analysis("exclusive", || {
                 EXCLUSIVE_STARTED.store(true, Ordering::SeqCst);

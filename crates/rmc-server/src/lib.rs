@@ -33,6 +33,53 @@ static TEST_GLOBAL_ALLOCATOR: mcp::heap_census::CensusAllocator<std::alloc::Syst
         census: &mcp::heap_census::GLOBAL_CENSUS,
     };
 
+/// The test binary keeps its data (graph snapshots, index caches, file-text
+/// copies) in a directory of its own, removed at exit, not in the user's
+/// `~/.local/share/search`.
+///
+/// # Why
+///
+/// The served data directory is shared with every live daemon, and the graph
+/// tests build the snapshot of this very workspace — the one a daemon serving a
+/// session in this repository builds and prunes too. One run failed on ENOENT
+/// for the snapshot's `manifest.json`: removed under the test mid-write.
+///
+/// # How
+///
+/// Every data directory in the workspace resolves through `XDG_DATA_HOME`
+/// (`directories::ProjectDirs`), so the variable is set — before `main`, from
+/// `.init_array`, while the process has one thread and setting the environment
+/// is sound. Cache directories (model weights, kernel caches) are left alone:
+/// sharing them costs nothing and refetching them would cost a download.
+#[cfg(all(test, target_os = "linux"))]
+mod test_data_dir {
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+
+    #[used]
+    #[unsafe(link_section = ".init_array")]
+    static SET_BEFORE_MAIN: extern "C" fn() = set_before_main;
+
+    extern "C" fn set_before_main() {
+        let dir = std::env::temp_dir().join(format!("rmc-server-test-data-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the test data directory");
+        // SAFETY: runs from `.init_array`, before `main`: no other thread exists
+        // yet to read the environment concurrently.
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
+        DIR.set(dir).expect("set once");
+        // SAFETY: `remove` is a plain `extern "C" fn()` with no captured state.
+        unsafe { libc::atexit(remove) };
+    }
+
+    extern "C" fn remove() {
+        if let Some(dir) = DIR.get() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
 pub(crate) mod deep_stack;
 pub mod panic_boundary;
 pub mod tools;
