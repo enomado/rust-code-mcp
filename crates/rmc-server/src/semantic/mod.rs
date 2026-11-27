@@ -10,6 +10,7 @@ pub(crate) mod position;
 mod rename;
 mod surface;
 mod tree_watch;
+mod units;
 /// What a name query costs and resolves when the name is fuzzy, a field or a
 /// path (plan item `no-brute-sweeps`): `find_references`, `rename_symbol`.
 #[cfg(test)]
@@ -18,6 +19,11 @@ mod word_index;
 #[cfg(test)]
 mod use_census;
 mod uses;
+mod widening;
+/// What narrowing the widening of a surface change by names would make pending
+/// on a project's recent history (plan step `uses-narrow-widening`). Measurement only.
+#[cfg(test)]
+mod widening_census;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -640,6 +646,9 @@ struct Patched {
     /// Names of the crates whose root is in a root with a surface change, for
     /// the log line: a wide invalidation is read by who caused it.
     surface_crates: String,
+    /// How the files made pending were chosen (`widening` module): by the
+    /// names the change reaches, or by the crates and why.
+    widening: String,
 }
 
 /// The display names of the crates whose root file is in one of `roots`,
@@ -880,32 +889,49 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
 
     // The source roots of changes that may re-resolve other files' uses
     // (`surface` module header): an edit that changed the file's surface, an
-    // added or a removed file (the module tree may follow). Decided on the
-    // texts the database holds before the change. Cost: the edited files'
-    // old and new texts parsed once each.
+    // added or a removed file (the module tree may follow); and of each such
+    // change its changed units (`units` module), by write (an index into
+    // `writes`: an added file has no id yet) or deletion — the old side's
+    // macros expanded here, on the texts the database holds before the
+    // change. Cost: the edited files' old and new texts parsed once each, and
+    // the changed macro calls among them expanded.
     let mut surface_roots: std::collections::BTreeSet<SourceRootId> = Default::default();
+    let mut changed_writes: Vec<(usize, Vec<(units::Side, units::Unit)>)> = Vec::new();
+    let mut changed_deletions: Vec<(FileId, Vec<(units::Side, units::Unit)>)> = Vec::new();
     {
         let db = ctx.host.raw_database();
         // Dropped before `trigger_cancellation`, which would wait for it.
         let analysis = ctx.host.analysis();
-        for (_, target, text) in &writes {
-            match target {
-                Target::New(root) => {
-                    surface_roots.insert(*root);
-                }
-                Target::Known(file_id) => {
-                    let old = analysis
-                        .file_text(*file_id)
-                        .expect("the slot is held: nothing writes the database");
-                    if surface::surface_of(&old) != surface::surface_of(text) {
-                        surface_roots.insert(db.file_source_root(*file_id).source_root_id(db));
+        let old_text = |file_id: FileId| {
+            analysis
+                .file_text(file_id)
+                .expect("the slot is held: nothing writes the database")
+        };
+        ra_ap_hir::attach_db(db, || {
+            let sema = ra_ap_hir::Semantics::new(db);
+            let expand = |_side, file, at, attr, module: &[String]| expand_units(&sema, file, at, attr, module);
+            for (index, (_, target, text)) in writes.iter().enumerate() {
+                match target {
+                    Target::New(root) => {
+                        surface_roots.insert(*root);
+                        changed_writes.push((index, units::changed_units(None, Some(text))));
+                    }
+                    Target::Known(file_id) => {
+                        let old = old_text(*file_id);
+                        if surface::surface_of(&old) != surface::surface_of(text) {
+                            surface_roots.insert(db.file_source_root(*file_id).source_root_id(db));
+                            let changed = units::changed_units(Some(&old), Some(text));
+                            changed_writes.push((index, widening::expand_old_side(*file_id, changed, &expand)));
+                        }
                     }
                 }
             }
-        }
-        for (_, file_id) in &deletions {
-            surface_roots.insert(db.file_source_root(*file_id).source_root_id(db));
-        }
+            for (_, file_id) in &deletions {
+                surface_roots.insert(db.file_source_root(*file_id).source_root_id(db));
+                let changed = units::changed_units(Some(&old_text(*file_id)), None);
+                changed_deletions.push((*file_id, widening::expand_old_side(*file_id, changed, &expand)));
+            }
+        });
     }
     patched.surface_changes = surface_roots.len();
 
@@ -994,28 +1020,19 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
             words.set_file(*file_id, text.as_deref());
         }
     }
-    // The table of uses: the changed files are pending, a removed one gone;
-    // after a surface change also every file whose resolution may follow it —
-    // the files of the changed roots' crates and of their reverse dependencies
-    // (`uses` module header).
-    {
-        let db = &*db;
-        let stale_roots = roots_depending_on(db, &surface_roots);
-        let mut uses = ctx.uses.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-        patched.uses_widened = uses.mark_pending_where(|file| {
-            !stale_roots.is_empty()
-                && stale_roots.contains(&db.file_source_root(file).source_root_id(db))
-        });
-        patched.surface_crates = surface_crate_names(db, &surface_roots);
-        for ((file_id, text), _) in texts.iter().zip(&local).filter(|(_, local)| **local) {
-            match text {
-                Some(_) => uses.mark_pending(*file_id),
-                None => uses.forget(*file_id),
-            }
-        }
-        patched.uses_pending = uses.size().1;
-    }
-
+    // What the table of uses is to make pending, by file: pending (an edited
+    // or added file), gone (a removed one) — of the local roots only.
+    let marks: Vec<(FileId, bool)> = texts
+        .iter()
+        .zip(&local)
+        .filter(|(_, local)| **local)
+        .map(|((file_id, text), _)| (*file_id, text.is_some()))
+        .collect();
+    let changed: Vec<(FileId, Vec<(units::Side, units::Unit)>)> = changed_writes
+        .into_iter()
+        .map(|(index, units)| (texts[index].0, units))
+        .chain(changed_deletions)
+        .collect();
     let mut change = ChangeWithProcMacros::default();
     for (file_id, text) in texts {
         // `None` empties the text: a file cannot be removed from the
@@ -1023,8 +1040,204 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
         change.change_file(file_id, text);
     }
     ctx.host.apply_change(change);
+
+    // The table of uses: the changed files are pending, a removed one gone;
+    // after a surface change also every file whose resolution may follow it
+    // (`widening` module): those the changed units reach by name, within the
+    // files of the changed roots' crates and of their reverse dependencies —
+    // or all of those when the names cannot tell. Decided on the new texts:
+    // the new side's macros are expanded on them.
+    {
+        let db = ctx.host.raw_database();
+        let stale_roots = roots_depending_on(db, &surface_roots);
+        let reached = if stale_roots.is_empty() || changed.is_empty() {
+            None
+        } else {
+            let vfs = read_vfs(&ctx.vfs);
+            let words = read_words(&ctx.words);
+            Some(widen_in_database(db, &vfs, &words, &changed, &stale_roots))
+        };
+        let mut uses = ctx.uses.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        patched.uses_widened = match &reached {
+            None => 0,
+            Some(widening::Widening::Roots(_)) => uses.mark_pending_where(|file| {
+                stale_roots.contains(&db.file_source_root(file).source_root_id(db))
+            }),
+            Some(widening::Widening::Files { files, .. }) => {
+                uses.mark_pending_where(|file| files.contains(&file))
+            }
+        };
+        patched.widening = match &reached {
+            None => String::new(),
+            Some(widening::Widening::Roots(why)) => format!(" — by the crates: {why}"),
+            Some(widening::Widening::Files { files, names, parsed, expanded }) => {
+                const SHOWN: usize = 8;
+                let rest = names.len().saturating_sub(SHOWN);
+                let mut shown = names[..names.len().min(SHOWN)].join(", ");
+                if rest > 0 {
+                    shown.push_str(&format!(" (+{rest} more)"));
+                }
+                format!(
+                    " — by {} name(s) [{shown}]: {} file(s), {parsed} parsed, {expanded} expanded",
+                    names.len(),
+                    files.len()
+                )
+            }
+        };
+        patched.surface_crates = surface_crate_names(db, &surface_roots);
+        for (file_id, kept) in marks {
+            if kept {
+                uses.mark_pending(file_id);
+            } else {
+                uses.forget(file_id);
+            }
+        }
+        patched.uses_pending = uses.size().1;
+    }
     Ok(patched)
 }
+
+/// The files `changed` can make re-resolve (`widening::widen`), on the
+/// database after the change: the candidates' texts, its macro expansions,
+/// the module files from the source roots' file sets; `stale_roots` bound it.
+fn widen_in_database(
+    db: &ra_ap_ide::RootDatabase,
+    vfs: &Vfs,
+    words: &word_index::WordIndex,
+    changed: &[(ra_ap_ide_db::base_db::FileId, Vec<(units::Side, units::Unit)>)],
+    stale_roots: &HashSet<ra_ap_ide_db::base_db::SourceRootId>,
+) -> widening::Widening {
+    use ra_ap_ide_db::base_db::{FileId, SourceDatabase};
+
+    ra_ap_hir::attach_db(db, || {
+        let sema = ra_ap_hir::Semantics::new(db);
+        let reachable = |file: FileId| stale_roots.contains(&db.file_source_root(file).source_root_id(db));
+        let text = |file: FileId| db.file_text(file).text(db).to_string();
+        let module_files = |file: FileId, module: &units::ModuleFiles| module_files_in(db, vfs, file, module);
+        let expand = |side: units::Side, file, at, attr, module: &[String]| match side {
+            units::Side::Old => Err("an old side's macro left unexpanded".to_owned()),
+            units::Side::New => expand_units(&sema, file, at, attr, module),
+        };
+        let scope = widening::Scope {
+            words,
+            reachable: &reachable,
+            text: &text,
+            module_files: &module_files,
+            expand: &expand,
+            parse_budget: widening::PARSE_BUDGET,
+            trace: None,
+        };
+        widening::widen(changed, &scope)
+    })
+}
+
+/// The files of `module` declared in `file` (`widening::module_paths`), from
+/// the file set of `file`'s source root.
+///
+/// Cost: one pass over that root's files — a package's, ≤ a few thousand.
+fn module_files_in(
+    db: &ra_ap_ide::RootDatabase,
+    vfs: &Vfs,
+    file: ra_ap_ide_db::base_db::FileId,
+    module: &units::ModuleFiles,
+) -> Vec<ra_ap_ide_db::base_db::FileId> {
+    use ra_ap_ide_db::base_db::SourceDatabase;
+
+    let Some(declaring) = vfs.file_path(file).as_path().map(|path| -> PathBuf { AsRef::<Path>::as_ref(path).to_owned() }) else {
+        return Vec::new();
+    };
+    let (exact, dirs) = widening::module_paths(&declaring, module);
+    let root = db.file_source_root(file).source_root_id(db);
+    let files = db.source_root(root).source_root(db);
+    files
+        .iter()
+        .filter(|candidate| {
+            let Some(path) = files.path_for_file(candidate).and_then(|path| path.as_path()) else {
+                return false;
+            };
+            let path: &Path = path.as_ref();
+            exact.iter().any(|wanted| wanted == path) || dirs.iter().any(|dir| path.starts_with(dir))
+        })
+        .collect()
+}
+
+/// The units of what the macro at `at` in `file` expands to, on the database
+/// `sema` reads (`Reach::Expand`): a macro call's expansion, an attribute
+/// macro's, or — an attribute that is no macro — the item as written; macros
+/// within expanded in their turn. `Err`: the macro does not resolve or its
+/// expansion failed (a proc macro not built, say) — what it defines is then
+/// unknown.
+///
+/// Cost: one expansion per macro, memoised by salsa; a call nested deeper than
+/// [`MAX_EXPANSION_DEPTH`] gives up.
+fn expand_units(
+    sema: &ra_ap_hir::Semantics<'_, ra_ap_ide::RootDatabase>,
+    file: ra_ap_ide_db::base_db::FileId,
+    at: ra_ap_syntax::TextRange,
+    attr: bool,
+    module: &[String],
+) -> std::result::Result<Vec<units::Unit>, String> {
+    use ra_ap_syntax::AstNode;
+
+    let source = sema.parse_guess_edition(file);
+    expand_in(sema, source.syntax(), at, attr, module, 0)
+}
+
+/// How deep macro expansions are followed for a change's reach.
+const MAX_EXPANSION_DEPTH: usize = 16;
+
+fn expand_in(
+    sema: &ra_ap_hir::Semantics<'_, ra_ap_ide::RootDatabase>,
+    root: &ra_ap_syntax::SyntaxNode,
+    at: ra_ap_syntax::TextRange,
+    attr: bool,
+    module: &[String],
+    depth: usize,
+) -> std::result::Result<Vec<units::Unit>, String> {
+    use ra_ap_syntax::AstNode;
+
+    if depth > MAX_EXPANSION_DEPTH {
+        return Err(format!("macros nested deeper than {MAX_EXPANSION_DEPTH}"));
+    }
+    // The units, and the tree their ranges are in.
+    let (found, tree) = if attr {
+        let item = units::item_at(root, at).ok_or("no item where an attribute macro was")?;
+        match sema.expand_attr_macro(&item) {
+            None => {
+                let written = units::as_written(root, at, module).ok_or("no item where an attribute macro was")?;
+                (written, root.clone())
+            }
+            Some(expansion) => {
+                if let Some(error) = expansion.err {
+                    return Err(format!("an attribute macro that does not expand: {}", error.render_to_string(sema.db)));
+                }
+                let tree = expansion.value.value;
+                (units::expansion_units(&tree, module), tree)
+            }
+        }
+    } else {
+        let call = units::macro_call_at(root, at).ok_or("no macro call where one was")?;
+        let name = call.path().map(|path| path.syntax().text().to_string()).unwrap_or_default();
+        let id = sema.to_def(&call).ok_or_else(|| format!("a macro {name}! that does not resolve"))?;
+        let expansion = sema.expand(id);
+        if let Some(error) = expansion.err {
+            return Err(format!("a macro {name}! that does not expand: {}", error.render_to_string(sema.db)));
+        }
+        let tree = expansion.value;
+        (units::expansion_units(&tree, module), tree)
+    };
+    let mut out = Vec::with_capacity(found.len());
+    for unit in found {
+        match &unit.reach {
+            units::Reach::Expand { at, attr, module } => {
+                out.extend(expand_in(sema, &tree, *at, *attr, module, depth + 1)?);
+            }
+            _ => out.push(unit),
+        }
+    }
+    Ok(out)
+}
+
 
 /// How many project contexts may stay loaded at once. `0` means unlimited.
 ///
@@ -1637,7 +1850,7 @@ fn refresh_if_stale(
                 tracing::info!(
                     "Refreshed {} without a reload: {} edited, {} added, {} removed, {} outside \
                      the analysis; database loaded {} s ago; table of uses: {} file(s) pending, \
-                     {} ready made pending by a surface change in {} root(s) [{}]",
+                     {} ready made pending by a surface change in {} root(s) [{}]{}",
                     canonical.display(),
                     patched.edited,
                     patched.added,
@@ -1647,7 +1860,8 @@ fn refresh_if_stale(
                     patched.uses_pending,
                     patched.uses_widened,
                     patched.surface_changes,
-                    patched.surface_crates
+                    patched.surface_crates,
+                    patched.widening
                 );
                 Ok(())
             }
@@ -4339,9 +4553,9 @@ edition = "2021"
         assert_eq!(stored.cost.files_from_table, 2, "{stored:?}");
     }
 
-    /// A refresh that adds an item leaves no file of the crate ready (a surface
-    /// change, `surface` module header): the edited file's new call is in the
-    /// answer, swept live.
+    /// A refresh that adds an item makes pending the edited file and those
+    /// naming the item (`widening` module) — here none: `lib.rs` stays ready
+    /// and answers from the table, the edited file's new call is swept live.
     #[test]
     fn an_edit_after_the_table_is_built_is_answered_live() {
         let _analysis = holding_an_analysis();
@@ -4361,7 +4575,7 @@ edition = "2021"
             .expect("references query");
         assert_eq!(refs_in(&found.locations, "src/more.rs"), 2, "{found:?}");
         assert_eq!(refs_in(&found.locations, "src/lib.rs"), 3, "{found:?}");
-        assert_eq!(found.cost.files_from_table, 0, "every file pending again: {found:?}");
+        assert_eq!(found.cost.files_from_table, 1, "`lib.rs` names no new item: {found:?}");
 
         fill_use_table(&service, root);
         let stored = service
@@ -4523,14 +4737,19 @@ edition = "2021"
         use_table_by_path(&service, root).0
     }
 
-    /// `uses-freshness`: a refresh makes pending only what may now resolve
-    /// differently — the edited file for an edit inside a body; the files of
-    /// its crate and of the crates depending on it for a surface change (a
-    /// signature, an `impl` inside a body, a new or a removed file) — and the
-    /// table rebuilt from there is the table a fresh load builds, after every
-    /// kind of edit. The signature edit re-resolves `.map` in files that did
-    /// not change (`Option::map` → `Result::map` in `b` and in `a/src/more.rs`):
-    /// keeping them ready would leave rows of a type that is gone.
+    /// `uses-freshness`, `uses-narrow-widening`: a refresh makes pending only
+    /// what may now resolve differently — the edited file for an edit inside a
+    /// body; for a surface change the files its changed units reach (`units`,
+    /// `widening`): those naming a changed function, those that may hold a
+    /// value of a type whose alias or impl changed, the crates' files for a
+    /// changed macro definition — and the table rebuilt from there is the
+    /// table a fresh load builds, after every kind of edit. The signature edit
+    /// re-resolves `.map` in files that did not change (`Option::map` →
+    /// `Result::map` in `b` and in `a/src/more.rs`): keeping them ready would
+    /// leave rows of a type that is gone. The alias edit does the same in `b`,
+    /// which does not name the alias: it names `get`, whose signature does
+    /// (plan counterexample (a)). The macro step has `b` call a method an
+    /// item macro expands to: only the expansion tells.
     #[test]
     fn after_each_edit_the_table_rebuilt_from_its_pending_files_is_a_fresh_one() {
         let _analysis = holding_an_analysis();
@@ -4548,7 +4767,8 @@ edition = "2021"
         assert_eq!(built, fresh_use_table(root), "a built table is a fresh one");
 
         let a_crate = ["a/src/lib.rs", "a/src/more.rs", "b/src/lib.rs"];
-        let steps: [(&str, &dyn Fn(&Path), &[&str]); 5] = [
+        let a_and_b = ["a/src/lib.rs", "b/src/lib.rs"];
+        let steps: [(&str, &dyn Fn(&Path), &[&str]); 9] = [
             (
                 "an edit inside a body",
                 &|root| {
@@ -4568,7 +4788,8 @@ edition = "2021"
                          impl W {\n        pub fn w(&self) {}\n    }\n    Some(2)\n}\n",
                     )
                 },
-                &a_crate,
+                // `W` and `w` are named nowhere else.
+                &["a/src/lib.rs"],
             ),
             (
                 "a signature",
@@ -4603,7 +4824,61 @@ edition = "2021"
                     );
                     fs::remove_file(root.join("a/src/more.rs")).expect("remove more.rs");
                 },
-                &["a/src/lib.rs", "b/src/lib.rs"],
+                // `twice` was named nowhere else; `b` follows nothing changed.
+                &["a/src/lib.rs"],
+            ),
+            (
+                "an alias in a signature",
+                &|root| {
+                    write_file(
+                        &root.join("a/src/lib.rs"),
+                        "pub type Foo = Result<u8, ()>;\n\npub fn get() -> Foo {\n    Ok(1)\n}\n",
+                    )
+                },
+                &a_and_b,
+            ),
+            (
+                "the alias's target behind an unchanged signature",
+                &|root| {
+                    write_file(
+                        &root.join("a/src/lib.rs"),
+                        "pub type Foo = Option<u8>;\n\npub fn get() -> Foo {\n    Some(1)\n}\n",
+                    )
+                },
+                &a_and_b,
+            ),
+            (
+                "a macro definition",
+                &|root| {
+                    write_file(
+                        &root.join("a/src/lib.rs"),
+                        "pub type Foo = Option<u8>;\n\npub fn get() -> Foo {\n    Some(1)\n}\n\n\
+                         pub struct W;\n\n#[macro_export]\nmacro_rules! made_for {\n    ($t:ident) => {\n        \
+                         impl $t {\n            pub fn made(&self) -> Option<u8> {\n                None\n            }\n        \
+                         }\n    };\n}\n",
+                    );
+                    write_file(
+                        &root.join("b/src/lib.rs"),
+                        "pub fn use_it() -> u8 {\n    a::get().map(|x| x + 1).unwrap_or(0)\n}\n\n\
+                         pub fn via() -> u8 {\n    a::W.made().map(|x| x).unwrap_or(0)\n}\n",
+                    );
+                },
+                // A changed macro definition: the crates.
+                &a_and_b,
+            ),
+            (
+                "an item macro that expands to an impl",
+                &|root| {
+                    write_file(
+                        &root.join("a/src/lib.rs"),
+                        "pub type Foo = Option<u8>;\n\npub fn get() -> Foo {\n    Some(1)\n}\n\n\
+                         pub struct W;\n\n#[macro_export]\nmacro_rules! made_for {\n    ($t:ident) => {\n        \
+                         impl $t {\n            pub fn made(&self) -> Option<u8> {\n                None\n            }\n        \
+                         }\n    };\n}\n\nmade_for!(W);\n",
+                    )
+                },
+                // `b` calls `made` on a `W`: the expansion's method.
+                &a_and_b,
             ),
         ];
         for (edit, apply, expected_pending) in steps {
@@ -4618,10 +4893,19 @@ edition = "2021"
             assert_eq!(rebuilt, fresh_use_table(root), "{edit}: the rebuilt table is a fresh one");
         }
         let (rebuilt, _) = use_table_by_path(&service, root);
-        assert!(
-            rebuilt.iter().any(|row| row.0 == "b/src/lib.rs" && row.2.ends_with("result.rs")),
-            "`.map` in b follows the new signature into result.rs: {rebuilt:?}"
+        let maps_into = |file: &str| -> Vec<u32> {
+            rebuilt
+                .iter()
+                .filter(|row| row.0 == "b/src/lib.rs" && row.2.ends_with(file))
+                .map(|row| row.1)
+                .collect()
+        };
+        assert_eq!(
+            maps_into("option.rs").len(),
+            4,
+            "`.map`/`.unwrap_or` in b follow the alias and the expanded method into option.rs: {rebuilt:?}"
         );
+        assert!(maps_into("result.rs").is_empty(), "{rebuilt:?}");
     }
 
     /// `uses-bur`: the builder fills the table leaves of the crate graph

@@ -52,9 +52,21 @@ pub(crate) struct WordIndex {
     /// every named field's declaration (and of struct literal fields, typed
     /// parameters and bindings, which only add candidates). Sorted.
     field_files_of: Vec<Vec<FileId>>,
-    /// By file: its words, and those of them in field shape; sorted, no
-    /// duplicates. A file without words is absent.
-    words_of: HashMap<FileId, (Vec<u32>, Vec<u32>)>,
+    /// By word id: how many files declare a type of that name — `struct`,
+    /// `enum`, `union`, `type`, `trait` right before it, or `as` (an import
+    /// alias; a cast `as u32` counts too, which only keeps a name). Whether a
+    /// name in a trait impl's header can be a project type (`surface::Witness`).
+    declaring_files: Vec<u32>,
+    /// By file: its words, those of them in field shape, those it declares
+    /// as types; sorted, no duplicates. A file without words is absent.
+    words_of: HashMap<FileId, FileWords>,
+}
+
+#[derive(Default)]
+struct FileWords {
+    words: Vec<u32>,
+    fields: Vec<u32>,
+    declared: Vec<u32>,
 }
 
 impl WordIndex {
@@ -65,39 +77,56 @@ impl WordIndex {
     /// word. A file indexed in increasing `FileId` order — as a build goes —
     /// appends to every list.
     pub(crate) fn set_file(&mut self, file: FileId, text: Option<&str>) {
-        if let Some((old, old_fields)) = self.words_of.remove(&file) {
-            for word in old {
+        if let Some(old) = self.words_of.remove(&file) {
+            for word in old.words {
                 remove_sorted(&mut self.files_of[word as usize], file);
             }
-            for word in old_fields {
+            for word in old.fields {
                 remove_sorted(&mut self.field_files_of[word as usize], file);
+            }
+            for word in old.declared {
+                self.declaring_files[word as usize] -= 1;
             }
         }
         let Some(text) = text else {
             return;
         };
-        let mut words: Vec<u32> = Vec::new();
-        let mut field_words: Vec<u32> = Vec::new();
-        for_each_code_word(text, |_, word, field_shape| {
+        let mut new = FileWords::default();
+        for_each_code_word(text, |_, word, shape| {
             let id = self.intern(word);
-            words.push(id);
-            if field_shape {
-                field_words.push(id);
+            new.words.push(id);
+            if shape.field {
+                new.fields.push(id);
+            }
+            if shape.declared {
+                new.declared.push(id);
             }
         });
-        for list in [&mut words, &mut field_words] {
+        for list in [&mut new.words, &mut new.fields, &mut new.declared] {
             list.sort_unstable();
             list.dedup();
         }
-        for &word in &words {
+        for &word in &new.words {
             insert_sorted(&mut self.files_of[word as usize], file);
         }
-        for &word in &field_words {
+        for &word in &new.fields {
             insert_sorted(&mut self.field_files_of[word as usize], file);
         }
-        if !words.is_empty() {
-            self.words_of.insert(file, (words, field_words));
+        for &word in &new.declared {
+            self.declaring_files[word as usize] += 1;
         }
+        if !new.words.is_empty() {
+            self.words_of.insert(file, new);
+        }
+    }
+
+    /// Whether some project file declares a type named `word` (see
+    /// `declaring_files`).
+    pub(crate) fn is_declared(&self, word: &str) -> bool {
+        let word = word.strip_prefix("r#").unwrap_or(word);
+        self.ids
+            .get(word)
+            .is_some_and(|&id| self.declaring_files[id as usize] > 0)
     }
 
     /// The files whose code holds `word` (a raw `r#x` is asked as `x`), in
@@ -124,7 +153,7 @@ impl WordIndex {
     pub(crate) fn size(&self) -> (usize, usize) {
         (
             self.ids.len(),
-            self.words_of.values().map(|(words, _)| words.len()).sum(),
+            self.words_of.values().map(|file| file.words.len()).sum(),
         )
     }
 
@@ -136,6 +165,7 @@ impl WordIndex {
         self.ids.insert(word.into(), id);
         self.files_of.push(Vec::new());
         self.field_files_of.push(Vec::new());
+        self.declaring_files.push(0);
         id
     }
 }
@@ -179,32 +209,58 @@ fn occurrences(text: &str, word: &str, field_shape_only: bool) -> Vec<usize> {
     if word.is_empty() {
         return found;
     }
-    for_each_code_word(text, |start, seen, field_shape| {
-        if seen == word && (field_shape || !field_shape_only) {
+    for_each_code_word(text, |start, seen, shape| {
+        if seen == word && (shape.field || !field_shape_only) {
             found.push(start);
         }
     });
     found
 }
 
-/// Call `visit(offset, word, field_shape)` for every word in code; see the
-/// module header. `field_shape`: the next token past whitespace and comments
-/// is a single `:` (a `::` path separator is two adjacent `:` tokens).
-fn for_each_code_word<'t>(text: &'t str, mut visit: impl FnMut(usize, &'t str, bool)) {
+/// Where a word in code stands, by its neighbouring tokens.
+#[derive(Clone, Copy, Default)]
+struct Shape {
+    /// The next token past whitespace and comments is a single `:` (a `::`
+    /// path separator is two adjacent `:` tokens).
+    field: bool,
+    /// The previous one is `struct`, `enum`, `union`, `type`, `trait` or `as`.
+    declared: bool,
+}
+
+/// Call `visit(offset, word, shape)` for every word in code; see the module
+/// header.
+fn for_each_code_word<'t>(text: &'t str, mut visit: impl FnMut(usize, &'t str, Shape)) {
     let lexed = LexedStr::new(Edition::Edition2015, text);
-    let field_shape = |token: usize| {
+    let trivia = |token: usize| {
+        matches!(
+            lexed.kind(token),
+            SyntaxKind::WHITESPACE | SyntaxKind::COMMENT
+        )
+    };
+    let shape = |token: usize| {
         let mut next = token + 1;
-        while next < lexed.len()
-            && matches!(
-                lexed.kind(next),
-                SyntaxKind::WHITESPACE | SyntaxKind::COMMENT
-            )
-        {
+        while next < lexed.len() && trivia(next) {
             next += 1;
         }
-        next < lexed.len()
+        let field = next < lexed.len()
             && lexed.kind(next) == SyntaxKind::COLON
-            && (next + 1 >= lexed.len() || lexed.kind(next + 1) != SyntaxKind::COLON)
+            && (next + 1 >= lexed.len() || lexed.kind(next + 1) != SyntaxKind::COLON);
+        let mut previous = token;
+        while previous > 0 && trivia(previous - 1) {
+            previous -= 1;
+        }
+        // `union` is a word in edition 2015, a contextual keyword after it.
+        let declared = previous > 0
+            && (matches!(
+                lexed.kind(previous - 1),
+                SyntaxKind::STRUCT_KW
+                    | SyntaxKind::ENUM_KW
+                    | SyntaxKind::TYPE_KW
+                    | SyntaxKind::TRAIT_KW
+                    | SyntaxKind::AS_KW
+            ) || (lexed.kind(previous - 1) == SyntaxKind::IDENT
+                && lexed.text(previous - 1) == "union"));
+        Shape { field, declared }
     };
     for token in 0..lexed.len() {
         // Sliced from `text` itself, so the words outlive the lexer.
@@ -213,12 +269,12 @@ fn for_each_code_word<'t>(text: &'t str, mut visit: impl FnMut(usize, &'t str, b
         let token_text = &text[range];
         match lexed.kind(token) {
             SyntaxKind::IDENT => match token_text.strip_prefix("r#") {
-                Some(raw) => visit(start + 2, raw, field_shape(token)),
-                None => visit(start, token_text, field_shape(token)),
+                Some(raw) => visit(start + 2, raw, shape(token)),
+                None => visit(start, token_text, shape(token)),
             },
             SyntaxKind::STRING => {
                 for (offset, word) in format_captures(token_text) {
-                    visit(start + offset, word, false);
+                    visit(start + offset, word, Shape::default());
                 }
             }
             _ => {}

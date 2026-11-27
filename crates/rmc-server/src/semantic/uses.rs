@@ -30,11 +30,14 @@
 //! not get to keep a file ready just because its text is unchanged. What it
 //! does (`apply_tree_change`): an edited file is pending; if its **surface**
 //! changed (`super::surface` — the file without its private fn bodies), or a
-//! file was added or removed (the module tree may change), every file of the
-//! crates whose root is in that file's source root, and of all their
-//! transitive reverse dependencies, is pending too
-//! ([`UseTable::mark_pending_where`]). An edit inside a body therefore costs
-//! one file; an edit of a signature in a leaf crate costs that crate.
+//! file was added or removed (the module tree may change), the files its
+//! changed items reach are pending too ([`UseTable::mark_pending_where`]):
+//! those naming them, or holding a value of a type whose impl or alias
+//! changed (`super::widening`), within the crates whose root is in that file's
+//! source root and all their transitive reverse dependencies — and all of
+//! those when the names cannot tell (a changed macro definition, a public
+//! glob). An edit inside a body therefore costs one file; a new function in a
+//! shared crate costs the files that call it.
 //!
 //! # Cost
 //!

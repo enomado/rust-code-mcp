@@ -111,7 +111,7 @@ const EXPRESSION_MACROS: &[&str] = &[
 
 /// Built-in attributes that leave an item as written (matched by the first
 /// segment of the attribute's path: `clippy::…`, `rustfmt::…` too).
-const INERT_ATTRS: &[&str] = &[
+pub(super) const INERT_ATTRS: &[&str] = &[
     "allow",
     "bench",
     "cfg",
@@ -126,6 +126,8 @@ const INERT_ATTRS: &[&str] = &[
     "inline",
     "must_use",
     "no_mangle",
+    "path",
+    "repr",
     "rustfmt",
     "should_panic",
     "test",
@@ -136,7 +138,11 @@ const INERT_ATTRS: &[&str] = &[
 /// See the module header. Two surfaces are compared, nothing else is done
 /// with one.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Surface(Vec<String>);
+pub(crate) struct Surface(Vec<Token>);
+
+/// A surface token: its kind (identifiers are told from keywords by it) and
+/// its text.
+pub(super) type Token = (SyntaxKind, String);
 
 /// The surface of a file's text; see the module header.
 pub(crate) fn surface_of(text: &str) -> Surface {
@@ -148,8 +154,33 @@ pub(crate) fn surface_of(text: &str) -> Surface {
 
 /// The tokens of `node`, fn bodies left out unless `whole` or the body can
 /// leak (`keeps_body`); `whole` — inside an item an attribute may rewrite.
-fn emit(node: &SyntaxNode, whole: bool, out: &mut Vec<String>) {
-    let whole = whole || ast::Item::cast(node.clone()).is_some_and(|item| may_be_rewritten(&item));
+/// An identifier that declares (its parent is a `NAME`) is given the kind
+/// `NAME`, one that refers keeps `IDENT`: the `units` module tells a unit's
+/// references from its own names so.
+pub(super) fn emit(node: &SyntaxNode, whole: bool, out: &mut Vec<Token>) {
+    emit_with(node, whole, Mode::Surface, out);
+}
+
+/// [`emit`] for a unit (`units` module): every body but a `const fn`'s left
+/// out entirely, attributes or not. What of a body is visible beyond its `fn`
+/// is a unit of its own; what a caller sees of an `async fn` or a `-> impl
+/// Trait` is its signature — the hidden type's auto traits leak, which picks
+/// no other declaration for a name; an attribute macro's item is a unit that
+/// is expanded.
+pub(super) fn emit_without_bodies(node: &SyntaxNode, out: &mut Vec<Token>) {
+    emit_with(node, false, Mode::Unit, out);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Surface,
+    Unit,
+}
+
+fn emit_with(node: &SyntaxNode, whole: bool, mode: Mode, out: &mut Vec<Token>) {
+    let whole = whole
+        || (mode == Mode::Surface
+            && ast::Item::cast(node.clone()).is_some_and(|item| may_be_rewritten(&item)));
     for element in node.children_with_tokens() {
         match element {
             NodeOrToken::Token(token) => {
@@ -161,36 +192,55 @@ fn emit(node: &SyntaxNode, whole: bool, out: &mut Vec<String>) {
                         SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT
                     );
                 if !silent {
-                    out.push(token.text().to_owned());
+                    let kind = if token.kind() == SyntaxKind::IDENT && node.kind() == SyntaxKind::NAME {
+                        SyntaxKind::NAME
+                    } else {
+                        token.kind()
+                    };
+                    out.push((kind, token.text().to_owned()));
                 }
             }
             NodeOrToken::Node(child) => {
                 if child.kind() == SyntaxKind::DOC_COMMENT {
                     continue;
                 }
-                if !whole && is_private_body(&child) {
-                    out.push("{".to_owned());
-                    emit_visible_in_body(&child, out);
-                    out.push("}".to_owned());
+                let private = match mode {
+                    Mode::Surface => !whole && is_private_body(&child),
+                    Mode::Unit => is_body_of_a_non_const_fn(&child),
+                };
+                if private {
+                    out.push((SyntaxKind::L_CURLY, "{".to_owned()));
+                    if mode == Mode::Surface {
+                        emit_visible_in_body(&child, out);
+                    }
+                    out.push((SyntaxKind::R_CURLY, "}".to_owned()));
                 } else {
-                    emit(&child, whole, out);
+                    emit_with(&child, whole, mode, out);
                 }
             }
         }
     }
 }
 
+/// Whether `node` is the body of a `fn` other than a `const fn` (whose body a
+/// const evaluation in a type runs).
+fn is_body_of_a_non_const_fn(node: &SyntaxNode) -> bool {
+    let Some(block) = ast::BlockExpr::cast(node.clone()) else {
+        return false;
+    };
+    let Some(function) = node.parent().and_then(ast::Fn::cast) else {
+        return false;
+    };
+    function.body().as_ref() == Some(&block) && function.const_token().is_none()
+}
+
 /// Of a private body: the `impl`s, macro definitions and macro calls in it, at
 /// any depth, each as its own surface.
-fn emit_visible_in_body(node: &SyntaxNode, out: &mut Vec<String>) {
+fn emit_visible_in_body(node: &SyntaxNode, out: &mut Vec<Token>) {
     for child in node.children() {
         let visible = match child.kind() {
             SyntaxKind::IMPL | SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => true,
-            SyntaxKind::MACRO_CALL => !ast::MacroCall::cast(child.clone())
-                .and_then(|call| call.path())
-                .and_then(|path| path.segment())
-                .and_then(|segment| segment.name_ref())
-                .is_some_and(|name| EXPRESSION_MACROS.contains(&&*name.text())),
+            SyntaxKind::MACRO_CALL => !is_expression_macro(&child),
             _ => false,
         };
         if visible {
@@ -239,6 +289,15 @@ fn may_be_rewritten(item: &ast::Item) -> bool {
             !first.is_some_and(|name| INERT_ATTRS.contains(&&*name.text()))
         })
     })
+}
+
+/// Whether the macro call `node` is one of the [`EXPRESSION_MACROS`].
+pub(super) fn is_expression_macro(node: &SyntaxNode) -> bool {
+    ast::MacroCall::cast(node.clone())
+        .and_then(|call| call.path())
+        .and_then(|path| path.segment())
+        .and_then(|segment| segment.name_ref())
+        .is_some_and(|name| EXPRESSION_MACROS.contains(&&*name.text()))
 }
 
 #[cfg(test)]
