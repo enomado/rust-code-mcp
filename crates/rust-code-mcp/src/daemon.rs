@@ -163,7 +163,16 @@ const KEYED_ENV_EXTRA: [&str; 2] = ["OPENROUTER_API_KEY", "LD_LIBRARY_PATH"];
 /// The price of unkeying it, stated plainly: a client that asks for a census
 /// while a daemon is already up gets none, because the probe runs once at
 /// startup. Restarting the daemon is what re-runs it.
-const UNKEYED_ENV: [&str; 4] = [DAEMON_ENV, DAEMON_DIR_ENV, IDLE_ENV, EP_CENSUS_ENV];
+///
+/// [`OOM_SCORE_ADJ_ENV`] is of the same kind: it ranks the process for the OOM
+/// killer and changes no answer.
+const UNKEYED_ENV: [&str; 5] = [
+    DAEMON_ENV,
+    DAEMON_DIR_ENV,
+    IDLE_ENV,
+    EP_CENSUS_ENV,
+    OOM_SCORE_ADJ_ENV,
+];
 
 /// Half an hour: long enough to survive a pause between questions in a session,
 /// short enough that a closed editor does not hold gigabytes until end of day.
@@ -1054,6 +1063,78 @@ pub fn growth_trim_is_due(
     rss_mb >= baseline_mb.saturating_add(growth_mb)
 }
 
+/// The lowest `oom_score_adj` the daemon keeps for itself, `0` to leave the
+/// inherited value alone — see [`oom_adj_to_set`].
+pub const OOM_SCORE_ADJ_ENV: &str = "RMC_OOM_SCORE_ADJ";
+
+/// Measured 2026-11-27 (night of 11-26/27): the client relays of the sessions
+/// ran at 200 — `DefaultOOMScoreAdjust=200` of the systemd user manager, which
+/// every descendant of a user unit inherits — while a daemon started from an
+/// editor session ran at 0. Both matched earlyoom's `--prefer` pattern, so the
+/// relays of 5–44 MB ranked first and were killed one by one while the 7 GB
+/// daemon kept growing.
+///
+/// 500 puts the daemon above any relay (200 is the most a relay inherits from
+/// a systemd user manager) whatever its size, and above processes of the same base value up to 300 ‰
+/// of the machine larger than itself (18 GB on 61 GB): a link step that big
+/// still outranks a small daemon, which would free nothing. Below 1000 so the
+/// kernel still prefers the larger of two victims when both are ours.
+const DEFAULT_OOM_SCORE_ADJ: u64 = 500;
+
+/// The kernel's ceiling for `oom_score_adj`.
+const OOM_SCORE_ADJ_MAX: i32 = 1000;
+
+/// What to write to `/proc/self/oom_score_adj`, given what the process inherited
+/// and the configured floor; `None` = leave it.
+///
+/// Raise only. The daemon is the process whose death costs least — the relays
+/// keep their sessions and start it again, and the analysis is a cache — so it
+/// must be the OOM killer's first choice, not the relays it serves. Lowering is
+/// never the daemon's business: an unprivileged process cannot go below what
+/// its parent was given, and a higher inherited value is someone's decision.
+pub fn oom_adj_to_set(current: i32, floor: u64) -> Option<i32> {
+    if floor == 0 {
+        return None;
+    }
+    let floor =
+        i32::try_from(floor).map_or(OOM_SCORE_ADJ_MAX, |floor| floor.min(OOM_SCORE_ADJ_MAX));
+    (current < floor).then_some(floor)
+}
+
+/// Apply [`oom_adj_to_set`] to this process and say what happened. Children
+/// the daemon starts (proc-macro servers, `cargo metadata`) inherit the value:
+/// they are the daemon's work and go with it.
+fn raise_own_oom_score_adj() {
+    let floor = env_u64(OOM_SCORE_ADJ_ENV, DEFAULT_OOM_SCORE_ADJ);
+    let path = "/proc/self/oom_score_adj";
+    let current = match std::fs::read_to_string(path) {
+        Ok(text) => match text.trim().parse::<i32>() {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!("oom_score_adj: cannot parse {text:?}: {e}");
+                return;
+            }
+        },
+        Err(e) => {
+            tracing::info!(
+                "oom_score_adj: not available ({e}); the OOM ranking stays the system's"
+            );
+            return;
+        }
+    };
+    match oom_adj_to_set(current, floor) {
+        Some(target) => match std::fs::write(path, target.to_string()) {
+            Ok(()) => tracing::info!(
+                "oom_score_adj {current} -> {target}: the daemon, not the client relays, is the OOM victim ({OOM_SCORE_ADJ_ENV} to change; 0 leaves the inherited value)"
+            ),
+            Err(e) => tracing::warn!("oom_score_adj {current} -> {target} refused: {e}"),
+        },
+        None => tracing::info!(
+            "oom_score_adj {current} kept (floor {floor}; {OOM_SCORE_ADJ_ENV} to change, 0 leaves the inherited value)"
+        ),
+    }
+}
+
 /// Where sockets live. `$XDG_RUNTIME_DIR` is preferred: it is private, on tmpfs,
 /// and cleaned out at logout together with any orphaned sockets.
 ///
@@ -1804,6 +1885,8 @@ pub async fn run_daemon(
         ensure_dir(parent)?;
     }
     adopt_disk_log(socket);
+    // Before the first load: from here on this process is the one worth killing.
+    raise_own_oom_score_adj();
     let listener = UnixListener::bind(socket).map_err(|e| {
         BoxError::from(format!(
             "cannot bind {}: {e} (is a live daemon already holding it?)",
@@ -2828,6 +2911,54 @@ mod watchdog_tests {
             "a floor at {DEFAULT_MIN_AVAILABLE_MB} MB must leave room above the \
              ~{TYPICAL_OOM_KILL_MB} MB where the OOM killer starts"
         );
+    }
+
+    /// Inherited value and floor → what the daemon writes. Raise only, never
+    /// past the kernel's 1000, and `0` is "leave it" even under a negative
+    /// inherited value.
+    #[test]
+    fn oom_adj_decision_table() {
+        const DEFAULT: u64 = DEFAULT_OOM_SCORE_ADJ;
+        let table: [(&str, i32, u64, Option<i32>); 9] = [
+            ("editor session, default floor", 0, DEFAULT, Some(500)),
+            ("user unit, default floor", 200, DEFAULT, Some(500)),
+            ("already at the floor", 500, DEFAULT, None),
+            ("someone set it higher", 800, DEFAULT, None),
+            ("protected parent is raised too", -500, DEFAULT, Some(500)),
+            ("disabled", 0, 0, None),
+            ("disabled under a negative value", -500, 0, None),
+            ("floor past the kernel ceiling", 200, 5000, Some(1000)),
+            ("floor beyond i32", 0, u64::MAX, Some(1000)),
+        ];
+        for (case, current, floor, want) in table {
+            assert_eq!(oom_adj_to_set(current, floor), want, "{case}");
+        }
+    }
+
+    /// The point of the floor, judged the way the kernel ranks: the shown
+    /// `oom_score` is `(1000 + RSS ‰ of RAM + oom_score_adj) · 2/3` (live,
+    /// 2026-11-27: a 25 MB relay at 200 reads 800). The night of 11-26/27 had a
+    /// 7.3 GB daemon at 0 and relays of 5–44 MB at 200, and the relays went
+    /// first. After the raise the daemon outranks every relay from both
+    /// inheritances, even fresh from startup at 300 MB.
+    #[test]
+    fn the_daemon_outranks_its_relays_for_the_oom_killer() {
+        const TOTAL_MB: i64 = 63_431;
+        let score =
+            |rss_mb: i64, adj: i32| (1000 + rss_mb * 1000 / TOTAL_MB + i64::from(adj)) * 2 / 3;
+        let relay = score(44, 200);
+        for inherited in [0, 200] {
+            let adj = oom_adj_to_set(inherited, DEFAULT_OOM_SCORE_ADJ).unwrap_or(inherited);
+            for daemon_mb in [300, 7_300] {
+                assert!(
+                    score(daemon_mb, adj) > relay,
+                    "daemon of {daemon_mb} MB inheriting {inherited} scores {} under a relay's {relay}",
+                    score(daemon_mb, adj)
+                );
+            }
+        }
+        // Without the raise the night repeats: the measured case ranks the relays first.
+        assert!(score(7_300, 0) < relay, "the night's order is lost");
     }
 
     /// Exactly at the limit counts as over it — a threshold that only fires
