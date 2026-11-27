@@ -72,6 +72,11 @@ enum Mode {
     /// Every look walks the tree: off Linux, for a context built by hand in a
     /// test, or after the watcher could not be set up (logged once).
     Walking,
+    /// Every look says "unchanged": a probe measuring a live workspace in
+    /// memory (`post_refresh_probe`) must not take in what others write to it
+    /// meanwhile.
+    #[cfg(test)]
+    Frozen,
 }
 
 impl TreeWatch {
@@ -109,6 +114,15 @@ impl TreeWatch {
         }
     }
 
+    /// A watch that never sees a change ([`Mode::Frozen`]).
+    #[cfg(test)]
+    pub(super) fn frozen(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            mode: Mode::Frozen,
+        }
+    }
+
     /// The stamps a walk of the tree would take now, given those of the last
     /// look; `None` when nothing a walk sees has changed since (`stamps` are
     /// current — no copy is made).
@@ -118,6 +132,8 @@ impl TreeWatch {
     ) -> Option<HashMap<PathBuf, FileStamp>> {
         match &mut self.mode {
             Mode::Walking => Some(super::collect_stamps(&self.root)),
+            #[cfg(test)]
+            Mode::Frozen => None,
             #[cfg(target_os = "linux")]
             Mode::Watching(watcher) => match watcher.current(&self.root, stamps) {
                 Ok(current) => current,
@@ -599,7 +615,7 @@ mod tests {
         let (mut watch, mut stamps) = TreeWatch::start(&root);
         let directories = match &watch.mode {
             Mode::Watching(watcher) => watcher.directory_count(),
-            Mode::Walking => panic!("no watcher on {}", root.display()),
+            Mode::Walking | Mode::Frozen => panic!("no watcher on {}", root.display()),
         };
         println!(
             "start: {directories} directories, {} files in {:?}",

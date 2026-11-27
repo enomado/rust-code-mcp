@@ -7,6 +7,10 @@ mod loader;
 #[cfg(test)]
 mod lru_sweep;
 pub(crate) mod position;
+/// What the first query after a refresh pays, by part (plan item
+/// `post-refresh-cost`). Measurement only.
+#[cfg(test)]
+mod post_refresh_probe;
 mod rename;
 mod surface;
 mod tree_watch;
@@ -112,6 +116,10 @@ struct ProjectContext {
     /// Keeps `stamps` current from file-change events instead of a walk of the
     /// tree on every query ([`tree_watch`]); set up by the load, before it.
     watch: tree_watch::TreeWatch,
+    /// A reload a background refresh found needed and left to the next query
+    /// ([`RefreshBy::Background`]): the events that called for it are read,
+    /// so this is what remembers it. Never set on a context a query refreshes.
+    reload_due: Option<LoadReason>,
 }
 
 fn stamp_of(path: &Path) -> Option<FileStamp> {
@@ -823,6 +831,19 @@ fn exposure_by_root(
 /// revision would reproduce the very defect [`refresh_if_stale`] guards against,
 /// only harder to notice.
 fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Patched> {
+    apply_tree_change_with(ctx, change, |path| {
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+    })
+}
+
+/// [`apply_tree_change`] with the new text of each edited or added file from
+/// `read` rather than the disk: the probe of what a query after a refresh costs
+/// (`post_refresh_probe`) replays real edits on a workspace it must not write.
+fn apply_tree_change_with(
+    ctx: &mut ProjectContext,
+    change: &TreeChange,
+    read: impl Fn(&Path) -> Result<String>,
+) -> Result<Patched> {
     use ra_ap_ide_db::base_db::salsa::Durability;
     use ra_ap_ide_db::base_db::{FileId, FileSet, SourceDatabase, SourceRoot, SourceRootId};
 
@@ -864,8 +885,7 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
                     continue;
                 }
             };
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?;
+            let text = read(path)?;
             match target {
                 Target::Known(_) => patched.edited += 1,
                 Target::New(_) => patched.added += 1,
@@ -1468,6 +1488,16 @@ fn evict_when_idle(slot: &ProjectSlot) -> bool {
     true
 }
 
+/// A project [`SemanticService::refresh_in_background`] patched.
+#[derive(Debug)]
+pub(crate) struct BackgroundRefresh {
+    pub project: PathBuf,
+    /// The symbol index was recomputed to the end (not cancelled by a later
+    /// refresh).
+    pub primed: bool,
+    pub took: std::time::Duration,
+}
+
 /// What one call of [`SemanticService::build_uses_batch`] did.
 #[derive(Debug)]
 pub(crate) enum UsesBatch {
@@ -1663,7 +1693,7 @@ fn bring_up_to_date(
     } else {
         // Cached — but "cached" said nothing about "current" until this call
         // existed. See [`refresh_if_stale`].
-        refresh_if_stale(gate, slot, context, canonical, requested)
+        refresh_if_stale(gate, slot, context, canonical, requested, RefreshBy::Query).map(|_| ())
     }
 }
 
@@ -1796,6 +1826,7 @@ fn load_into(
         loaded_at: std::time::Instant::now(),
         stamps,
         watch,
+        reload_due: None,
     });
     slot.publish(Some(requested));
     mem.finish();
@@ -1836,45 +1867,79 @@ fn load_into(
 /// Before the patch path for added files, every new `*.rs` reloaded: on a
 /// workspace where a fleet of agents adds test modules all day that was 72
 /// reloads in four days (6638 s of loading), most of the calls over 40 s.
+///
+/// # Who calls it
+///
+/// Every query, on its slot before its snapshot ([`RefreshBy::Query`]) —
+/// which is what keeps "an edit made before the call is seen in it". And the
+/// daemon's background loop ([`RefreshBy::Background`],
+/// [`SemanticService::refresh_in_background`]), so that the edits are in the
+/// database, and rust-analyzer's recomputation of them done, before the next
+/// query comes; a reload it finds needed it leaves to that query.
 fn refresh_if_stale(
     gate: &load_gate::LoadGate,
     slot: &ProjectSlot,
     context: &mut Option<ProjectContext>,
     canonical: &Path,
     requested: LoadKind,
-) -> Result<()> {
+    by: RefreshBy,
+) -> Result<Refreshed> {
     let ctx = context
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
+    if let Some(reason) = ctx.reload_due {
+        return match by {
+            RefreshBy::Background => Ok(Refreshed::ReloadDeferred),
+            RefreshBy::Query => {
+                load_into(gate, slot, context, canonical, requested, reason)?;
+                Ok(Refreshed::Reloaded)
+            }
+        };
+    }
     // No event since the last look: nothing a walk would see has changed, and
     // the check was one `read` (`tree_watch`).
     let Some(current) = ctx.watch.current(&ctx.stamps) else {
-        return Ok(());
+        return Ok(Refreshed::Unchanged);
     };
 
+    // A reload, now or — from the background — at the next query. The events
+    // that called for it are read either way; the stamps need no update, as a
+    // load takes its own.
+    let reload = |context: &mut Option<ProjectContext>, reason: LoadReason| match by {
+        RefreshBy::Query => {
+            load_into(gate, slot, context, canonical, requested, reason)?;
+            Ok(Refreshed::Reloaded)
+        }
+        RefreshBy::Background => {
+            context.as_mut().expect("checked above").reload_due = Some(reason);
+            Ok(Refreshed::ReloadDeferred)
+        }
+    };
     match classify_staleness(&ctx.stamps, &current, &ctx.layout) {
         Staleness::Fresh => {
             // Unchanged, or changed only in shape files that do not reload (a
             // nested project's lockfile): either way the stamps are current.
             ctx.stamps = current;
-            Ok(())
+            Ok(Refreshed::Unchanged)
         }
         Staleness::ManifestChanged(manifest) => {
             tracing::info!(
-                "{} changed since {} was analysed; reloading",
+                "{} changed since {} was analysed; reloading{}",
                 manifest.display(),
-                canonical.display()
+                canonical.display(),
+                by.reload_when()
             );
-            load_into(gate, slot, context, canonical, requested, LoadReason::ManifestChanged)
+            reload(context, LoadReason::ManifestChanged)
         }
         Staleness::Changed(change) => match apply_tree_change(ctx, &change) {
             Ok(patched) => {
                 ctx.stamps = current;
                 tracing::info!(
-                    "Refreshed {} without a reload: {} edited, {} added, {} removed, {} outside \
+                    "Refreshed {}{} without a reload: {} edited, {} added, {} removed, {} outside \
                      the analysis; database loaded {} s ago; table of uses: {} file(s) pending, \
                      {} ready made pending by a surface change in {} root(s) [{}]{}",
                     canonical.display(),
+                    by.log_text(),
                     patched.edited,
                     patched.added,
                     patched.removed,
@@ -1886,21 +1951,64 @@ fn refresh_if_stale(
                     patched.surface_crates,
                     patched.widening
                 );
-                Ok(())
+                Ok(Refreshed::Patched)
             }
             Err(e) => {
                 // A file excluded in the analysis, unreadable, non-UTF-8, or
                 // loadable yet in no root cannot be patched in. Falling back
                 // to a reload is slow but honest; keeping the stale context
-                // would be the original defect.
+                // would be the original defect. Nothing was written before the
+                // error (`apply_tree_change` decides everything first).
                 tracing::info!(
-                    "Cannot patch {} incrementally ({e}); reloading",
-                    canonical.display()
+                    "Cannot patch {} incrementally ({e}); reloading{}",
+                    canonical.display(),
+                    by.reload_when()
                 );
-                load_into(gate, slot, context, canonical, requested, LoadReason::CannotPatch)
+                reload(context, LoadReason::CannotPatch)
             }
         },
     }
+}
+
+/// Who brings a context up to date — see [`refresh_if_stale`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshBy {
+    /// A query, before its snapshot: a reload happens here and now.
+    Query,
+    /// The daemon's background loop: patches only, a reload is left to the
+    /// next query ([`ProjectContext::reload_due`]) — a project nobody asks
+    /// about must not cost a minute of loading, and a load in the background
+    /// would bypass nothing the query's own would not do anyway.
+    Background,
+}
+
+impl RefreshBy {
+    fn log_text(self) -> &'static str {
+        match self {
+            RefreshBy::Query => "",
+            RefreshBy::Background => " in the background",
+        }
+    }
+
+    fn reload_when(self) -> &'static str {
+        match self {
+            RefreshBy::Query => "",
+            RefreshBy::Background => " at the next query",
+        }
+    }
+}
+
+/// What [`refresh_if_stale`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refreshed {
+    /// Nothing that a query could see changed.
+    Unchanged,
+    /// Edits patched into the database.
+    Patched,
+    /// Reloaded (a query's refresh only).
+    Reloaded,
+    /// A reload is due and left to the next query (a background refresh only).
+    ReloadDeferred,
 }
 
 impl SemanticService {
@@ -2075,6 +2183,7 @@ impl SemanticService {
                 loaded_at: std::time::Instant::now(),
                 stamps: HashMap::new(),
                 watch: tree_watch::TreeWatch::walking(&path),
+                reload_due: None,
             },
         );
     }
@@ -2174,22 +2283,31 @@ impl SemanticService {
         usize::from(removed.is_some())
     }
 
-    /// Give every loaded analysis a revision bump and sweep the type interner.
+    /// Evict every loaded analysis's LRU memos over capacity and sweep the type
+    /// interner — without a revision bump.
     ///
     /// # Why a daemon has to do this by hand
     ///
     /// salsa evicts an LRU-capped query's memos in exactly one place:
-    /// `for_each_evicted`, reached from `reset_for_new_revision`. That is to
-    /// say, **capacities only mean something at the moment the revision bumps**,
-    /// and a revision bumps when a file changes. An IDE gets those for free on
-    /// every keystroke; a project sitting in this daemon that nobody has edited
-    /// for hours never bumps at all, so its capacity — whatever it is set to —
-    /// evicts nothing, ever. Those are precisely the cold contexts that made a
-    /// daemon 14.6 GB. This call is where the bump comes from instead.
+    /// `for_each_evicted`, reached from `reset_for_new_revision` — at a
+    /// revision bump, or on an explicit `trigger_lru_eviction` (`Zalsa::evict_lru`
+    /// calls the same reset of every ingredient, `deleted_entries` included).
+    /// A project sitting in this daemon that nobody has edited for hours never
+    /// bumps, so without this its capacities evict nothing, ever. Those are
+    /// precisely the cold contexts that made a daemon 14.6 GB.
     ///
-    /// `AnalysisHost::trigger_garbage_collection` is a synthetic write plus a
-    /// mark-and-sweep over the interned type storage, and rust-analyzer's own
-    /// main loop calls it the same way when its worker pools go quiet.
+    /// # Why not `AnalysisHost::trigger_garbage_collection` (plan item `post-refresh-cost`)
+    ///
+    /// That is a synthetic write at `LOW` plus the sweep: rust-analyzer bumps
+    /// because an eviction under running queries cancels them, and a cancelled
+    /// fixpoint cycle is only cleared by a bump. The bump is paid by the next
+    /// query, which re-verifies every memo it touches — on a ~9000-file
+    /// workspace the symbol index of every local module and the bodies the
+    /// query reads: seconds, with nothing changed. Measured on a live daemon
+    /// (2026-11-27, 3 h): the first `find_*` after a collection and a refresh
+    /// took p50 5.2 s, after a refresh alone p50 2.3 s. Here no query is in
+    /// flight (the gate below), so the eviction cancels nothing and the bump
+    /// buys nothing — the reasoning of [`evict_when_idle`].
     ///
     /// # Why calling it with several hosts loaded is sound
     ///
@@ -2208,22 +2326,126 @@ impl SemanticService {
     ///
     /// The sweep runs once per host, so N loaded projects pay N sweeps; the
     /// caller keeps this off the hot path (see the watchdog's interval) rather
-    /// than the method trying to be clever about it. The bump itself is paid
-    /// later, by the next query re-validating its memos.
+    /// than the method trying to be clever about it. The eviction walks the
+    /// LRU-capped ingredients once; the next query pays nothing for it beyond
+    /// recomputing what was evicted, if it needs that.
     ///
     /// Returns the number of contexts collected, for the log line.
     pub(crate) fn collect_garbage(&self) -> usize {
+        use ra_ap_ide_db::base_db::salsa::Database as _;
         let slots = self.registry().slots();
         let mut collected = 0;
         for (path, slot) in slots {
             let mut guard = slot.lock();
             if let Some(ctx) = guard.as_mut() {
                 tracing::debug!("collecting garbage in {}", path.display());
-                ctx.host.trigger_garbage_collection();
+                ctx.host.raw_database_mut().trigger_lru_eviction();
                 collected += 1;
             }
         }
+        if collected > 0 {
+            // SAFETY: the caller holds the analysis gate exclusively (header):
+            // no query is in flight holding a type it has not recorded yet.
+            unsafe { ra_ap_hir::collect_ty_garbage() };
+        }
         collected
+    }
+
+    /// Patch every loaded project's edits into its database now, not at its
+    /// next query, and recompute what rust-analyzer recomputes for any query
+    /// after them: the symbol index of the local crates (plan item
+    /// `post-refresh-cost`).
+    ///
+    /// # Why
+    ///
+    /// The refresh was lazy: the first query after edits patched them in and
+    /// then paid rust-analyzer's recomputation itself. Measured on a
+    /// ~9000-file workspace (`post_refresh_probe`, three real commits replayed,
+    /// loaded machine): our side of the refresh 0.02–0.8 s, then the symbol
+    /// index alone 2.4–3.2 s after 3 edited files and 4.0–9.0 s after 20 —
+    /// every `find_definition` and the declaration lookup of every
+    /// `find_references` waits for it; warm it is 0.02–0.06 s. Neither the
+    /// garbage collection's synthetic write (+0.0–0.2 s) nor the builder of
+    /// the table of uses beside the query (−0.2…+0.9 s) added anything that
+    /// stands out of the noise. So the cure is to do that work before the
+    /// query comes: edits of other sessions land minutes before anybody asks.
+    ///
+    /// # What stays as it was
+    ///
+    /// A query still refreshes on its own slot before its snapshot: an edit
+    /// made before a call is seen in it, whether or not this loop got there
+    /// first. A reload this finds needed is left to the next query
+    /// ([`RefreshBy::Background`]). A query arriving while the index is being
+    /// primed shares the computation — salsa makes it wait for the memo in
+    /// progress rather than compute it twice; a refresh landing meanwhile
+    /// cancels the priming, and the next round primes again.
+    ///
+    /// # Cost
+    ///
+    /// Without events: one `read` of each loaded project's inotify fd under a
+    /// `try_lock` of its slot (a slot somebody holds is skipped — its holder
+    /// refreshes). With events: the refresh the query would have done, plus
+    /// the symbol index of the changed crates (seconds of rayon threads, once
+    /// per refresh, which a fleet makes every few minutes) — the same work the
+    /// next query would do, moved off its clock.
+    ///
+    /// The caller holds the analysis gate (shared), as for a query.
+    pub(crate) fn refresh_in_background(&self) -> Vec<BackgroundRefresh> {
+        let slots: Vec<(PathBuf, Arc<ProjectSlot>)> = self.registry().slots();
+        let mut done = Vec::new();
+        for (project, slot) in slots {
+            let _spoil = SpoilOnPanic(&slot);
+            let mut guard = match slot.context.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => continue,
+            };
+            let Some(kind) = guard.as_ref().map(|ctx| ctx.load_kind) else { continue };
+            let refreshed = match refresh_if_stale(
+                &self.gate,
+                &slot,
+                &mut guard,
+                &project,
+                kind,
+                RefreshBy::Background,
+            ) {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    tracing::warn!(
+                        "background refresh of {} failed: {error:#}",
+                        project.display()
+                    );
+                    continue;
+                }
+            };
+            match refreshed {
+                Refreshed::Unchanged | Refreshed::ReloadDeferred => continue,
+                Refreshed::Reloaded => unreachable!("a background refresh does not reload"),
+                Refreshed::Patched => {}
+            }
+            let ctx = guard.as_ref().expect("a patched context is loaded");
+            let in_flight = QueryInFlight::begin(&slot);
+            let analysis = ctx.host.analysis();
+            drop(guard);
+            let started = std::time::Instant::now();
+            // Not a crate search, no path filter, not `libs`: the symbol index
+            // of every crate of the local roots (`ide_db::symbol_index::world_symbols`).
+            let primed = Cancelled::catch(|| {
+                analysis.symbol_search(ra_ap_ide::Query::new("rmc_prime".to_owned()), 1)
+            });
+            let took = started.elapsed();
+            drop(analysis);
+            drop(in_flight);
+            evict_when_idle(&slot);
+            let primed = matches!(primed, Ok(Ok(_)));
+            tracing::info!(
+                "symbol index of {} {} after a background refresh in {:.1} s",
+                project.display(),
+                if primed { "primed" } else { "cancelled by a later refresh" },
+                took.as_secs_f64()
+            );
+            done.push(BackgroundRefresh { project, primed, took });
+        }
+        done
     }
 
     /// One batch of the background builder of the tables of uses (`uses`
@@ -2834,6 +3056,7 @@ impl SemanticService {
                 loaded_at: std::time::Instant::now(),
                 stamps: HashMap::new(),
                 watch: tree_watch::TreeWatch::walking(&canonical),
+                reload_due: None,
             },
         );
     }
@@ -3501,6 +3724,65 @@ pub fn second() {
             1,
             "the new package's call must be found: {with_user:?}"
         );
+    }
+
+    /// Plan item `post-refresh-cost`: the daemon's loop patches other
+    /// sessions' edits into the database ahead of the next query and primes
+    /// the symbol index; a reload it finds needed it leaves to that query.
+    #[test]
+    fn a_background_refresh_patches_edits_ahead_of_the_query_and_leaves_a_reload_to_it() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        let canonical = root.canonicalize().expect("canonicalize");
+        write_file(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+        );
+        let manifest = root.join("crates/base/Cargo.toml");
+        let package = "[package]\nname = \"base\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        write_file(&manifest, package);
+        let lib = root.join("crates/base/src/lib.rs");
+        write_file(&lib, "pub fn target() {}\n\npub fn first() {\n    target();\n}\n");
+
+        let service = SemanticService::new();
+        let before = service
+            .find_references_by_name_with_exact(root, "target", true)
+            .expect("first query");
+        assert_eq!(call_sites(&before), 1, "positive control: {before:?}");
+        let loaded = loaded_at(&service, root);
+        assert!(service.refresh_in_background().is_empty(), "nothing changed, nothing refreshed");
+
+        // A manifest: the reload is due, and only a query does it.
+        write_file(&manifest, &format!("{package}\n[features]\nextra = []\n"));
+        assert!(service.refresh_in_background().is_empty(), "a reload is not a patch");
+        assert!(service.refresh_in_background().is_empty(), "nor is it on a second look");
+        assert_eq!(loaded_at(&service, root), loaded, "the background reloaded");
+        let due = service.with_context_for_test(&canonical, |ctx| ctx.reload_due);
+        assert_eq!(due, Some(LoadReason::ManifestChanged), "the reload is remembered");
+        service
+            .find_references_by_name_with_exact(root, "target", true)
+            .expect("query after the manifest edit");
+        let reloaded = loaded_at(&service, root);
+        assert_ne!(reloaded, loaded, "the query did not do the reload left to it");
+
+        // Code: patched by the background alone. The watch is frozen right
+        // after, so whatever the query sees, the background put there.
+        write_file(&lib, "mod more;\n\npub fn target() {}\n\npub fn first() {\n    target();\n}\n");
+        write_file(&root.join("crates/base/src/more.rs"), "pub fn second() {\n    super::target();\n}\n");
+        let done = service.refresh_in_background();
+        assert_eq!(done.len(), 1, "one project patched: {done:?}");
+        assert!(done[0].primed, "the symbol index was primed: {done:?}");
+        assert_eq!(done[0].project, canonical);
+        service.with_context_for_test(&canonical, |ctx| {
+            ctx.watch = tree_watch::TreeWatch::frozen(&canonical);
+        });
+        let after = service
+            .find_references_by_name_with_exact(root, "target", true)
+            .expect("query after the code edit");
+        assert_eq!(loaded_at(&service, root), reloaded, "a code edit reloaded");
+        assert_eq!(call_sites(&after), 2, "the new module's call is in: {after:?}");
+        assert_eq!(answer(&after), answer_of_a_fresh_load(root, "target"));
     }
 
     /// Call sites landing in one file, named by the tail of its path.
@@ -5636,34 +5918,65 @@ path = "src/lib.rs"
         );
     }
 
-    /// Two things at once, because the collection can fail in two directions.
+    /// Three things at once, because the collection can fail in three
+    /// directions.
     ///
-    /// *That it happened*: the whole point is the revision bump — without one,
-    /// salsa never reaches `for_each_evicted` and an LRU capacity evicts
-    /// nothing. A collection that returned a count without bumping would look
-    /// exactly like a working one from the outside, so the revision is read
-    /// directly.
+    /// *That it evicted*: a project nobody edits never bumps its revision, and
+    /// without this call its LRU capacities evict nothing. A collection that
+    /// returned a count without evicting would look exactly like a working one
+    /// from the outside, so the heap of `parse` trees is read directly: a query
+    /// that parses 200 modules (with the eviction after queries off) leaves
+    /// them all, and the collection takes them back to the LRU's 128.
+    ///
+    /// *That it did not bump the revision* (plan item `post-refresh-cost`):
+    /// the synthetic write it used to be made the next query re-verify every
+    /// memo it touched; the eviction alone does what the bump's reset did.
     ///
     /// *That it was safe*: the sweep is `unsafe` and process-global. Had it
     /// freed something still in use, the symptom would be a wrong answer or a
     /// crash on the next query — hence the same question on both sides of it.
     #[test]
-    fn a_collection_bumps_the_revision_and_keeps_the_answers() {
+    fn a_collection_evicts_without_a_revision_bump_and_keeps_the_answers() {
+        const MODULES: usize = 200;
         let _sweep = sweeping_alone();
         use ra_ap_ide_db::base_db::SourceDatabase;
 
         let workspace = tempfile::tempdir().expect("create workspace tempdir");
         let root = workspace.path();
-        one_crate_workspace(root);
+        write_file(
+            &root.join("Cargo.toml"),
+            "[package]\nname = \"collect_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        let mut lib = String::from("pub fn target() {}\n");
+        for m in 0..MODULES {
+            lib.push_str(&format!("pub mod m{m};\n"));
+            write_file(
+                &root.join(format!("src/m{m}.rs")),
+                &format!("pub fn f{m}() {{ crate::target(); }}\n"),
+            );
+        }
+        write_file(&root.join("src/lib.rs"), &lib);
+        let parse_heap = |service: &SemanticService| -> usize {
+            let report = service.memory_breakdown(root, 0).expect("memory report");
+            report
+                .rows
+                .iter()
+                .find(|row| row.name == "EditionedFileId::parse_")
+                .and_then(|row| row.heap_bytes)
+                .expect("the fork weighs `parse` memos")
+        };
 
-        let service = SemanticService::new();
+        let service = SemanticService::without_eviction_after_queries();
+        service.get_or_load_full(root).expect("load");
+        let after_load = parse_heap(&service);
         let before = service
             .find_references_by_name_with_exact(root, "target", true)
             .expect("query before collection");
-        assert_eq!(
-            call_sites(&before),
-            1,
-            "positive control: the fixture must start with one call site, got {before:?}"
+        assert_eq!(call_sites(&before), MODULES, "positive control: {before:?}");
+        let after_query = parse_heap(&service);
+        assert!(
+            after_query > 2 * after_load,
+            "positive control: the query left {after_query} B of trees, the load {after_load} B"
         );
 
         let canonical = root.canonicalize().expect("canonicalize");
@@ -5678,9 +5991,15 @@ path = "src/lib.rs"
 
         let revision_after = service
             .with_context_for_test(&canonical, |ctx| ctx.host.raw_database().nonce_and_revision());
-        assert_ne!(
+        assert_eq!(
             revision_before, revision_after,
-            "without a revision bump the LRU capacities never evict anything"
+            "the collection bumped the revision: the next query re-verifies every memo"
+        );
+        let collected = parse_heap(&service);
+        assert!(
+            collected <= 2 * after_load,
+            "after the collection {collected} B of trees, after the load {after_load} B: the \
+             trees over the LRU's capacity were not evicted"
         );
 
         let after = service

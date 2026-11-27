@@ -481,9 +481,16 @@ impl ServerRuntime {
     /// every garbage collection out for as long as it runs. Stops on
     /// [`Self::request_shutdown`] and once the process refuses analyses.
     ///
+    /// The same loop, before each batch, refreshes the loaded projects in the
+    /// background and primes their symbol index
+    /// ([`SemanticService::refresh_in_background`]), so the first query after
+    /// other sessions' edits does not pay rust-analyzer's recomputation of them
+    /// (plan item `post-refresh-cost`). With [`USES_THREADS_ENV`]`=0` the loop
+    /// runs for that alone.
+    ///
     /// Cost: the threads it is given, for as long as a loaded project has
-    /// pending files; nothing (a registry look every [`USES_IDLE_POLL`]) once
-    /// none has.
+    /// pending files; nothing (a registry look and a `read` of each loaded
+    /// project's inotify fd every [`USES_IDLE_POLL`]) once none has.
     pub fn start_uses_builder(&self) {
         self.start_uses_builder_on(uses_builder_threads());
     }
@@ -494,11 +501,11 @@ impl ServerRuntime {
         if threads == 0 {
             tracing::info!(
                 "table of uses: no background builder ({USES_THREADS_ENV}=0); library references \
-                 are swept live"
+                 are swept live; the loop refreshes projects in the background only"
             );
-            return;
+        } else {
+            tracing::info!("table of uses: background builder on {threads} thread(s)");
         }
-        tracing::info!("table of uses: background builder on {threads} thread(s)");
         let semantic = self.state.semantic();
         let mut shutdown = self.shutdown_tx.subscribe();
         let handle = tokio::spawn(async move {
@@ -514,6 +521,19 @@ impl ServerRuntime {
                     changed = shutdown.changed() => if changed.is_err() { break } else { continue },
                 }
                 let outcome = crate::deep_stack::with_semantic(&semantic, "uses builder", move |service| {
+                    // Before the batch: a batch on the old revision would only
+                    // be cancelled by the next query's refresh.
+                    for done in service.refresh_in_background() {
+                        tracing::debug!(
+                            "background refresh of {}: primed {} in {:?}",
+                            done.project.display(),
+                            done.primed,
+                            done.took
+                        );
+                    }
+                    if threads == 0 {
+                        return Ok(UsesBatch::Idle);
+                    }
                     Ok(service.build_uses_batch(threads, USES_FILES_PER_THREAD))
                 })
                 .await;
