@@ -182,7 +182,7 @@ fn library_use_census() {
     let (mut host, vfs, _layout) = super::loader::load_project_full(&root).unwrap();
     let load = at.elapsed();
     let rss_loaded = rss_mib();
-    let files = super::position::project_rust_files(&vfs, &root);
+    let files = super::position::project_rust_files(host.raw_database(), &vfs, &root);
 
     let at = Instant::now();
     let report = pass(&host.raw_database().clone(), &files);

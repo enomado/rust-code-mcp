@@ -595,7 +595,7 @@ fn read_uses(uses: &RwLock<uses::UseTable>) -> RwLockReadGuard<'_, uses::UseTabl
 fn build_word_index(host: &AnalysisHost, vfs: &Vfs, root: &Path) -> word_index::WordIndex {
     let analysis = host.analysis();
     let mut index = word_index::WordIndex::default();
-    for file_id in position::project_rust_files(vfs, root) {
+    for file_id in position::project_rust_files(host.raw_database(), vfs, root) {
         let text = analysis
             .file_text(file_id)
             .expect("a database nobody else holds is not cancelled");
@@ -964,10 +964,17 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
     }
 
     // The word index follows the same texts (every changed file is under the
-    // project root: the stamps come from walking it).
+    // project root: the stamps come from walking it) — those of local roots,
+    // the files the load built it over (`position::project_rust_files`): a
+    // vendored registry crate under the root is a library and stays out.
+    // A removed file is looked up before its text goes: its root still names it.
+    let local: Vec<bool> = texts
+        .iter()
+        .map(|(file_id, _)| position::is_in_local_root(db, *file_id))
+        .collect();
     {
         let mut words = ctx.words.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (file_id, text) in &texts {
+        for ((file_id, text), _) in texts.iter().zip(&local).filter(|(_, local)| **local) {
             words.set_file(*file_id, text.as_deref());
         }
     }
@@ -984,7 +991,7 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
                 && stale_roots.contains(&db.file_source_root(file).source_root_id(db))
         });
         patched.surface_crates = surface_crate_names(db, &surface_roots);
-        for (file_id, text) in &texts {
+        for ((file_id, text), _) in texts.iter().zip(&local).filter(|(_, local)| **local) {
             match text {
                 Some(_) => uses.mark_pending(*file_id),
                 None => uses.forget(*file_id),
@@ -1462,7 +1469,11 @@ fn load_into(
         indexing.elapsed().as_millis()
     );
     // Nothing described yet: until a file's uses are stored, queries sweep it.
-    let uses = uses::UseTable::all_pending(position::project_rust_files(&vfs, canonical));
+    let uses = uses::UseTable::all_pending(position::project_rust_files(
+        host.raw_database(),
+        &vfs,
+        canonical,
+    ));
     let exposure = exposure_by_root(host.raw_database());
     *context = Some(ProjectContext {
         host,
@@ -3860,6 +3871,138 @@ pub fn hooked() {
                 "exact={exact}: the one call of spawn, not add_spawn_hook, got {found:?}"
             );
         }
+    }
+
+    /// A crate with a registry dependency vendored under its own root
+    /// (`third_party/vdep`, a directory source replacing crates.io): the
+    /// vendored crate is a *library* root that lies under the project root —
+    /// the shape of a dependency's `OUT_DIR` under `target/`, which is what a
+    /// large workspace has. Both files call `std::mem::take` once.
+    ///
+    /// Not `vendor/`: the staleness walk skips directories of that name (and
+    /// `target/`), so a file added there would never reach a refresh, and the
+    /// refresh path would go untested.
+    fn vendored_dependency_workspace(root: &Path) {
+        write_file(
+            &root.join("Cargo.toml"),
+            r#"
+[package]
+name = "vendored_probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+vdep = "0.1"
+"#,
+        );
+        write_file(
+            &root.join(".cargo/config.toml"),
+            r#"
+[source.crates-io]
+replace-with = "vendored"
+
+[source.vendored]
+directory = "third_party"
+"#,
+        );
+        write_file(
+            &root.join("third_party/vdep/Cargo.toml"),
+            r#"
+[package]
+name = "vdep"
+version = "0.1.0"
+edition = "2021"
+"#,
+        );
+        write_file(
+            &root.join("third_party/vdep/.cargo-checksum.json"),
+            r#"{"files":{},"package":null}"#,
+        );
+        write_file(
+            &root.join("third_party/vdep/src/lib.rs"),
+            "pub fn helper(v: &mut Vec<u8>) -> Vec<u8> {\n    std::mem::take(v)\n}\n",
+        );
+        write_file(
+            &root.join("src/lib.rs"),
+            "pub fn run(v: &mut Vec<u8>) -> Vec<u8> {\n    let _ = vdep::helper(v);\n    std::mem::take(v)\n}\n",
+        );
+    }
+
+    /// The files of a library root under the project root — a dependency's
+    /// `OUT_DIR` under `target/`, a vendored crate — were taken for the
+    /// project's: on a ~8000-file workspace the table's builder spent 42–68 s on each of a
+    /// dependency's generated files (`grammers-tl-types`,
+    /// `unicode-general-category`, 2026-11-27), and their uses were answered
+    /// as the project's references. Neither the word index, nor the table of
+    /// uses, nor an answer holds them — after the load, nor after a file is
+    /// added to the vendored crate.
+    #[test]
+    fn a_library_under_the_project_root_is_not_the_project() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        vendored_dependency_workspace(root);
+
+        let service = SemanticService::new();
+        let found = service
+            .find_references_by_name_with_exact(root, "std::mem::take", true)
+            .expect("references query");
+        assert_eq!(refs_in(&found, "src/lib.rs"), 1, "the project's call, got {found:?}");
+        assert_eq!(
+            call_sites(&found),
+            1,
+            "no reference inside the vendored crate, got {found:?}"
+        );
+        // Non-vacuity: the vendored crate is in the analysis — its function
+        // resolves as a definition (by its path: a bare name searches the
+        // project's own crates only).
+        let helper = service
+            .symbol_search_with_exact(root, "vdep::helper", 8, true)
+            .expect("definition query");
+        assert!(
+            helper.iter().any(|d| d.file_path.ends_with("third_party/vdep/src/lib.rs")),
+            "the vendored crate is loaded, got {helper:?}"
+        );
+
+        // A file added to the vendored crate after the load, then a query to
+        // refresh on.
+        write_file(
+            &root.join("third_party/vdep/src/extra.rs"),
+            "pub fn more(v: &mut Vec<u8>) -> Vec<u8> {\n    std::mem::take(v)\n}\n",
+        );
+        let found = service
+            .find_references_by_name_with_exact(root, "std::mem::take", true)
+            .expect("references query after the refresh");
+        assert_eq!(call_sites(&found), 1, "still the project's call only, got {found:?}");
+
+        let canonical = root.canonicalize().expect("canonicalize the workspace");
+        let (indexed, pending) = service.with_context_for_test(&canonical, |ctx| {
+            let vfs = read_vfs(&ctx.vfs);
+            let words = ctx.words.read().unwrap();
+            let indexed: Vec<String> = words
+                .files_with("take")
+                .iter()
+                .map(|&file| vfs.file_path(file).to_string())
+                .collect();
+            let pending: Vec<String> = read_uses(&ctx.uses)
+                .pending()
+                .iter()
+                .map(|&file| vfs.file_path(file).to_string())
+                .collect();
+            (indexed, pending)
+        });
+        assert!(
+            indexed.len() == 1 && !indexed[0].contains("/third_party/"),
+            "the word index holds the project's file only, got {indexed:?}"
+        );
+        assert!(
+            pending.iter().all(|path| !path.contains("/third_party/")),
+            "the table of uses holds the project's files only, got {pending:?}"
+        );
+        assert!(!pending.is_empty(), "the project's file is in the table, pending");
     }
 
     /// Make every pending file of `root`'s table of uses ready, the way the

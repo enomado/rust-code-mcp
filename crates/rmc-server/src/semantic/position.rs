@@ -882,25 +882,54 @@ fn collect_by_token_scan(
     Ok(None)
 }
 
-/// The `.rs` files under `project_root` the analysis knows, sorted — what the
-/// word index is built over (`build_word_index`); no query walks them.
+/// The `.rs` files under `project_root` the analysis knows **in local source
+/// roots**, sorted — what the word index and the table of uses are built over
+/// (`build_word_index`, `UseTable::all_pending`); no query walks them.
+///
+/// # Why local roots only
+///
+/// A path under the project root is not enough: the `OUT_DIR` of a dependency
+/// (`target/debug/build/<dep>/out/*.rs`, pulled in with `include!`) and a
+/// vendored registry crate sit under it too, in a *library* root. They are not
+/// the project's code — a reference found there is not one the project makes —
+/// and they are the heaviest files there are: on a ~8000-file workspace 750 of
+/// the 8834 files the analysis holds under the root were such, and the table's
+/// builder spent 42–68 s on one each (`grammers-tl-types`
+/// `generated_functions.rs`, `unicode-general-category` `category.rs`,
+/// 2026-11-27). A local crate's own generated code is in a local root and stays.
 ///
 /// Sorted, because the VFS hands files back in load order: two runs that probe
 /// different occurrences first would otherwise answer in different order (the
 /// index keeps its lists in the same `FileId` order).
-pub(super) fn project_rust_files(vfs: &Vfs, project_root: &Path) -> Vec<ra_ap_vfs::FileId> {
+///
+/// Cost: one pass over the VFS plus two input reads per file under the root —
+/// microseconds per file, once per load.
+pub(super) fn project_rust_files(
+    db: &ra_ap_ide::RootDatabase,
+    vfs: &Vfs,
+    project_root: &Path,
+) -> Vec<ra_ap_vfs::FileId> {
     let mut files: Vec<ra_ap_vfs::FileId> = vfs
         .iter()
-        .filter(|(_, path)| {
+        .filter(|(file_id, path)| {
             path.as_path().is_some_and(|path| {
                 let path: &Path = path.as_ref();
                 path.extension().is_some_and(|ext| ext == "rs") && path.starts_with(project_root)
-            })
+            }) && is_in_local_root(db, *file_id)
         })
         .map(|(file_id, _)| file_id)
         .collect();
     files.sort();
     files
+}
+
+/// Whether the file belongs to a local source root (the workspace's packages
+/// and path dependencies), not to a library one (sysroot, registry, a
+/// dependency's `OUT_DIR`). See [`project_rust_files`].
+pub(super) fn is_in_local_root(db: &ra_ap_ide::RootDatabase, file_id: ra_ap_vfs::FileId) -> bool {
+    use ra_ap_ide_db::base_db::SourceDatabase;
+    let root = db.file_source_root(file_id).source_root_id(db);
+    !db.source_root(root).source_root(db).is_library
 }
 
 /// References inside the project to declarations that live in a library — the
