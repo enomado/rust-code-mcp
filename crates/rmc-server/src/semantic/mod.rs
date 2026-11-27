@@ -575,10 +575,13 @@ fn read_words(words: &RwLock<word_index::WordIndex>) -> RwLockReadGuard<'_, word
 
 /// What a query reads beside its snapshot and the `Vfs`: the word index, read
 /// for the whole query, and the table of uses, which the query reads (and a
-/// test fills) through its lock.
+/// test fills) through its lock; and the database the snapshot reads, for the
+/// `hir` questions `Analysis` has no method for (`position::assoc_item_navs`).
+/// It is a handle of the same revision as the snapshot, cancelled with it.
 struct Indexes<'a> {
     words: &'a word_index::WordIndex,
     uses: &'a RwLock<uses::UseTable>,
+    db: &'a ra_ap_ide::RootDatabase,
 }
 
 /// A context's table of uses for reading; poisoning stepped over as for the `Vfs`.
@@ -2146,6 +2149,7 @@ impl SemanticService {
             // Under the slot, beside the snapshot: see `queries_in_flight`.
             let _in_flight = QueryInFlight::begin(&slot);
             let analysis = ctx.host.analysis();
+            let db = ctx.host.raw_database().clone();
             let vfs = Arc::clone(&ctx.vfs);
             let words = Arc::clone(&ctx.words);
             let uses = Arc::clone(&ctx.uses);
@@ -2163,6 +2167,7 @@ impl SemanticService {
                 let indexes = Indexes {
                     words: &words,
                     uses: &uses,
+                    db: &db,
                 };
                 Cancelled::catch(std::panic::AssertUnwindSafe(|| {
                     work(&canonical, &analysis, &vfs, &indexes)
@@ -2279,6 +2284,7 @@ impl SemanticService {
         self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, indexes| {
             position::symbol_search_with_exact(
                 analysis,
+                indexes.db,
                 vfs,
                 indexes.words,
                 symbol_name,
@@ -2301,6 +2307,7 @@ impl SemanticService {
         self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, indexes| {
             position::symbol_search_within(
                 analysis,
+                indexes.db,
                 vfs,
                 indexes.words,
                 symbol_name,
@@ -2368,6 +2375,7 @@ impl SemanticService {
         self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, indexes| {
             position::find_references_by_name_with_exact(
                 analysis,
+                indexes.db,
                 vfs,
                 indexes.words,
                 &read_uses(indexes.uses),
@@ -2393,6 +2401,7 @@ impl SemanticService {
         self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, indexes| {
             position::find_references_within(
                 analysis,
+                indexes.db,
                 vfs,
                 indexes.words,
                 &read_uses(indexes.uses),
@@ -4515,6 +4524,146 @@ edition = "2021"
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// `src/lib.rs` of [`type_method_path_workspace`]: two types with a `new`
+    /// each, a trait with a required and a provided method, std types'
+    /// methods, a module function. One use of each on its own line.
+    const TYPE_METHOD_PATH_LIB: &str = r#"pub struct App;
+impl App {
+    pub fn new() -> Self {
+        App
+    }
+}
+pub struct Other;
+impl Other {
+    pub fn new() -> Self {
+        Other
+    }
+}
+pub trait Shape {
+    fn area(&self) -> u32;
+    fn twice(&self) -> u32 {
+        2
+    }
+}
+impl Shape for App {
+    fn area(&self) -> u32 {
+        1
+    }
+}
+pub mod inner {
+    pub fn helper() {}
+}
+pub fn use_all() {
+    let app = App::new(); // use App::new
+    let _ = Other::new(); // use Other::new
+    let _ = app.area(); // use area
+    let _ = app.twice(); // use twice
+    let _: Vec<u8> = Vec::new(); // use Vec::new
+    let _ = Some(1).map(|x| x + 1); // use Option::map
+    inner::helper(); // use helper
+}
+"#;
+
+    fn type_method_path_workspace(root: &Path) {
+        write_file(
+            &root.join("Cargo.toml"),
+            r#"
+[package]
+name = "type_method_probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+        );
+        write_file(&root.join("src/lib.rs"), TYPE_METHOD_PATH_LIB);
+    }
+
+    /// The 1-based line of [`TYPE_METHOD_PATH_LIB`] that ends with `// <mark>`.
+    fn type_method_line(mark: &str) -> u32 {
+        let tail = format!("// {mark}");
+        TYPE_METHOD_PATH_LIB
+            .lines()
+            .position(|line| line.ends_with(&tail))
+            .map(|index| index as u32 + 1)
+            .unwrap_or_else(|| panic!("no line marked `{mark}`"))
+    }
+
+    /// The lines of `src/lib.rs` the answer's references are on.
+    fn reference_lines(found: &[Location]) -> Vec<u32> {
+        let mut lines: Vec<u32> = found
+            .iter()
+            .filter(|l| l.name == "reference" && l.file_path.ends_with("src/lib.rs"))
+            .map(|l| l.line)
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    /// `type-method-path`: a path whose leading segments are a type or a
+    /// trait was answered "No references found" / "No definition found" — the
+    /// symbol index reads them as modules (`probe_index_hits_for_path_queries`),
+    /// and the empty answer reads as "dead code". Each path below names one
+    /// item and gets exactly its one use: `App::new` not `Other::new`, the
+    /// trait impl's `area` and the trait's provided `twice` through the type,
+    /// std's `Vec::new` and `Option::map`; a module path stays the index's.
+    #[test]
+    fn a_type_method_path_is_resolved_through_the_type() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        type_method_path_workspace(root);
+        let service = SemanticService::new();
+
+        for (path, mark) in [
+            ("App::new", "use App::new"),
+            ("Other::new", "use Other::new"),
+            ("App::area", "use area"),
+            ("App::twice", "use twice"),
+            ("Shape::twice", "use twice"),
+            ("Vec::new", "use Vec::new"),
+            ("std::vec::Vec::new", "use Vec::new"),
+            ("Option::map", "use Option::map"),
+            ("inner::helper", "use helper"),
+        ] {
+            for exact in [true, false] {
+                let found = service
+                    .find_references_by_name_with_exact(root, path, exact)
+                    .expect("references query");
+                assert_eq!(
+                    reference_lines(&found),
+                    vec![type_method_line(mark)],
+                    "`{path}` exact={exact}: its one use, got {found:?}"
+                );
+            }
+            let definitions = service
+                .symbol_search_with_exact(root, path, 8, true)
+                .expect("definition query");
+            let leaf = path.rsplit("::").next().unwrap();
+            assert!(
+                !definitions.is_empty() && definitions.iter().all(|d| d.exact && d.name == leaf),
+                "`{path}`: its declaration, got {definitions:?}"
+            );
+        }
+
+        // `App::new` is the one in `impl App`, not in `impl Other` (line 3,
+        // not 9).
+        let definitions = service
+            .symbol_search_with_exact(root, "App::new", 8, true)
+            .expect("definition query");
+        assert_eq!(
+            definitions.iter().map(|d| d.line).collect::<Vec<_>>(),
+            vec![3],
+            "got {definitions:?}"
+        );
+        // A path to nothing stays empty.
+        let found = service
+            .find_references_by_name_with_exact(root, "App::missing", true)
+            .expect("references query");
+        assert!(found.is_empty(), "got {found:?}");
     }
 
     /// A sweep out of time answers with what it has and says it is partial;

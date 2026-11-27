@@ -161,6 +161,7 @@ Found 1 definition(s) for 'RustParser':
 - First query triggers lazy loading of rust-analyzer (~120ms)
 - Subsequent queries are instant (<10ms)
 - A bare name searches the project's own code; an item of std or a dependency is found by its path: `std::thread::spawn`, `tokio::spawn`. Hits are named by the path's last segment, which is what `exact` compares.
+- A path through a type or a trait names its associated item: `App::new`, `Vec::new`, `Option::map`, `Shape::area`, `crate_a::Widget::new`. The owner is looked up in the index, else resolved like a `use` from the project's crates (prelude types, dependencies); then its inherent impls, and only if they have no such item, the trait impls for the type and the traits' provided methods. The same in `find_references`. A path that resolves to nothing says so (`the path resolves to no declaration … ask for `new` with exact=true`) — that is not "unused".
 - `exact=true` asks the index for full-name matches directly, so a short name (`new`, `spawn`) is not crowded out by long names that merely contain its letters.
 - A name the index lacks (a struct field) is looked for by a sweep over the project's files, bounded like `find_references`' (`RMC_SWEEP_BUDGET_SECS`); a cut answer starts with `INCOMPLETE:`.
 
@@ -197,6 +198,7 @@ Found 21 reference(s) for 'RustParser':
 
 **Notes:**
 - Name an item of std or a dependency by its path (`std::thread::spawn`): its references are collected from the project's own files only — each occurrence of the name is resolved with goto-definition and kept if it lands on that item, so `Builder::spawn` or a local `fn spawn` do not count. The declaration line points into the library's sources. Only library items whose name matches in full are searched this way; a loose (fuzzy) library hit is not. Files the table of uses already describes (built in the background after a load, on `RMC_USES_THREADS` threads, 1 by default; an edit inside a fn body leaves only that file to rebuild, a signature edit its crate and the crates depending on it) are answered from it without a query; only the rest are swept.
+- `Type::method` / `Trait::method` paths resolve through the type as in `find_definition` (`Vec::new`, `Option::map`, `App::new` — not `Other::new`). Only the project's local crates count as its files: a dependency's generated code under `target/…/out/` or a vendored registry crate under the root is a library.
 - **Time budget.** The two file sweeps — the library-item sweep above and the token sweep for names the symbol index lacks (struct fields) — stop after `RMC_SWEEP_BUDGET_SECS` (default 30 s; the same budget applies to `find_definition`'s token sweep). A cut answer lists what was found until then and says so on its first and last lines: `INCOMPLETE: Found N reference(s) …` / `INCOMPLETE: time budget of 30 s exhausted in the library-item sweep: K of M project files searched …`. Narrow the query (`exact=true`, a full path) and ask again. The daemon log gets a `… is INCOMPLETE` line for the call.
 
 ---

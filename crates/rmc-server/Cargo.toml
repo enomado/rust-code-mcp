@@ -65,6 +65,10 @@ ra_ap_parser        = { workspace = true }
 # The parser a refresh tells a file's surface from its fn bodies with
 # (`semantic::surface`); a dependency of `ra_ap_ide` already.
 ra_ap_syntax        = { workspace = true }
+# Types, traits and impls for a `Type::method` path the symbol index cannot
+# resolve (`semantic::position::assoc_item_navs`); `Semantics` for the census
+# probe (`semantic::use_census`). A dependency of `ra_ap_ide` already.
+ra_ap_hir           = { workspace = true }
 # The `Arc` rust-analyzer's database inputs are built with (a source root set
 # when a refresh patches an added file in); the lockfile's version.
 triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
@@ -86,6 +90,4 @@ optional = true
 [dev-dependencies]
 # `heap_size::DefMapCensus`, for the def map composition probe.
 ra_ap_hir_def = { workspace = true }
-# `Semantics`, for the identifier census probe (`semantic::use_census`).
-ra_ap_hir = { workspace = true }
 tempfile = "3"

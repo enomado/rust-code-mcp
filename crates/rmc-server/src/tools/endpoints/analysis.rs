@@ -253,7 +253,18 @@ fn swept_text(
         .as_deref()
         .map_or_else(String::new, |why| format!("\nINCOMPLETE: {why}"));
     if answer.locations.is_empty() {
-        format!("{head}{none} for symbol '{symbol_name}'{tail}")
+        // A path that resolved to nothing is not "unused": no declaration was
+        // found to have uses. Said so, with what was tried and what to ask
+        // instead, rather than in the words a dead item gets.
+        let unresolved = match symbol_name.rsplit_once("::") {
+            Some((owner, leaf)) if !owner.is_empty() && !leaf.is_empty() => format!(
+                ": the path resolves to no declaration — `{owner}` is neither a module \
+                 holding `{leaf}` nor a type or trait with an associated item `{leaf}`. \
+                 This does not mean unused; ask for `{leaf}` with exact=true"
+            ),
+            _ => String::new(),
+        };
+        format!("{head}{none} for symbol '{symbol_name}'{unresolved}{tail}")
     } else {
         let result = answer
             .locations
@@ -675,6 +686,36 @@ mod tests {
             },
         );
         assert!(empty.starts_with("INCOMPLETE: No definition found"), "{empty}");
+        // An unresolved path says it did not resolve — not the words of an
+        // unused item — and what to ask instead; a bare name does not.
+        let unresolved = swept_text(
+            "find_references",
+            Noun::Reference,
+            "App::missing",
+            "/w",
+            &SweptAnswer {
+                locations: Vec::new(),
+                incomplete: None,
+                cost: Default::default(),
+            },
+        );
+        assert!(
+            unresolved.contains("resolves to no declaration")
+                && unresolved.contains("ask for `missing` with exact=true"),
+            "{unresolved}"
+        );
+        let bare = swept_text(
+            "find_references",
+            Noun::Reference,
+            "missing",
+            "/w",
+            &SweptAnswer {
+                locations: Vec::new(),
+                incomplete: None,
+                cost: Default::default(),
+            },
+        );
+        assert_eq!(bare, "No references found for symbol 'missing'");
         let whole = swept_text(
             "find_references",
             Noun::Reference,

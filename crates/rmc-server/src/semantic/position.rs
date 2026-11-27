@@ -2,7 +2,8 @@
 
 use anyhow::{Context, Result};
 use ra_ap_ide::{
-    Analysis, AnalysisHost, FilePosition, LineCol, NavigationTarget, Query, SymbolKind, TextSize,
+    Analysis, AnalysisHost, FilePosition, LineCol, NavigationTarget, Query, RootDatabase,
+    SymbolKind, TextSize,
 };
 use ra_ap_vfs::{Vfs, VfsPath};
 
@@ -430,6 +431,7 @@ pub(crate) fn find_references(
 /// rather than an answer to it.
 pub(crate) fn symbol_search_with_exact(
     analysis: &Analysis,
+    db: &RootDatabase,
     vfs: &Vfs,
     words: &WordIndex,
     symbol_name: &str,
@@ -438,6 +440,7 @@ pub(crate) fn symbol_search_with_exact(
 ) -> Result<Vec<Location>> {
     let answer = symbol_search_within(
         analysis,
+        db,
         vfs,
         words,
         symbol_name,
@@ -452,6 +455,7 @@ pub(crate) fn symbol_search_with_exact(
 /// stopped sweep is named in [`SweptAnswer::incomplete`].
 pub(crate) fn symbol_search_within(
     analysis: &Analysis,
+    db: &RootDatabase,
     vfs: &Vfs,
     words: &WordIndex,
     symbol_name: &str,
@@ -460,6 +464,15 @@ pub(crate) fn symbol_search_within(
     budget: SweepBudget,
 ) -> Result<SweptAnswer> {
     let mut locations = index_matches(&analysis, vfs, symbol_name, limit, exact_only)?;
+    // `Type::method` / `Trait::method`: the index reads leading segments as
+    // modules and finds nothing (`assoc_item_navs`).
+    if !locations.iter().any(|location| location.exact) {
+        for target in assoc_item_navs(db, symbol_name) {
+            let mut location = nav_target_to_location(vfs, analysis, &target)?;
+            location.exact = true;
+            locations.push(location);
+        }
+    }
 
     let mut incomplete = None;
     let mut cost = SweepCost::default();
@@ -573,6 +586,142 @@ fn index_navs(
     Ok(navs)
 }
 
+/// The associated items a path `Owner::item` names when `Owner` is a type or a
+/// trait: `WellLogApp::new`, `Vec::new`, `Option::map`, `Iterator::map`,
+/// `crate_a::Widget::new`, `std::vec::Vec::new`.
+///
+/// # Why the index cannot
+///
+/// rust-analyzer's symbol index reads every leading segment of a path query
+/// as a crate or a module (`resolve_path_to_modules`): for `App::new` it
+/// looks for a module `App`, finds none and answers nothing — which the tools
+/// reported as "No references found", read as "dead code"
+/// (`probe_index_hits_for_path_queries`, 2026-11-26).
+///
+/// # How, and what it costs
+///
+/// 1. The owner: the index's full-name matches for the owner path (a type
+///    anywhere in the project's crates, a path through modules); if there are
+///    none, the owner path resolved from each local crate's root module the
+///    way a `use` would — that is where the prelude lives (`Vec`, `Option`)
+///    and where a dependency's name resolves. A local crate's def map is
+///    already built by the load; one resolution is a few hash lookups — on
+///    ~2000 crates, milliseconds.
+/// 2. The item: the owner's inherent impls (`Type::iterate_assoc_items` —
+///    the defining crate's impls only, already in the database); for a trait,
+///    its own items. Only when the inherent impls hold no such item (`T::default`
+///    from `Default`, `T::map` from a trait's provided method) the trait impls
+///    for the type are asked (`Impl::all_for_type`): that walks the trait
+///    impls of every crate — memoised per crate by salsa, so the first such
+///    query of a revision pays for the crates it touches and the next ones only
+///    the walk.
+///
+/// No file is read and no occurrence is resolved. An owner that is neither a
+/// type nor a trait (a module, a function) contributes nothing: a module path
+/// is the index's job, which it does.
+pub(crate) fn assoc_item_navs(db: &RootDatabase, symbol_name: &str) -> Vec<NavigationTarget> {
+    use ra_ap_hir::{AssocItem, Crate, Impl, ItemInNs, ModuleDef, Name, Semantics};
+    use ra_ap_ide::TryToNav as _;
+
+    let path = symbol_name.strip_prefix("::").unwrap_or(symbol_name);
+    let segments: Vec<&str> = path.split("::").collect();
+    let [owner_path @ .., item] = segments.as_slice() else {
+        return Vec::new();
+    };
+    if owner_path.is_empty() || item.is_empty() || owner_path.iter().any(|s| s.is_empty()) {
+        return Vec::new();
+    }
+    let owner_leaf = owner_path[owner_path.len() - 1];
+
+    // The owner, from the index first.
+    let mut owners: Vec<ModuleDef> = Vec::new();
+    {
+        let mut query = Query::new(owner_path.join("::"));
+        query.exact();
+        for symbol in ra_ap_ide_db::symbol_index::world_symbols(db, query) {
+            if symbol.name.as_str() == owner_leaf && !owners.contains(&symbol.def) {
+                owners.push(symbol.def);
+            }
+        }
+    }
+    // Then as a path from each local crate's root: the prelude, dependencies.
+    if owners.is_empty() {
+        let names: Vec<Name> = owner_path.iter().map(|s| Name::new_root(s)).collect();
+        for krate in Crate::all(db)
+            .into_iter()
+            .filter(|k| k.origin(db).is_local())
+        {
+            let root = krate.root_module(db);
+            let Some(items) = root.resolve_mod_path(db, names.iter().cloned()) else {
+                continue;
+            };
+            for found in items {
+                if let ItemInNs::Types(def) = found
+                    && !owners.contains(&def)
+                {
+                    owners.push(def);
+                }
+            }
+        }
+    }
+
+    let named = |assoc: &AssocItem| assoc.name(db).is_some_and(|n| n.as_str() == *item);
+    let mut found: Vec<AssocItem> = Vec::new();
+    let push = |assoc: AssocItem, found: &mut Vec<AssocItem>| {
+        if !found.contains(&assoc) {
+            found.push(assoc);
+        }
+    };
+    for owner in owners {
+        let ty = match owner {
+            ModuleDef::Trait(trait_) => {
+                for assoc in trait_.items(db).into_iter().filter(&named) {
+                    push(assoc, &mut found);
+                }
+                continue;
+            }
+            ModuleDef::Adt(adt) => adt.ty(db),
+            ModuleDef::TypeAlias(alias) => alias.ty(db),
+            ModuleDef::BuiltinType(builtin) => builtin.ty(db),
+            _ => continue,
+        };
+        let before = found.len();
+        ty.iterate_assoc_items(db, |assoc| {
+            if named(&assoc) {
+                push(assoc, &mut found);
+            }
+            None::<()>
+        });
+        if found.len() > before {
+            continue;
+        }
+        // Not inherent: a trait's, implemented for the type — the impl's own
+        // item, or the trait's provided one the impl does not override.
+        for imp in Impl::all_for_type(db, ty) {
+            let Some(trait_) = imp.trait_(db) else {
+                continue;
+            };
+            let own: Vec<AssocItem> = imp.items(db).into_iter().filter(&named).collect();
+            if own.is_empty() {
+                for assoc in trait_.items(db).into_iter().filter(&named) {
+                    push(assoc, &mut found);
+                }
+            } else {
+                for assoc in own {
+                    push(assoc, &mut found);
+                }
+            }
+        }
+    }
+
+    let sema = Semantics::new(db);
+    found
+        .into_iter()
+        .filter_map(|assoc| assoc.try_to_nav(&sema))
+        .map(|nav| nav.call_site())
+        .collect()
+}
+
 /// The index's answer with the sweep deliberately not run — the mutant that
 /// tells which kinds the index carries, kept in the source rather than applied
 /// by hand to a working tree each time the question comes up.
@@ -606,6 +755,7 @@ fn dedup_by_position(locations: &mut Vec<Location>) {
 /// [`find_references_within`].
 pub(crate) fn find_references_by_name_with_exact(
     analysis: &Analysis,
+    db: &RootDatabase,
     vfs: &Vfs,
     words: &WordIndex,
     uses: &UseTable,
@@ -614,6 +764,7 @@ pub(crate) fn find_references_by_name_with_exact(
 ) -> Result<Vec<Location>> {
     let answer = find_references_within(
         analysis,
+        db,
         vfs,
         words,
         uses,
@@ -628,6 +779,7 @@ pub(crate) fn find_references_by_name_with_exact(
 /// a stopped sweep is named in [`SweptAnswer::incomplete`].
 pub(crate) fn find_references_within(
     analysis: &Analysis,
+    db: &RootDatabase,
     vfs: &Vfs,
     words: &WordIndex,
     uses: &UseTable,
@@ -637,7 +789,14 @@ pub(crate) fn find_references_within(
 ) -> Result<SweptAnswer> {
     let name = leaf_name(symbol_name);
     // First, find all symbols matching the name, full-name matches first.
-    let symbols = index_navs(analysis, symbol_name, 50, exact_only)?;
+    let mut symbols = index_navs(analysis, symbol_name, 50, exact_only)?;
+    // `Type::method` / `Trait::method`: the index reads leading segments as
+    // modules and finds nothing; the owner's associated items are the answer
+    // (`assoc_item_navs`). Each is named `name`, so the loop below takes it as
+    // a full-name match.
+    if !symbols.iter().any(|symbol| symbol.name.as_str() == name) {
+        symbols.extend(assoc_item_navs(db, symbol_name));
+    }
 
     let mut all_locations = Vec::new();
     let mut resolved_the_name = false;
