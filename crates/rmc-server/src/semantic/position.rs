@@ -601,8 +601,8 @@ fn index_navs(
 /// # How, and what it costs
 ///
 /// 1. The owner: the index's full-name matches for the owner path (a type
-///    anywhere in the project's crates, a path through modules); if there are
-///    none, the owner path resolved from each local crate's root module the
+///    anywhere in the project's crates, a path through modules); if they hold
+///    no such item, the owner path resolved from each local crate's root module the
 ///    way a `use` would — that is where the prelude lives (`Vec`, `Option`)
 ///    and where a dependency's name resolves. A local crate's def map is
 ///    already built by the load; one resolution is a few hash lookups — on
@@ -633,9 +633,10 @@ pub(crate) fn assoc_item_navs(db: &RootDatabase, symbol_name: &str) -> Vec<Navig
     }
     let owner_leaf = owner_path[owner_path.len() - 1];
 
-    // The owner, from the index first.
-    let mut owners: Vec<ModuleDef> = Vec::new();
-    {
+    // The owners the index names: a type anywhere in the project's crates,
+    // a path through modules.
+    let from_index = || {
+        let mut owners: Vec<ModuleDef> = Vec::new();
         let mut query = Query::new(owner_path.join("::"));
         query.exact();
         for symbol in ra_ap_ide_db::symbol_index::world_symbols(db, query) {
@@ -643,9 +644,12 @@ pub(crate) fn assoc_item_navs(db: &RootDatabase, symbol_name: &str) -> Vec<Navig
                 owners.push(symbol.def);
             }
         }
-    }
-    // Then as a path from each local crate's root: the prelude, dependencies.
-    if owners.is_empty() {
+        owners
+    };
+    // The owner path resolved like a `use` from each local crate's root: the
+    // prelude (`Vec`, `Option`), dependencies.
+    let as_used = || {
+        let mut owners: Vec<ModuleDef> = Vec::new();
         let names: Vec<Name> = owner_path.iter().map(|s| Name::new_root(s)).collect();
         for krate in Crate::all(db)
             .into_iter()
@@ -663,55 +667,68 @@ pub(crate) fn assoc_item_navs(db: &RootDatabase, symbol_name: &str) -> Vec<Navig
                 }
             }
         }
-    }
+        owners
+    };
 
     let named = |assoc: &AssocItem| assoc.name(db).is_some_and(|n| n.as_str() == *item);
-    let mut found: Vec<AssocItem> = Vec::new();
     let push = |assoc: AssocItem, found: &mut Vec<AssocItem>| {
         if !found.contains(&assoc) {
             found.push(assoc);
         }
     };
-    for owner in owners {
-        let ty = match owner {
-            ModuleDef::Trait(trait_) => {
-                for assoc in trait_.items(db).into_iter().filter(&named) {
-                    push(assoc, &mut found);
+    let items_of = |owners: Vec<ModuleDef>| {
+        let mut found: Vec<AssocItem> = Vec::new();
+        for owner in owners {
+            let ty = match owner {
+                ModuleDef::Trait(trait_) => {
+                    for assoc in trait_.items(db).into_iter().filter(&named) {
+                        push(assoc, &mut found);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            ModuleDef::Adt(adt) => adt.ty(db),
-            ModuleDef::TypeAlias(alias) => alias.ty(db),
-            ModuleDef::BuiltinType(builtin) => builtin.ty(db),
-            _ => continue,
-        };
-        let before = found.len();
-        ty.iterate_assoc_items(db, |assoc| {
-            if named(&assoc) {
-                push(assoc, &mut found);
-            }
-            None::<()>
-        });
-        if found.len() > before {
-            continue;
-        }
-        // Not inherent: a trait's, implemented for the type — the impl's own
-        // item, or the trait's provided one the impl does not override.
-        for imp in Impl::all_for_type(db, ty) {
-            let Some(trait_) = imp.trait_(db) else {
-                continue;
+                ModuleDef::Adt(adt) => adt.ty(db),
+                ModuleDef::TypeAlias(alias) => alias.ty(db),
+                ModuleDef::BuiltinType(builtin) => builtin.ty(db),
+                _ => continue,
             };
-            let own: Vec<AssocItem> = imp.items(db).into_iter().filter(&named).collect();
-            if own.is_empty() {
-                for assoc in trait_.items(db).into_iter().filter(&named) {
+            let before = found.len();
+            ty.iterate_assoc_items(db, |assoc| {
+                if named(&assoc) {
                     push(assoc, &mut found);
                 }
-            } else {
-                for assoc in own {
-                    push(assoc, &mut found);
+                None::<()>
+            });
+            if found.len() > before {
+                continue;
+            }
+            // Not inherent: a trait's, implemented for the type — the impl's
+            // own item, or the trait's provided one the impl does not override.
+            for imp in Impl::all_for_type(db, ty) {
+                let Some(trait_) = imp.trait_(db) else {
+                    continue;
+                };
+                let own: Vec<AssocItem> = imp.items(db).into_iter().filter(&named).collect();
+                if own.is_empty() {
+                    for assoc in trait_.items(db).into_iter().filter(&named) {
+                        push(assoc, &mut found);
+                    }
+                } else {
+                    for assoc in own {
+                        push(assoc, &mut found);
+                    }
                 }
             }
         }
+        found
+    };
+    // The index's owners first; the resolved path when they hold no such item.
+    // Not only when the index names no owner: a same-named item of another
+    // kind shadows the prelude's there — on a ~8000-file workspace the index's
+    // only `Option` was a variant of a vendored crate's enum (`Value::Option`),
+    // and `Option::map` resolved to nothing (2026-11-27).
+    let mut found = items_of(from_index());
+    if found.is_empty() {
+        found = items_of(as_used());
     }
 
     let sema = Semantics::new(db);

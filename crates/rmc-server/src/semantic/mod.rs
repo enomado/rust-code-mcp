@@ -4564,6 +4564,11 @@ pub fn use_all() {
     let _ = Some(1).map(|x| x + 1); // use Option::map
     inner::helper(); // use helper
 }
+// A variant named like the prelude's `Option`: the index names it as the
+// owner of `Option::map`, and it holds no `map`.
+pub enum Value {
+    Option(u8),
+}
 "#;
 
     fn type_method_path_workspace(root: &Path) {
