@@ -67,29 +67,61 @@ pub(crate) struct RenamePreview {
 ///
 /// Resolves the symbol by name first; fails if multiple symbols match (ambiguous rename
 /// is dangerous). Use rename_by_position to disambiguate.
+///
+/// # Which declarations a name has: `find_definition`'s answer
+///
+/// The declarations are found exactly as `find_definition` with `exact=true`
+/// finds them ([`position::symbol_search_within`]): the index's full-name
+/// query, a `Type::method` / `Trait::method` path through the type, and the
+/// fields the index does not carry, from the word index's candidate files.
+/// Before (plan item `no-brute-sweeps`, 2026-11-27) this was a *fuzzy* index
+/// query cut at 50 and filtered for the name afterwards, which
+///
+/// - answered "No exact match" for a name declared in the project whenever
+///   fifty longer names holding its letters sorted ahead of it — the crowding
+///   `position::index_navs` describes (`spawn` behind fifty test functions);
+/// - never matched a path (`App::new`, `crate_a::Widget`): the whole path was
+///   compared with the leaf name;
+/// - never found a field: the index does not carry fields, so renaming one by
+///   name answered "No symbol found", the words a misspelling gets.
+///
+/// # Cost
+///
+/// That of `find_definition`: index lookups, plus — for a name the index has
+/// no full match of, or that may also be a field — lexing the files the word
+/// index has the name in and a `find_all_refs` per not-yet-covered occurrence
+/// there, bounded by `budget`. No other file is read. An answer the budget cut
+/// is refused rather than renamed on: which declarations exist is exactly
+/// what it could not finish saying.
 pub(crate) fn rename_by_name(
     analysis: &Analysis,
+    db: &ra_ap_ide::RootDatabase,
     vfs: &Vfs,
+    words: &super::word_index::WordIndex,
     symbol_name: &str,
     new_name: &str,
+    budget: position::SweepBudget,
 ) -> Result<RenamePreview> {
-    let query = Query::new(symbol_name.to_string());
-    let symbols = analysis
-        .symbol_search(query, 50)
-        .context("symbol_search query failed")?;
-
-    if symbols.is_empty() {
-        anyhow::bail!("No symbol found matching '{}'", symbol_name);
+    let found =
+        position::symbol_search_within(analysis, db, vfs, words, symbol_name, 50, true, budget)?;
+    if let Some(why) = &found.incomplete {
+        anyhow::bail!(
+            "Cannot tell which declarations '{symbol_name}' has: {why}. Pass file_path, line, \
+             and column of the one to rename."
+        );
     }
+    let leaf = symbol_name.rsplit("::").next().unwrap_or(symbol_name);
 
-    // Filter to exact name matches to avoid renaming a substring match
-    let exact: Vec<_> = symbols
-        .iter()
-        .filter(|s| s.name.as_str() == symbol_name)
-        .collect();
-
-    let target = match exact.as_slice() {
+    let target = match found.locations.as_slice() {
         [] => {
+            // Fuzzy candidates are listed from the index alone — no sweep, no
+            // reference search: a hint, not an answer.
+            let symbols = analysis
+                .symbol_search(Query::new(symbol_name.to_string()), 50)
+                .context("symbol_search query failed")?;
+            if symbols.is_empty() {
+                anyhow::bail!("No symbol found matching '{}'", symbol_name);
+            }
             let fuzzy: Vec<_> = symbols.iter().collect();
             let locs = format_nav_candidates(vfs, &analysis, &fuzzy);
             anyhow::bail!(
@@ -99,9 +131,19 @@ pub(crate) fn rename_by_name(
                 locs
             )
         }
-        [single] => *single,
+        [single] => single,
         multiple => {
-            let locs = format_nav_candidates(vfs, &analysis, multiple);
+            let locs = multiple
+                .iter()
+                .map(|location| {
+                    let path = location.file_path.display();
+                    let (line, column) = (location.line, location.column);
+                    format!(
+                        "  - {path}:{line}:{column} ({leaf}) - rerun with file_path=\"{path}\", line={line}, column={column}"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             anyhow::bail!(
                 "Ambiguous symbol '{}': {} exact matches.\n{}",
                 symbol_name,
@@ -111,13 +153,23 @@ pub(crate) fn rename_by_name(
         }
     };
 
-    let offset = target.focus_range.unwrap_or(target.full_range).start();
-    let position = FilePosition {
-        file_id: target.file_id,
-        offset,
+    // One character into the identifier, not at its first byte: a field asked
+    // at its first character answers nothing in rust-analyzer (see
+    // `position::collect_by_token_scan`). Single-character names have no inside.
+    let column = if leaf.len() > 1 {
+        target.column + 1
+    } else {
+        target.column
     };
-
-    rename_at_file_position(vfs, &analysis, position, new_name)
+    rename_by_position(
+        analysis,
+        vfs,
+        &target.file_path,
+        target.line,
+        column,
+        leaf,
+        new_name,
+    )
 }
 
 fn nav_position(

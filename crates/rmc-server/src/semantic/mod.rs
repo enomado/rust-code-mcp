@@ -9,6 +9,10 @@ mod lru_sweep;
 pub(crate) mod position;
 mod rename;
 mod surface;
+/// What a name query costs and resolves when the name is fuzzy, a field or a
+/// path (plan item `no-brute-sweeps`): `find_references`, `rename_symbol`.
+#[cfg(test)]
+mod sweep_scope_tests;
 mod word_index;
 #[cfg(test)]
 mod use_census;

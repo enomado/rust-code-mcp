@@ -235,9 +235,10 @@ fn swept_text(
     if cost.files_read > 0 {
         tracing::info!(
             "{tool} '{symbol_name}' in {directory}: name sweep read {} candidate file(s), {} \
-             rust-analyzer quer(ies)",
+             rust-analyzer quer(ies); {} declaration search(es)",
             cost.files_read,
-            cost.ra_queries
+            cost.ra_queries,
+            cost.declaration_searches
         );
     }
     let (plural, none) = match noun {
@@ -333,7 +334,7 @@ pub(crate) async fn rename_symbol_with_semantic(
             Some((file, line, column)) => {
                 service.rename_by_position(&project, &file, line, column, &symbol, &new)
             }
-            None => service.rename_by_name(&project, &symbol, &new),
+            None => service.rename_by_name(&project, &symbol, &new, sweep_budget()),
         }
         .map_err(rename_mcp_error)
     })

@@ -62,6 +62,10 @@ pub(crate) struct SweepCost {
     /// Files whose uses of a library declaration came from the table of uses
     /// (`uses::UseTable`) rather than a sweep: no query asked about them.
     pub files_from_table: usize,
+    /// `find_all_refs` searches started from a declaration the symbol index
+    /// named in full — one per full-name match, never one per fuzzy match
+    /// ([`find_references_within`]).
+    pub declaration_searches: usize,
 }
 
 /// When a file sweep must stop, and what it was doing when it did.
@@ -818,9 +822,10 @@ pub(crate) fn find_references_within(
     let mut all_locations = Vec::new();
     let mut resolved_the_name = false;
     let mut library_symbols = Vec::new();
+    let mut cost = SweepCost::default();
 
-    // For each symbol found, find its references. One `find_all_refs` per
-    // match, up to 50 matches of a fuzzy query: bounded by the budget too.
+    // For each full-name match, its references: one `find_all_refs` each.
+    // A fuzzy match contributes its declaration only — see the loop.
     let mut incomplete = None;
     for (done, symbol) in symbols.iter().enumerate() {
         if budget.exhausted() {
@@ -853,16 +858,29 @@ pub(crate) fn find_references_within(
             continue;
         }
 
+        // A fuzzy match is listed by its declaration, from the index, and not
+        // searched: the caller named something else (`target` brought
+        // `target_dir`, `retarget`, … up to 50 of them), and a `find_all_refs`
+        // each is a reference search per *guess* — on a ~8000-file workspace
+        // a fuzzy `new` would search the uses of fifty `new`s, the work of
+        // fifty exact queries, for names nobody asked about (plan rule: a
+        // fuzzy query does not start an expensive branch by itself). The
+        // listed declaration tells the caller which full name to ask for.
+        if !symbol_exact {
+            all_locations.push(nav_target_to_location(vfs, analysis, symbol)?);
+            continue;
+        }
+
         let position = FilePosition {
             file_id: symbol.file_id,
             offset: nav_offset(symbol),
         };
+        cost.declaration_searches += 1;
         if let Some((_, harvest)) = harvest_refs_at(&analysis, vfs, position, symbol_exact)? {
             all_locations.extend(harvest.into_all());
         }
     }
 
-    let mut cost = SweepCost::default();
     if incomplete.is_none() {
         incomplete = collect_library_refs(
             analysis,

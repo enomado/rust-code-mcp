@@ -140,7 +140,7 @@ impl SearchToolRouter {
     }
 
     /// Find all references to a symbol by name
-    #[tool(description = "Find all places where a symbol is used (calls, type references, etc.). Default matching preserves rust-analyzer substring/fuzzy search and ranks exact source symbols first; set `exact=true` to resolve only full-name matches. Each result line is tagged with `exact=true/false`.")]
+    #[tool(description = "Find all places where a symbol is used (calls, type references, etc.). References are resolved for full-name matches; by default the fuzzy matches of the name are listed too, by their declarations only (`exact=false` lines) — ask for the full name of the one you meant. Set `exact=true` to drop them. Each result line is tagged with `exact=true/false`.")]
     async fn find_references(
         &self,
         Parameters(FindReferencesParams {
