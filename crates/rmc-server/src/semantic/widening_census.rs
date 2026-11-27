@@ -8,7 +8,8 @@
 //! files' texts from the working tree as it is now — a commit is judged
 //! against today's tree, which is close enough for counts.
 //!
-//! `RMC_WIDENING_REPO=<dir> [RMC_WIDENING_SINCE="24 hours ago"] cargo test -p
+//! `RMC_WIDENING_REPO=<dir> [RMC_WIDENING_SINCE="24 hours ago"]
+//! [RMC_WIDENING_UNTIL=<date>] cargo test -p
 //! rmc-server --lib -- --ignored --nocapture widening_census`
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -120,6 +121,9 @@ struct Totals {
     by_names: usize,
     pending_by_crates: Vec<usize>,
     pending_by_names: Vec<usize>,
+    /// Of the commits the names could tell — without those that went by the
+    /// crates (mostly item macros the probe cannot expand).
+    pending_names_told: Vec<usize>,
     reasons: BTreeMap<String, usize>,
 }
 
@@ -198,12 +202,16 @@ fn widening_census() {
             .unwrap()
             .trim(),
     );
+    // A fixed window (`RMC_WIDENING_UNTIL`) keeps two runs comparable.
+    let until = std::env::var("RMC_WIDENING_UNTIL").unwrap_or_else(|_| "now".to_owned());
     let commits = git(
         &repo,
         &[
             "log",
             "--since",
             &since,
+            "--until",
+            &until,
             "--format=%H",
             "--reverse",
             "--no-merges",
@@ -216,7 +224,11 @@ fn widening_census() {
     let mut rows: Vec<(usize, usize, String, String)> = Vec::new();
     let mut closure_secs = 0.0;
     let mut parsed_total = 0;
+    let mut lexed_total = 0;
     let mut optimistic_total = 0;
+    // By name as the widening shows it (`x@`, `x&T`, `T*`): the files holding
+    // its bare word, summed over the commits — an upper bound of its share.
+    let mut widest_names: HashMap<String, usize> = HashMap::new();
     for commit in commits.lines() {
         totals.commits += 1;
         let changes = git(
@@ -322,6 +334,12 @@ fn widening_census() {
                 .map(|candidate| ids[candidate])
                 .collect()
         };
+        let module_names = |file: FileId| -> Vec<String> {
+            paths
+                .get(file.index() as usize)
+                .map(|path| widening::module_names_by_path(path))
+                .unwrap_or_default()
+        };
         // No analysis here: an attribute is taken as written (as if no macro),
         // a body macro as expanding to nothing that escapes, an item macro as
         // unknown. Counted, to tell what the estimate leans on.
@@ -386,6 +404,7 @@ fn widening_census() {
             reachable: &reachable,
             text: &text,
             module_files: &module_files,
+            module_names: &module_names,
             expand: &expand,
             parse_budget: widening::PARSE_BUDGET,
             trace: tracing_this.then_some(&trace),
@@ -421,19 +440,26 @@ fn widening_census() {
                 names,
                 parsed,
                 expanded,
+                lexed,
             } => {
+                lexed_total += lexed;
                 totals.by_names += 1;
                 parsed_total += parsed;
                 // The widest names first: what the count is made of.
                 let mut by_width: Vec<(usize, &String)> = names
                     .iter()
                     .map(|name| {
-                        let bare = name.trim_end_matches(['@', '*']);
-                        let bare = bare.split('&').next().unwrap_or(bare);
+                        // `x@`, `T*`, `x&T`, `x~Tr`, `T::x`, a `!` when untold.
+                        let bare = name.trim_end_matches(['@', '*', '!']);
+                        let bare = bare.rsplit("::").next().unwrap_or(bare);
+                        let bare = bare.split(['&', '~']).next().unwrap_or(bare);
                         (words.files_with(bare).len(), name)
                     })
                     .collect();
                 by_width.sort_by(|a, b| b.0.cmp(&a.0));
+                for (width, name) in &by_width {
+                    *widest_names.entry((*name).clone()).or_default() += width;
+                }
                 let shown: Vec<String> = by_width
                     .iter()
                     .take(6)
@@ -456,6 +482,9 @@ fn widening_census() {
         };
         totals.pending_by_crates.push(by_crates);
         totals.pending_by_names.push(by_names);
+        if matches!(widening, Widening::Files { .. }) {
+            totals.pending_names_told.push(by_names);
+        }
         rows.push((by_crates, by_names, commit[..9].to_owned(), what));
     }
 
@@ -476,13 +505,24 @@ fn widening_census() {
     );
     eprintln!("pending by names:  {}", quantiles(&totals.pending_by_names));
     eprintln!(
-        "closure: {parsed_total} files parsed in {closure_secs:.1} s; {optimistic_total} macros taken optimistically (attribute as written, body macro empty)"
+        "  of {} told by names: {}",
+        totals.pending_names_told.len(),
+        quantiles(&totals.pending_names_told)
+    );
+    eprintln!(
+        "closure: {parsed_total} files parsed, {lexed_total} lexed in {closure_secs:.1} s; {optimistic_total} macros taken optimistically (attribute as written, body macro empty)"
     );
     eprintln!("\nwhy the crates (commits):");
     let mut reasons: Vec<(&String, &usize)> = totals.reasons.iter().collect();
     reasons.sort_by(|a, b| b.1.cmp(a.1));
     for (why, count) in reasons.iter().take(40) {
         eprintln!("  {count:4}  {why}");
+    }
+    let mut widest: Vec<(&String, &usize)> = widest_names.iter().collect();
+    widest.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+    eprintln!("\nwidest names (files with the bare word, summed over commits):");
+    for (name, width) in widest.iter().take(30) {
+        eprintln!("  {width:7}  {name}");
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0));
     eprintln!("\nwidest by crates (crates → names):");

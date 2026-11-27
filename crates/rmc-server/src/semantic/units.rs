@@ -30,6 +30,10 @@
 //!   a tuple struct, an alias or a trait impl's associated type, the values of
 //!   another type in turn. Each unit says what it hands out ([`Holder`]); the
 //!   `widening` module closes over them.
+//! - Both at once: [`Witness::Both`] (a field, a variant, a method of an
+//!   inherent `impl` — the name among the holders of its type) and
+//!   [`Witness::InScope`] (a trait's item — the name among the files that may
+//!   have the trait in scope).
 //!
 //! # Macros
 //!
@@ -78,10 +82,12 @@ pub(crate) fn is_primitive(name: &str) -> bool {
 pub(crate) enum Witness {
     /// The files that name it.
     Name(String),
-    /// The files that name either: an associated item without `self` of an
-    /// inherent `impl` is reached only as `Type::item`, or `Self::item` inside
-    /// an `impl Type` — a dependent names both, so either is sound, and the
-    /// refresh takes the one fewer files hold.
+    /// The files that name the item `.1` and the type `.0` or one of its
+    /// aliases (`WordIndex::names_for`): an associated item without `self` of
+    /// an inherent `impl` is reached only as `Type::item`, `Alias::item`, or
+    /// `Self::item` inside an `impl` naming the type. (Picking the rarer of
+    /// the two names, as this once did, missed `Alias::item` where the alias is
+    /// declared in another file.)
     Either(String, String),
     /// The files that may hold a value of one of these types.
     Holds(Vec<String>),
@@ -90,8 +96,17 @@ pub(crate) enum Witness {
     /// (a pattern on a value, or a path naming the enum), a method (`x.m()`).
     Both(String, String),
     /// The files of the module of the inline path `.1` in the declaring file
-    /// and of the modules below it that name `.0`: a private `use`.
+    /// and of the modules below it that name `.0`: a private item or `use`.
+    /// A file below names it through a path (`super::x`, `crate::x`, `m::x`)
+    /// or a glob import — `widening` asks the lexer which.
     Scoped(String, Vec<String>),
+    /// The files that name `.0`, an item of the trait `.1`, and may have the
+    /// trait in scope: name it, hold a value of it (`dyn Tr`, or a value of a
+    /// type parameter bounded by it or a subtrait — the two receivers whose
+    /// trait methods resolve without the trait in scope, `method_resolution`
+    /// of rust-analyzer), or have a glob import. A method call `x.k()` names
+    /// only `k`, so the bare name reaches every `k` of the workspace.
+    InScope(String, String),
     /// A trait `impl`: the files holding a value of its self type — of the
     /// header's types the project declares (`impl From<Foo> for String` is
     /// `Foo`). When the self type holds no such name (`impl Ext for Vec<u8>`,
@@ -615,7 +630,7 @@ fn item_units(item: &ast::Item, context: &Context, as_written: bool, out: &mut V
             // objects derefs or iterates to it.
             let header = header_tokens(tr.syntax(), SyntaxKind::ASSOC_ITEM_LIST, &[]);
             let mut holders = vec![holder(
-                Witness::Holds(name.into_iter().collect()),
+                Witness::Holds(name.clone().into_iter().collect()),
                 refs(&header),
             )];
             for assoc in tr
@@ -629,9 +644,16 @@ fn item_units(item: &ast::Item, context: &Context, as_written: bool, out: &mut V
                     }
                     _ => {
                         if let Some(assoc_name) = assoc_name(&assoc) {
-                            reach.push(Witness::Name(assoc_name.clone()));
-                            holders
-                                .push(holder(Witness::Name(assoc_name), refs_of(assoc.syntax())));
+                            // Reached, and called to hand out what its
+                            // signature names, where the trait may be in scope.
+                            let witness = match &name {
+                                Some(trait_name) => {
+                                    Witness::InScope(assoc_name, trait_name.clone())
+                                }
+                                None => Witness::Name(assoc_name),
+                            };
+                            reach.push(witness.clone());
+                            holders.push(holder(witness, refs_of(assoc.syntax())));
                         }
                     }
                 }
@@ -961,8 +983,8 @@ fn impl_units(imp: &ast::Impl, context: &Context, out: &mut Vec<Unit>) {
             Some(head) => Witness::Either(head.clone(), name),
             None => Witness::Name(name),
         });
-        // What it hands out goes to whoever calls it by name.
-        let handed = assoc_name(&assoc).map(Witness::Name);
+        // What it hands out goes to whoever calls it — reaches it.
+        let handed = witness.clone();
         let own = &tokens[prefix.len()..];
         let mut mentions = refs(own);
         mentions.extend(header_mentions.iter().cloned());
@@ -1039,6 +1061,7 @@ mod tests {
             Witness::Holds(types) => format!("holds({})", types.join(",")),
             Witness::Both(name, ty) => format!("{name}&{ty}"),
             Witness::Scoped(name, module) => format!("{name}@{}", module.join("::")),
+            Witness::InScope(name, tr) => format!("{name}~{tr}"),
             Witness::TraitImpl {
                 self_type,
                 trait_ref,
@@ -1121,11 +1144,10 @@ mod tests {
             ),
             ["a"]
         );
-        // A trait: its name and items (a glob-imported trait's methods are
-        // called by name only).
+        // A trait: its name, and its items where it may be in scope.
         assert_eq!(
             reach("pub trait T {}", "pub trait T { fn m(&self); }"),
-            ["T", "m"]
+            ["T", "m~T"]
         );
         assert_eq!(
             reach("", "pub use a::{b::{self, C}, D as E};"),
@@ -1190,16 +1212,21 @@ mod tests {
             handed_out(text, "T"),
             [
                 "V",
-                "get",
+                "get&Q",
                 "holds(A)",
                 "holds(Alias)",
                 "holds(W)",
                 "impl[It; Iterator; Item,next,Iterator]",
                 "make",
                 "next",
-                "out",
+                "out~Tr",
                 "t"
             ]
+        );
+        // An associated function without `self`: through its type.
+        assert_eq!(
+            handed_out("impl Q { fn make() -> T { todo!() } }", "T"),
+            ["Q|make"]
         );
         // A field's own name is a declaration, not a reference.
         assert!(handed_out("struct S { t: u8 }", "t").is_empty());

@@ -1070,7 +1070,7 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
         patched.widening = match &reached {
             None => String::new(),
             Some(widening::Widening::Roots(why)) => format!(" — by the crates: {why}"),
-            Some(widening::Widening::Files { files, names, parsed, expanded }) => {
+            Some(widening::Widening::Files { files, names, parsed, expanded, lexed }) => {
                 const SHOWN: usize = 8;
                 let rest = names.len().saturating_sub(SHOWN);
                 let mut shown = names[..names.len().min(SHOWN)].join(", ");
@@ -1078,7 +1078,7 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
                     shown.push_str(&format!(" (+{rest} more)"));
                 }
                 format!(
-                    " — by {} name(s) [{shown}]: {} file(s), {parsed} parsed, {expanded} expanded",
+                    " — by {} name(s) [{shown}]: {} file(s), {parsed} parsed, {expanded} expanded, {lexed} lexed",
                     names.len(),
                     files.len()
                 )
@@ -1114,6 +1114,21 @@ fn widen_in_database(
         let reachable = |file: FileId| stale_roots.contains(&db.file_source_root(file).source_root_id(db));
         let text = |file: FileId| db.file_text(file).text(db).to_string();
         let module_files = |file: FileId, module: &units::ModuleFiles| module_files_in(db, vfs, file, module);
+        // By path and by rust-analyzer: a `#[path]` module's name is in its
+        // declaration; a crate root has none.
+        let module_names = |file: FileId| -> Vec<String> {
+            let mut names: Vec<String> = vfs
+                .file_path(file)
+                .as_path()
+                .map(|path| widening::module_names_by_path(AsRef::<Path>::as_ref(path)))
+                .unwrap_or_default();
+            names.extend(
+                sema.file_to_module_defs(file)
+                    .filter_map(|module| module.name(db))
+                    .map(|name| name.as_str().to_owned()),
+            );
+            names
+        };
         let expand = |side: units::Side, file, at, attr, module: &[String]| match side {
             units::Side::Old => Err("an old side's macro left unexpanded".to_owned()),
             units::Side::New => expand_units(&sema, file, at, attr, module),
@@ -1123,6 +1138,7 @@ fn widen_in_database(
             reachable: &reachable,
             text: &text,
             module_files: &module_files,
+            module_names: &module_names,
             expand: &expand,
             parse_budget: widening::PARSE_BUDGET,
             trace: None,
@@ -4768,7 +4784,25 @@ edition = "2021"
 
         let a_crate = ["a/src/lib.rs", "a/src/more.rs", "b/src/lib.rs"];
         let a_and_b = ["a/src/lib.rs", "b/src/lib.rs"];
-        let steps: [(&str, &dyn Fn(&Path), &[&str]); 9] = [
+        // Crate `a` of the trait steps: `Tr::k` returns `ret`.
+        fn trait_crate(ret: &str, value: &str) -> String {
+            format!(
+                "pub type Foo = Option<u8>;\n\npub fn get() -> Foo {{\n    Some(1)\n}}\n\n\
+                 pub struct W;\n\n#[macro_export]\nmacro_rules! made_for {{\n    ($t:ident) => {{\n        \
+                 impl $t {{\n            pub fn made(&self) -> Option<u8> {{\n                None\n            }}\n        \
+                 }}\n    }};\n}}\n\nmade_for!(W);\n\n\
+                 pub trait Tr {{\n    fn k(&self) -> {ret};\n}}\n\n\
+                 impl Tr for W {{\n    fn k(&self) -> {ret} {{\n        {value}\n    }}\n}}\n"
+            )
+        }
+        // Crate `b`'s root as the trait steps leave it.
+        fn b_with_trait() -> String {
+            "mod plain;\n\nuse a::Tr;\n\npub fn use_it() -> u8 {\n    a::get().map(|x| x + 1).unwrap_or(0)\n}\n\n\
+             pub fn via() -> u8 {\n    a::W.made().map(|x| x).unwrap_or(0)\n}\n\n\
+             pub fn by_trait() -> u8 {\n    a::W.k().map(|x| x).unwrap_or(0)\n}\n"
+                .to_owned()
+        }
+        let steps: [(&str, &dyn Fn(&Path), &[&str]); 13] = [
             (
                 "an edit inside a body",
                 &|root| {
@@ -4880,6 +4914,63 @@ edition = "2021"
                 // `b` calls `made` on a `W`: the expansion's method.
                 &a_and_b,
             ),
+            (
+                "a trait, its caller, and a file with a method of the same name",
+                &|root| {
+                    write_file(&root.join("a/src/lib.rs"), &trait_crate("Option<u8>", "None"));
+                    write_file(
+                        &root.join("b/src/lib.rs"),
+                        "mod plain;\n\nuse a::Tr;\n\npub fn use_it() -> u8 {\n    a::get().map(|x| x + 1).unwrap_or(0)\n}\n\n\
+                         pub fn via() -> u8 {\n    a::W.made().map(|x| x).unwrap_or(0)\n}\n\n\
+                         pub fn by_trait() -> u8 {\n    a::W.k().map(|x| x).unwrap_or(0)\n}\n",
+                    );
+                    write_file(
+                        &root.join("b/src/plain.rs"),
+                        "pub struct K;\n\nimpl K {\n    pub fn k(&self) -> Option<u8> {\n        None\n    }\n}\n\n\
+                         pub fn local() -> u8 {\n    K.k().map(|x| x).unwrap_or(0)\n}\n",
+                    );
+                },
+                &["a/src/lib.rs", "b/src/lib.rs", "b/src/plain.rs"],
+            ),
+            (
+                "a trait method's signature",
+                &|root| write_file(&root.join("a/src/lib.rs"), &trait_crate("Result<u8, ()>", "Err(())")),
+                // `plain.rs` names `k` but not `Tr`, holds no `Tr` value and
+                // has no glob: its `k` is `K::k`.
+                &a_and_b,
+            ),
+            (
+                "private helpers at the crate root and below it",
+                &|root| {
+                    write_file(
+                        &root.join("b/src/lib.rs"),
+                        &format!("{}\nmod other;\n\nfn helper() -> Option<u8> {{\n    Some(1)\n}}\n", b_with_trait()),
+                    );
+                    write_file(
+                        &root.join("b/src/plain.rs"),
+                        "pub struct K;\n\nimpl K {\n    pub fn k(&self) -> Option<u8> {\n        None\n    }\n}\n\n\
+                         pub fn local() -> u8 {\n    K.k().map(|x| x).unwrap_or(0)\n}\n\n\
+                         pub fn up() -> u8 {\n    super::helper().map(|x| x).unwrap_or(0)\n}\n",
+                    );
+                    write_file(
+                        &root.join("b/src/other.rs"),
+                        "fn helper() -> Option<u8> {\n    None\n}\n\npub fn own() -> u8 {\n    helper().map(|x| x).unwrap_or(0)\n}\n",
+                    );
+                },
+                &["b/src/lib.rs", "b/src/other.rs", "b/src/plain.rs"],
+            ),
+            (
+                "a private function's signature at the crate root",
+                &|root| {
+                    write_file(
+                        &root.join("b/src/lib.rs"),
+                        &format!("{}\nmod other;\n\nfn helper() -> Result<u8, ()> {{\n    Ok(1)\n}}\n", b_with_trait()),
+                    )
+                },
+                // `other.rs` calls a `helper` of its own; `plain.rs` reaches
+                // the root's as `super::helper`.
+                &["b/src/lib.rs", "b/src/plain.rs"],
+            ),
         ];
         for (edit, apply, expected_pending) in steps {
             apply(root);
@@ -4905,7 +4996,9 @@ edition = "2021"
             4,
             "`.map`/`.unwrap_or` in b follow the alias and the expanded method into option.rs: {rebuilt:?}"
         );
-        assert!(maps_into("result.rs").is_empty(), "{rebuilt:?}");
+        // `.map`/`.unwrap_or` after the trait's `k` follow its new signature;
+        // `helper` itself names `Result` and `Ok`.
+        assert_eq!(maps_into("result.rs").len(), 4, "{rebuilt:?}");
     }
 
     /// `uses-bur`: the builder fills the table leaves of the crate graph

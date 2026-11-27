@@ -46,6 +46,8 @@ use ra_ap_vfs::FileId;
 #[derive(Default)]
 pub(crate) struct WordIndex {
     ids: HashMap<Box<str>, u32>,
+    /// By word id: its spelling.
+    spelling_of: Vec<Box<str>>,
     /// By word id; sorted, no duplicates.
     files_of: Vec<Vec<FileId>>,
     /// By word id: the files where the word stands as `word:` — the shape of
@@ -58,8 +60,14 @@ pub(crate) struct WordIndex {
     /// name in a trait impl's header can be a project type (`surface::Witness`).
     declaring_files: Vec<u32>,
     /// By file: its words, those of them in field shape, those it declares
-    /// as types; sorted, no duplicates. A file without words is absent.
+    /// as types; sorted, no duplicates. A file without words and globs is
+    /// absent (an alias has words).
     words_of: HashMap<FileId, FileWords>,
+    /// The files with a glob import not of std ([`Facts::glob`]); sorted.
+    glob_files: Vec<FileId>,
+    /// By target word id: the names it is also known by ([`Facts::aliases`]),
+    /// with how many files say so.
+    aliases_of: HashMap<u32, HashMap<u32, u32>>,
 }
 
 #[derive(Default)]
@@ -67,6 +75,9 @@ struct FileWords {
     words: Vec<u32>,
     fields: Vec<u32>,
     declared: Vec<u32>,
+    glob: bool,
+    /// (alias, target); sorted, no duplicates.
+    aliases: Vec<(u32, u32)>,
 }
 
 impl WordIndex {
@@ -87,12 +98,23 @@ impl WordIndex {
             for word in old.declared {
                 self.declaring_files[word as usize] -= 1;
             }
+            if old.glob {
+                remove_sorted(&mut self.glob_files, file);
+            }
+            for (alias, target) in old.aliases {
+                let known = self.aliases_of.get_mut(&target).expect("counted when set");
+                let count = known.get_mut(&alias).expect("counted when set");
+                *count -= 1;
+                if *count == 0 {
+                    known.remove(&alias);
+                }
+            }
         }
         let Some(text) = text else {
             return;
         };
         let mut new = FileWords::default();
-        for_each_code_word(text, |_, word, shape| {
+        let facts = for_each_code_word(text, |_, word, shape| {
             let id = self.intern(word);
             new.words.push(id);
             if shape.field {
@@ -102,6 +124,26 @@ impl WordIndex {
                 new.declared.push(id);
             }
         });
+        new.glob = facts.glob;
+        if new.glob {
+            insert_sorted(&mut self.glob_files, file);
+        }
+        new.aliases = facts
+            .aliases
+            .iter()
+            .map(|(alias, target)| (self.intern(alias), self.intern(target)))
+            .filter(|(alias, target)| alias != target)
+            .collect();
+        new.aliases.sort_unstable();
+        new.aliases.dedup();
+        for &(alias, target) in &new.aliases {
+            *self
+                .aliases_of
+                .entry(target)
+                .or_default()
+                .entry(alias)
+                .or_default() += 1;
+        }
         for list in [&mut new.words, &mut new.fields, &mut new.declared] {
             list.sort_unstable();
             list.dedup();
@@ -115,7 +157,8 @@ impl WordIndex {
         for &word in &new.declared {
             self.declaring_files[word as usize] += 1;
         }
-        if !new.words.is_empty() {
+        // `use super::*;` has no word but a glob to drop when patched.
+        if !new.words.is_empty() || new.glob {
             self.words_of.insert(file, new);
         }
     }
@@ -149,6 +192,48 @@ impl WordIndex {
         }
     }
 
+    /// Whether `file` has a glob import not of std (`use a::*`, `use
+    /// super::*`) — the names it brings are not written, a trait's among them.
+    pub(crate) fn has_glob(&self, file: FileId) -> bool {
+        self.glob_files.binary_search(&file).is_ok()
+    }
+
+    /// `name` and the names it is known by through aliases, transitively —
+    /// `type A = m::S<u8>;`, `use m::S as A;` make `A` a name of `S`. What a
+    /// file says `S::new()` with: it names `new` and one of these (or `Self`
+    /// inside an `impl` that names one).
+    ///
+    /// Cost: one lookup per name found; aliases of a type are a handful.
+    pub(crate) fn names_for(&self, name: &str) -> Vec<String> {
+        let name = name.strip_prefix("r#").unwrap_or(name);
+        let mut names = vec![name.to_owned()];
+        let Some(&first) = self.ids.get(name) else {
+            return names;
+        };
+        let mut seen = vec![first];
+        let mut at = 0;
+        while at < seen.len() {
+            let target = seen[at];
+            at += 1;
+            for &alias in self
+                .aliases_of
+                .get(&target)
+                .into_iter()
+                .flat_map(|known| known.keys())
+            {
+                if !seen.contains(&alias) {
+                    seen.push(alias);
+                }
+            }
+        }
+        names.extend(
+            seen[1..]
+                .iter()
+                .map(|&id| self.spelling_of[id as usize].to_string()),
+        );
+        names
+    }
+
     /// Distinct words, and (word, file) pairs — for the load's log line.
     pub(crate) fn size(&self) -> (usize, usize) {
         (
@@ -163,11 +248,17 @@ impl WordIndex {
         }
         let id = u32::try_from(self.files_of.len()).expect("fewer than 2^32 distinct words");
         self.ids.insert(word.into(), id);
+        self.spelling_of.push(word.into());
         self.files_of.push(Vec::new());
         self.field_files_of.push(Vec::new());
         self.declaring_files.push(0);
         id
     }
+}
+
+/// A raw identifier `r#x` as `x`.
+fn unraw(word: &str) -> &str {
+    word.strip_prefix("r#").unwrap_or(word)
 }
 
 fn insert_sorted(files: &mut Vec<FileId>, file: FileId) {
@@ -227,10 +318,153 @@ struct Shape {
     declared: bool,
 }
 
+/// What a file's tokens tell beyond its words.
+#[derive(Default)]
+struct Facts<'t> {
+    /// (alias, target): `type A<…> = path::S<…>;` (the target is the last
+    /// segment of the path the alias starts with — `Box<dyn S>` is `Box`, an
+    /// associated type `type Item = S;` counts too) and `use path::S as A;`.
+    aliases: Vec<(&'t str, &'t str)>,
+    /// A glob import that may bring in names from outside the file: a `use`
+    /// with a `*`, but not one whose path starts with `std`, `core` or
+    /// `alloc`, and not `use super::*` inside an inline module (it brings the
+    /// enclosing module's names, which are in the file — or came by a glob of
+    /// that module, counted by itself). Lexed, not parsed: a `*` repetition
+    /// after a `use` in a macro pattern counts too, which only adds a file.
+    glob: bool,
+}
+
+/// How a word in code stands for [`path_uses`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PathUse {
+    /// Somewhere as the segment right after one of the prefixes, or one of
+    /// the prefixes is renamed — see [`path_uses`].
+    pub(crate) after_prefix: bool,
+    /// Somewhere not as the name an item or a `let` declares (`mod tests`,
+    /// `fn new`): a use that a glob import may resolve.
+    pub(crate) undeclared: bool,
+}
+
+/// How `word` stands in `text`: [`PathUse::after_prefix`] — as the next
+/// segment after one of `prefixes` (`super::word`, `crate::word`,
+/// `m::word`), in a use group too (`use super::{a, word}`), or one of
+/// `prefixes` is renamed (`use super as up;`: `up::word` reaches it unseen; a
+/// cast `m as u8` counts too, which only keeps a file); and
+/// [`PathUse::undeclared`]. How a file below a module names a private item of
+/// it (`widening`).
+///
+/// Cost: one lexing of `text` (≈ 0.2 ms a file).
+pub(crate) fn path_uses(text: &str, word: &str, prefixes: &[&str]) -> PathUse {
+    let word = word.strip_prefix("r#").unwrap_or(word);
+    let mut found = PathUse::default();
+    let lexed = LexedStr::new(Edition::Edition2015, text);
+    let significant: Vec<usize> = (0..lexed.len())
+        .filter(|&token| {
+            !matches!(
+                lexed.kind(token),
+                SyntaxKind::WHITESPACE | SyntaxKind::COMMENT
+            )
+        })
+        .collect();
+    let kind = |at: usize| lexed.kind(significant[at]);
+    let spelled = |at: usize| {
+        let text = lexed.text(significant[at]);
+        text.strip_prefix("r#").unwrap_or(text)
+    };
+    let is_prefix = |at: usize| prefixes.contains(&spelled(at));
+    // The segment before a `::` ending right before `at`, if one does.
+    let qualifier = |at: usize| -> Option<usize> {
+        if at >= 1 && kind(at - 1) == SyntaxKind::COLON2 {
+            return (at >= 2).then(|| at - 2);
+        }
+        let colons = at >= 2
+            && kind(at - 1) == SyntaxKind::COLON
+            && kind(at - 2) == SyntaxKind::COLON
+            && lexed.text_range(significant[at - 2]).end
+                == lexed.text_range(significant[at - 1]).start;
+        (colons && at >= 3).then(|| at - 3)
+    };
+    // Whether the word at `at` is right after a prefix and `::`, or in a
+    // group whose `{` is.
+    let after_prefix = |at: usize| -> bool {
+        if qualifier(at).is_some_and(is_prefix) {
+            return true;
+        }
+        // In a group: back to the group's unmatched `{`, then its qualifier.
+        if at == 0 || !matches!(kind(at - 1), SyntaxKind::COMMA | SyntaxKind::L_CURLY) {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut back = at;
+        while back > 0 {
+            back -= 1;
+            match kind(back) {
+                SyntaxKind::R_CURLY | SyntaxKind::R_PAREN | SyntaxKind::R_BRACK => depth += 1,
+                SyntaxKind::L_PAREN | SyntaxKind::L_BRACK if depth == 0 => return false,
+                SyntaxKind::L_CURLY if depth == 0 => return qualifier(back).is_some_and(is_prefix),
+                SyntaxKind::L_CURLY | SyntaxKind::L_PAREN | SyntaxKind::L_BRACK => depth -= 1,
+                SyntaxKind::SEMICOLON if depth == 0 => return false,
+                _ => {}
+            }
+        }
+        false
+    };
+    let declares = |at: usize| {
+        at >= 1
+            && (matches!(
+                kind(at - 1),
+                SyntaxKind::MOD_KW
+                    | SyntaxKind::FN_KW
+                    | SyntaxKind::STRUCT_KW
+                    | SyntaxKind::ENUM_KW
+                    | SyntaxKind::TRAIT_KW
+                    | SyntaxKind::TYPE_KW
+                    | SyntaxKind::CONST_KW
+                    | SyntaxKind::STATIC_KW
+                    | SyntaxKind::LET_KW
+            ) || (kind(at - 1) == SyntaxKind::IDENT && spelled(at - 1) == "union"))
+    };
+    for at in 0..significant.len() {
+        if kind(at) == SyntaxKind::AS_KW && at >= 1 && is_prefix(at - 1) {
+            found.after_prefix = true;
+        }
+        if kind(at) != SyntaxKind::IDENT || spelled(at) != word {
+            continue;
+        }
+        found.after_prefix |= after_prefix(at);
+        found.undeclared |= !declares(at);
+        if found.after_prefix && found.undeclared {
+            break;
+        }
+    }
+    found
+}
+
 /// Call `visit(offset, word, shape)` for every word in code; see the module
 /// header.
-fn for_each_code_word<'t>(text: &'t str, mut visit: impl FnMut(usize, &'t str, Shape)) {
+fn for_each_code_word<'t>(
+    text: &'t str,
+    mut visit: impl FnMut(usize, &'t str, Shape),
+) -> Facts<'t> {
     let lexed = LexedStr::new(Edition::Edition2015, text);
+    let mut facts = Facts::default();
+    // A type alias being lexed: its name, the depth of `<` in its generics,
+    // whether past its `=`, and the last segment of the target's path so far
+    // (with whether the previous token was that segment).
+    struct Alias<'t> {
+        name: &'t str,
+        angles: usize,
+        target: Option<(&'t str, bool)>,
+        past_eq: bool,
+    }
+    let mut alias: Option<Alias<'t>> = None;
+    let mut after_type_kw = false;
+    // The significant tokens of the `use` item being lexed, `None` outside one.
+    let mut in_use: Option<Vec<(SyntaxKind, &str)>> = None;
+    // `true` for each open `{` that opens an inline module; the last two
+    // significant tokens, to tell it (`mod name {`).
+    let mut braces: Vec<bool> = Vec::new();
+    let mut last_two = [SyntaxKind::EOF, SyntaxKind::EOF];
     let trivia = |token: usize| {
         matches!(
             lexed.kind(token),
@@ -267,7 +501,105 @@ fn for_each_code_word<'t>(text: &'t str, mut visit: impl FnMut(usize, &'t str, S
         let range = lexed.text_range(token);
         let start = range.start;
         let token_text = &text[range];
-        match lexed.kind(token) {
+        let kind = lexed.kind(token);
+        if !trivia(token) {
+            match kind {
+                SyntaxKind::L_CURLY => braces.push(
+                    last_two[0] == SyntaxKind::MOD_KW && last_two[1] == SyntaxKind::IDENT,
+                ),
+                SyntaxKind::R_CURLY => {
+                    braces.pop();
+                }
+                _ => {}
+            }
+            match (&mut in_use, kind) {
+                (_, SyntaxKind::USE_KW) => in_use = Some(Vec::new()),
+                (Some(seen), SyntaxKind::SEMICOLON) => {
+                    let seen = std::mem::take(seen);
+                    in_use = None;
+                    let mut path = seen.iter().map(|(kind, _)| *kind).skip_while(|kind| {
+                        matches!(kind, SyntaxKind::COLON | SyntaxKind::COLON2)
+                    });
+                    let first_is_std = seen
+                        .iter()
+                        .find(|(kind, _)| !matches!(kind, SyntaxKind::COLON | SyntaxKind::COLON2))
+                        .is_some_and(|(kind, text)| {
+                            *kind == SyntaxKind::IDENT && matches!(*text, "std" | "core" | "alloc")
+                        });
+                    let star = seen.iter().any(|(kind, _)| *kind == SyntaxKind::STAR);
+                    let parents_glob = path.next() == Some(SyntaxKind::SUPER_KW)
+                        && path
+                            .filter(|kind| *kind != SyntaxKind::COLON && *kind != SyntaxKind::COLON2)
+                            .eq([SyntaxKind::STAR]);
+                    let in_inline_module = braces.iter().any(|&module| module);
+                    facts.glob |= star && !first_is_std && !(parents_glob && in_inline_module);
+                }
+                (Some(seen), _) => {
+                    if let [.., (SyntaxKind::IDENT, target), (SyntaxKind::AS_KW, _)] = seen[..]
+                        && kind == SyntaxKind::IDENT
+                    {
+                        facts.aliases.push((unraw(token_text), unraw(target)));
+                    }
+                    seen.push((kind, token_text));
+                }
+                (None, _) => {}
+            }
+            let mut ended = false;
+            if let Some(state) = &mut alias {
+                if !state.past_eq {
+                    match kind {
+                        SyntaxKind::L_ANGLE => state.angles += 1,
+                        SyntaxKind::R_ANGLE => state.angles = state.angles.saturating_sub(1),
+                        SyntaxKind::EQ if state.angles == 0 => state.past_eq = true,
+                        // `type Item;`, `type Item: Bound;` in a trait.
+                        SyntaxKind::SEMICOLON | SyntaxKind::L_CURLY | SyntaxKind::R_CURLY => {
+                            ended = true
+                        }
+                        _ => {}
+                    }
+                } else {
+                    let separator = matches!(
+                        kind,
+                        SyntaxKind::COLON
+                            | SyntaxKind::COLON2
+                            | SyntaxKind::CRATE_KW
+                            | SyntaxKind::SELF_KW
+                            | SyntaxKind::SUPER_KW
+                    );
+                    match (kind, state.target) {
+                        // `dyn` is a word in edition 2015.
+                        (SyntaxKind::IDENT, None) if token_text == "dyn" => {}
+                        (SyntaxKind::IDENT, None | Some((_, false))) => {
+                            state.target = Some((unraw(token_text), true))
+                        }
+                        (_, Some((target, _))) if separator => {
+                            state.target = Some((target, false))
+                        }
+                        (_, None) if separator => {}
+                        _ => {
+                            if let Some((target, _)) = state.target {
+                                facts.aliases.push((state.name, target));
+                            }
+                            ended = true;
+                        }
+                    }
+                }
+            }
+            if ended {
+                alias = None;
+            }
+            if after_type_kw && kind == SyntaxKind::IDENT {
+                alias = Some(Alias {
+                    name: unraw(token_text),
+                    angles: 0,
+                    target: None,
+                    past_eq: false,
+                });
+            }
+            after_type_kw = kind == SyntaxKind::TYPE_KW;
+            last_two = [last_two[1], kind];
+        }
+        match kind {
             SyntaxKind::IDENT => match token_text.strip_prefix("r#") {
                 Some(raw) => visit(start + 2, raw, shape(token)),
                 None => visit(start, token_text, shape(token)),
@@ -280,6 +612,7 @@ fn for_each_code_word<'t>(text: &'t str, mut visit: impl FnMut(usize, &'t str, S
             _ => {}
         }
     }
+    facts
 }
 
 /// The implicit captures of a format string: `name` in `{name}`, `{name:?}`,
@@ -379,6 +712,80 @@ fn f(p: &Probe) -> u32 {
         assert_eq!(index.field_shape_files_with("rop"), [file(1)]);
         index.set_file(file(1), None);
         assert!(index.field_shape_files_with("rop").is_empty());
+    }
+
+    /// A glob that may bring names from outside the file counts; one of std,
+    /// and `use super::*` inside an inline module (the file's own names), do
+    /// not — a top-level `use super::*` does.
+    #[test]
+    fn a_glob_from_outside_the_file_is_flagged() {
+        let flagged = |text: &str| {
+            let mut index = WordIndex::default();
+            index.set_file(file(1), Some(text));
+            index.has_glob(file(1))
+        };
+        assert!(flagged("use crate::prelude::*;"));
+        assert!(flagged("use super::*;"));
+        assert!(flagged("use a::{b::*, c};"));
+        assert!(flagged("mod tests { use crate::x::*; }"));
+        assert!(flagged("mod tests { use super::inner::*; }"));
+        assert!(!flagged("use std::io::prelude::*;"));
+        assert!(!flagged("use ::core::ops::*;"));
+        assert!(!flagged("mod tests { use super::*; fn t() {} }"));
+        assert!(!flagged("fn f() { let x = 2 * 3; }"));
+        assert!(!flagged("use a::b; fn f() -> u8 { 2 * 3 }"));
+        // After the inline module closes, a top-level glob counts again.
+        assert!(flagged("mod tests { use super::*; }\nuse super::*;"));
+        let mut index = WordIndex::default();
+        index.set_file(file(1), Some("use super::*;"));
+        index.set_file(file(1), Some("use super::x;"));
+        assert!(!index.has_glob(file(1)), "a patched file drops its glob");
+    }
+
+    /// How a private item of a module is named below it: after a path to the
+    /// module (a group too, a rename of the module), and whether anywhere not
+    /// as a declaration.
+    #[test]
+    fn path_uses_tell_a_path_to_the_module_from_an_own_name() {
+        let prefixes = ["super", "self", "crate", "m"];
+        let uses = |text: &str| {
+            let found = path_uses(text, "t", &prefixes);
+            (found.after_prefix, found.undeclared)
+        };
+        assert_eq!(uses("fn f() { super::t(); }"), (true, true));
+        assert_eq!(uses("use crate::t;"), (true, true));
+        assert_eq!(uses("use super::{a, t};"), (true, true));
+        assert_eq!(uses("use super::{a::{b, t}};"), (false, true), "`a::t`");
+        assert_eq!(uses("fn f() { m::t(); }"), (true, true));
+        assert_eq!(uses("use super as up; fn f() { up::t(); }"), (true, true));
+        // Its own: imported from elsewhere, declared, a struct literal field.
+        assert_eq!(uses("use rust_i18n::t; fn f() { t!(\"k\"); }"), (false, true));
+        assert_eq!(uses("mod t;"), (false, false));
+        assert_eq!(uses("fn t() {}"), (false, false));
+        assert_eq!(uses("fn f() { S { a, t }; g(a, t); }"), (false, true));
+        assert_eq!(uses("fn f() {} // super::t"), (false, false));
+    }
+
+    /// Aliases: a `type` whose target's path ends in the name, a renaming
+    /// import — transitively, patched with their file.
+    #[test]
+    fn a_name_is_known_by_its_aliases() {
+        let mut index = WordIndex::default();
+        index.set_file(file(1), Some("pub struct S; impl S { fn new() -> S { S } }"));
+        index.set_file(
+            file(2),
+            Some("pub type A = crate::m::S;\npub type G<T = u8> = S<T>;\ntype Boxed = Box<dyn S>;"),
+        );
+        index.set_file(file(3), Some("use other::{A as B, C};\ntype Fp = fn() -> S;"));
+        let mut names = index.names_for("S");
+        names.sort();
+        assert_eq!(names, ["A", "B", "G", "S"]);
+        assert_eq!(index.names_for("Box"), ["Box", "Boxed"]);
+        index.set_file(file(3), None);
+        let mut names = index.names_for("S");
+        names.sort();
+        assert_eq!(names, ["A", "G", "S"], "a removed file takes its aliases");
+        assert_eq!(index.names_for("Nothing"), ["Nothing"]);
     }
 
     #[test]
