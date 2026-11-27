@@ -69,9 +69,41 @@ impl GateConfig {
 static INSTALLED: OnceLock<GateConfig> = OnceLock::new();
 
 /// Turn the gate on for every [`super::SemanticService`] of this process.
-/// The first call wins; the daemon makes it once, at startup.
+/// The first call wins; the daemon makes it once, at startup. Prices of
+/// directories that no longer exist are dropped first: the daemon tests load
+/// fixtures in temp directories under the user's own data dir, and their
+/// prices would otherwise pile up for ever.
 pub fn install(config: GateConfig) {
+    let dropped = drop_vanished_prices(&config.prices_dir);
+    if dropped > 0 {
+        tracing::info!(
+            "load admission: dropped {dropped} price(s) of directories that no longer exist"
+        );
+    }
     let _ = INSTALLED.set(config);
+}
+
+/// Remove every price file whose directory (its second line) is gone, and
+/// files that are not prices at all (a temp file of an interrupted write).
+/// Returns how many went.
+fn drop_vanished_prices(prices_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(prices_dir) else {
+        return 0;
+    };
+    let mut dropped = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let keep = path.extension().is_some_and(|ext| ext == "peak_mb")
+            && std::fs::read_to_string(&path).is_ok_and(|text| {
+                text.lines()
+                    .nth(1)
+                    .is_some_and(|dir| Path::new(dir).is_dir())
+            });
+        if !keep && std::fs::remove_file(&path).is_ok() {
+            dropped += 1;
+        }
+    }
+    dropped
 }
 
 /// The decision on one load.
@@ -633,6 +665,21 @@ mod tests {
         assert!(gate.admit_with(&other, || Some(14000)).is_err());
         drop(first);
         assert!(gate.admit_with(&other, || Some(14000)).is_ok());
+    }
+
+    #[test]
+    fn prices_of_vanished_directories_are_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let prices = dir.path().join("load-peaks");
+        let alive = dir.path().join("alive");
+        std::fs::create_dir(&alive).unwrap();
+        let gone = dir.path().join("gone");
+        write_price(&prices, &alive, 700);
+        write_price(&prices, &gone, 500);
+        std::fs::write(prices.join("x.tmp123"), "500\n").unwrap();
+        assert_eq!(drop_vanished_prices(&prices), 2);
+        assert_eq!(read_price(&prices, &alive), Some(700));
+        assert_eq!(std::fs::read_dir(&prices).unwrap().count(), 1);
     }
 
     #[test]
