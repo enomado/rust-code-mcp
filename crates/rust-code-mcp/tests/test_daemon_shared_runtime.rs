@@ -712,12 +712,22 @@ fn a_session_survives_its_daemon_being_killed() -> Result<()> {
 /// path a test can replace. A hard link, so staging costs no copy; the
 /// directory sits in the target dir because a hard link cannot cross into
 /// the tmpfs that holds ordinary temp directories.
+///
+/// With a separate build dir (`CARGO_BUILD_BUILD_DIR`) the binary and
+/// `CARGO_TARGET_TMPDIR` can sit on different disks, and the link fails with
+/// `EXDEV`; a copy stages the same launch path then.
 fn staged_binary() -> Result<(TempDir, std::path::PathBuf)> {
     let dir = tempfile::Builder::new()
         .prefix("rebuilt-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
     let exe = dir.path().join("rust-code-mcp");
-    std::fs::hard_link(env!("CARGO_BIN_EXE_rust-code-mcp"), &exe)?;
+    let built = env!("CARGO_BIN_EXE_rust-code-mcp");
+    if let Err(error) = std::fs::hard_link(built, &exe) {
+        if error.kind() != std::io::ErrorKind::CrossesDevices {
+            return Err(error.into());
+        }
+        std::fs::copy(built, &exe)?;
+    }
     Ok((dir, exe))
 }
 
