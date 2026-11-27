@@ -270,14 +270,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     if let daemon::Mode::Daemon { socket, idle } = &mode {
         let result = daemon::run_daemon(socket, *idle, &runtime).await;
-        match daemon::shutdown_within(&runtime, daemon::EXIT_BUDGET).await {
-            Some(shutdown) => {
-                tracing::info!("Runtime shutdown after daemon exit: {:?}", shutdown)
+        // `AtOnce`: the machine is pressed, and dropping the analyses would
+        // swap them back in only to free them — see `daemon::DaemonExit`.
+        if !matches!(result, Ok(daemon::DaemonExit::AtOnce)) {
+            match daemon::shutdown_within(&runtime, daemon::EXIT_BUDGET).await {
+                Some(shutdown) => {
+                    tracing::info!("Runtime shutdown after daemon exit: {:?}", shutdown)
+                }
+                None => tracing::warn!(
+                    "runtime still winding down after {:?} (an in-flight sync or tool call holds a workspace lock); exiting without it",
+                    daemon::EXIT_BUDGET
+                ),
             }
-            None => tracing::warn!(
-                "runtime still winding down after {:?} (an in-flight sync or tool call holds a workspace lock); exiting without it",
-                daemon::EXIT_BUDGET
-            ),
         }
         // Exit, not return: returning drops the tokio runtime, and that drop
         // waits for every blocking task — an in-flight sync's embedder runs on

@@ -904,6 +904,76 @@ pub fn pressure_level(machine: &MachineMemory, floor_mb: u64) -> PressureLevel {
     }
 }
 
+/// Whether the machine is short enough that courtesy costs more than it buys:
+/// under the floor, or at any [`PressureLevel`] above `Calm`. Decides three
+/// things the night of 2026-11-26/27 got wrong — a SIGTERM wind-down, a
+/// retired daemon waiting for its clients, and a relay starting a new daemon
+/// (see [`sigterm_exit`], [`retired_exit_is_due`] and [`spawn_waits_for_room`]).
+///
+/// `None` (no `/proc/meminfo`) and a floor of `0` read as not pressed: the
+/// floor's `0` is the one switch for "do not react to the rest of the machine".
+pub fn machine_is_pressed(machine: Option<MachineMemory>, floor_mb: u64) -> bool {
+    let Some(machine) = machine else {
+        return false;
+    };
+    floor_mb > 0
+        && (machine.available_mb < floor_mb
+            || pressure_level(&machine, floor_mb) != PressureLevel::Calm)
+}
+
+/// How [`run_daemon`] wants the process to end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonExit {
+    /// [`shutdown_within`] first: background tasks stopped, analyses dropped.
+    WindDown,
+    /// `process::exit` now. Dropping a loaded analysis frees millions of small
+    /// allocations, and under thrash every one of them is a page to swap back
+    /// in first: the SIGTERMs of 2026-11-27 took 4.4 s and over 10 s, earlyoom
+    /// gave up waiting («kill failed: Timer expired») and the machine sank
+    /// meanwhile. Exit unmaps the pages without touching them. What is lost is
+    /// what a SIGKILL loses too: the next sync redoes an interrupted one.
+    AtOnce,
+}
+
+/// The exit a SIGTERM gets: at once while the machine is pressed — earlyoom
+/// sends it exactly then — and the usual wind-down otherwise.
+pub fn sigterm_exit(machine: Option<MachineMemory>, floor_mb: u64) -> DaemonExit {
+    if machine_is_pressed(machine, floor_mb) {
+        DaemonExit::AtOnce
+    } else {
+        DaemonExit::WindDown
+    }
+}
+
+/// Whether a retired daemon stops waiting for its clients now. Normally it
+/// waits for them to leave or for [`RETIRE_GRACE_ENV`]; under pressure the
+/// wait is its whole analysis held beside a successor's, and the clients'
+/// relays redial on their own (reads are repeated, a state-changing call in
+/// flight returns an error naming the reason).
+pub fn retired_exit_is_due(retiring: bool, machine: Option<MachineMemory>, floor_mb: u64) -> bool {
+    retiring && machine_is_pressed(machine, floor_mb)
+}
+
+/// Upper bound on a relay holding back a new daemon while the machine is
+/// pressed; then it starts one anyway. Two minutes is long past a PSI ten-second
+/// average and earlyoom's reaction, short enough that a session left waiting
+/// for its tools comes back.
+const SPAWN_PRESSURE_WAIT: Duration = Duration::from_secs(120);
+const SPAWN_PRESSURE_POLL: Duration = Duration::from_secs(2);
+
+/// Whether a relay that found no daemon waits before starting one. The storm
+/// of 2026-11-27: earlyoom killed the daemon, the relays started a new one in
+/// half a second at 3.5–8 GB available, its first tool loaded the workspace
+/// again and earlyoom killed it again — 7 daemons in two hours, at 10:55
+/// three in five seconds. `waited` is how long this relay has held back.
+pub fn spawn_waits_for_room(
+    machine: Option<MachineMemory>,
+    floor_mb: u64,
+    waited: Duration,
+) -> bool {
+    waited < SPAWN_PRESSURE_WAIT && machine_is_pressed(machine, floor_mb)
+}
+
 /// [`decide_watchdog_action`] plus the machine's pressure.
 ///
 /// The RSS limits and the floor decide first, unchanged. Pressure can only add
@@ -1644,6 +1714,16 @@ async fn connect_or_spawn(socket: &Path, idle: Option<Duration>) -> Option<UnixS
                 // Nothing there: the ordinary first-start case.
                 Err(_) => {}
             }
+            // Under the lock, so the relays behind it queue here too and then
+            // find the one daemon this wait ends with.
+            if wait_for_room_to_spawn().await {
+                // A daemon started by hand may have bound meanwhile; relays
+                // never do, they wait on this lock.
+                if let Some(stream) = try_connect(socket).await {
+                    drop(lock);
+                    return Some(stream);
+                }
+            }
             match spawn_daemon(socket, idle) {
                 Ok(child) => wait_for_daemon(socket, child).await,
                 Err(e) => {
@@ -1655,6 +1735,35 @@ async fn connect_or_spawn(socket: &Path, idle: Option<Duration>) -> Option<UnixS
     };
     drop(lock);
     stream
+}
+
+/// Hold a spawn back while the machine is pressed, at most
+/// [`SPAWN_PRESSURE_WAIT`] — see [`spawn_waits_for_room`]. `true` if it waited.
+/// The floor is the daemon's own ([`WatchdogLimits::from_env`]): the relay
+/// passes its environment to the daemon it starts, so both judge one line.
+async fn wait_for_room_to_spawn() -> bool {
+    let floor_mb = WatchdogLimits::from_env().min_available_mb;
+    let started = Instant::now();
+    let mut announced = false;
+    while spawn_waits_for_room(machine_memory(), floor_mb, started.elapsed()) {
+        if !announced {
+            tracing::warn!(
+                "no daemon, and the machine is pressed ({}); holding the start back up to {:?}",
+                describe_machine(machine_memory(), floor_mb),
+                SPAWN_PRESSURE_WAIT,
+            );
+            announced = true;
+        }
+        tokio::time::sleep(SPAWN_PRESSURE_POLL).await;
+    }
+    if announced {
+        tracing::warn!(
+            "starting the daemon after holding back {:.0}s: {}",
+            started.elapsed().as_secs_f64(),
+            describe_machine(machine_memory(), floor_mb),
+        );
+    }
+    announced
 }
 
 /// Size at which a daemon log is rolled aside on the next spawn. Generous on
@@ -1880,7 +1989,7 @@ pub async fn run_daemon(
     socket: &Path,
     idle: Duration,
     runtime: &ServerRuntime,
-) -> Result<(), BoxError> {
+) -> Result<DaemonExit, BoxError> {
     if let Some(parent) = socket.parent() {
         ensure_dir(parent)?;
     }
@@ -1975,6 +2084,7 @@ pub async fn run_daemon(
     let mut retiring_since: Option<SystemTime> = None;
     let mut last_logged_rss_mb: Option<u64> = None;
     let mut last_level = PressureLevel::Calm;
+    let mut exit = DaemonExit::WindDown;
 
     // Signals must reach the same exit path as an idle timeout. A daemon killed
     // outright leaves its socket file behind; clients survive that (they clear it
@@ -1996,7 +2106,20 @@ pub async fn run_daemon(
             accepted = listener.accept() => Some(accepted),
             _ = tokio::time::sleep(IDLE_TICK) => None,
             _ = sigterm.recv() => {
-                tracing::info!("SIGTERM from {}, shutting down", describe_sigterm_sender());
+                let machine = machine_memory();
+                exit = sigterm_exit(machine, limits.min_available_mb);
+                match exit {
+                    DaemonExit::WindDown => tracing::info!(
+                        "SIGTERM from {}, shutting down",
+                        describe_sigterm_sender()
+                    ),
+                    DaemonExit::AtOnce => tracing::warn!(
+                        "SIGTERM from {} while the machine is pressed ({:?} MB available, {}): exiting at once, without the wind-down",
+                        describe_sigterm_sender(),
+                        machine.map(|machine| machine.available_mb),
+                        describe_machine(machine, limits.min_available_mb),
+                    ),
+                }
                 break;
             }
             _ = sigint.recv() => {
@@ -2255,6 +2378,20 @@ pub async fn run_daemon(
             break;
         }
 
+        if retiring {
+            let machine = machine_memory();
+            if retired_exit_is_due(retiring, machine, limits.min_available_mb) {
+                tracing::warn!(
+                    "retired with {} client(s) attached and the machine pressed ({:?} MB available, {}): exiting at once, the relays redial",
+                    live.load(Ordering::SeqCst),
+                    machine.map(|machine| machine.available_mb),
+                    describe_machine(machine, limits.min_available_mb),
+                );
+                exit = DaemonExit::AtOnce;
+                break;
+            }
+        }
+
         // The deadline. Without it this daemon waits for clients that outlive
         // it by hours, holding whatever pushed it past the hard limit in the
         // first place.
@@ -2288,7 +2425,7 @@ pub async fn run_daemon(
     if !retiring {
         let _ = fs::remove_file(socket);
     }
-    Ok(())
+    Ok(exit)
 }
 
 /// Pid of the last SIGTERM's sender; 0 — none seen, or not knowable here.
@@ -2959,6 +3096,61 @@ mod watchdog_tests {
         }
         // Without the raise the night repeats: the measured case ranks the relays first.
         assert!(score(7_300, 0) < relay, "the night's order is lost");
+    }
+
+    /// Machine readings of the census → pressed or not. The floor is the
+    /// daemon's 6.3 GB on this 63 GB machine; rows are the night's moments.
+    #[test]
+    fn machine_pressed_table() {
+        const FLOOR: u64 = 6_343;
+        let calm = psi(0, 0, 0);
+        // (case, MB available, MB of swap used, PSI, floor, pressed)
+        let rows = [
+            ("idle desktop", 40_000, 0, calm, FLOOR, false),
+            ("01:52 storm start, 4 GB", 4_000, 0, calm, FLOOR, true),
+            ("10:55, 1.8 GB", 1_800, 16_000, calm, FLOOR, true),
+            ("9 GB, stalling", 9_000, 0, psi(12, 3, 1), FLOOR, true),
+            ("9 GB, swap full", 9_000, 15_000, None, FLOOR, true),
+            ("roomy, old swap", 30_000, 9_000, calm, FLOOR, false),
+            ("exactly the floor", FLOOR, 0, calm, FLOOR, false),
+            ("watch disabled", 1_000, 16_000, psi(50, 50, 50), 0, false),
+        ];
+        for (case, available, swap_used, psi, floor, want) in rows {
+            let reading = Some(machine(available, swap_used, psi));
+            assert_eq!(machine_is_pressed(reading, floor), want, "{case}");
+        }
+        assert!(!machine_is_pressed(None, FLOOR), "no /proc");
+    }
+
+    /// The three reactions follow the one judgement, each with its own gate.
+    #[test]
+    fn pressed_machine_exits_at_once_and_holds_spawns_back() {
+        const FLOOR: u64 = 6_343;
+        let pressed = Some(machine(4_000, 0, psi(0, 0, 0)));
+        let calm = Some(machine(40_000, 0, psi(0, 0, 0)));
+
+        assert_eq!(sigterm_exit(pressed, FLOOR), DaemonExit::AtOnce);
+        assert_eq!(sigterm_exit(calm, FLOOR), DaemonExit::WindDown);
+        assert_eq!(sigterm_exit(pressed, 0), DaemonExit::WindDown, "watch off");
+
+        assert!(retired_exit_is_due(true, pressed, FLOOR));
+        assert!(
+            !retired_exit_is_due(false, pressed, FLOOR),
+            "serving: stays"
+        );
+        assert!(
+            !retired_exit_is_due(true, calm, FLOOR),
+            "calm: clients finish"
+        );
+
+        let last_poll = SPAWN_PRESSURE_WAIT - SPAWN_PRESSURE_POLL;
+        assert!(spawn_waits_for_room(pressed, FLOOR, Duration::ZERO));
+        assert!(spawn_waits_for_room(pressed, FLOOR, last_poll));
+        assert!(
+            !spawn_waits_for_room(pressed, FLOOR, SPAWN_PRESSURE_WAIT),
+            "the wait is bounded: a session is not left without a server for good"
+        );
+        assert!(!spawn_waits_for_room(calm, FLOOR, Duration::ZERO));
     }
 
     /// Exactly at the limit counts as over it — a threshold that only fires
