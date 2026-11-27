@@ -81,6 +81,10 @@ struct ProjectContext {
     /// describes (`uses` module header); every file pending after a load or a
     /// refresh. Shared with the queries and written like `words`.
     uses: Arc<RwLock<uses::UseTable>>,
+    /// The order the builder fills `uses` in, by source root — every root of
+    /// the database ([`exposure_by_root`]); computed at load, as the crate
+    /// graph it reads changes only by a reload.
+    exposure: HashMap<ra_ap_ide_db::base_db::SourceRootId, uses::Exposure>,
     /// Where the load put files, so that a file added since goes where a
     /// reload would put it — see [`apply_tree_change`].
     layout: loader::SourceLayout,
@@ -693,6 +697,67 @@ fn roots_depending_on(
     // root) still holds its changed files.
     roots.extend(changed.iter().copied());
     roots
+}
+
+/// The [`uses::Exposure`] of every local source root: how many local roots'
+/// surface changes make its files pending — the local roots of the crates its
+/// crates transitively depend on, its own included. The mirror of
+/// [`roots_depending_on`]: `X` counts `R` exactly when `X` is in
+/// `roots_depending_on({R})`.
+///
+/// Library roots do not change while a context lives, so they never make a
+/// file pending and are not counted; a library root still gets an exposure
+/// (a project file may sit in one, a vendored crate under the project
+/// directory), so that every root of a pending file has one. The crate graph
+/// changes only by a reload, which computes this again.
+///
+/// Cost: one pass over the crate graph in its topological order (dependencies
+/// first, as `all_crates` lists it), each crate's set the union of its
+/// dependencies' — ≈ 2000 crates × a few hundred local roots at most on a
+/// ~8000-file workspace, milliseconds, once per load.
+fn exposure_by_root(
+    db: &ra_ap_ide::RootDatabase,
+) -> HashMap<ra_ap_ide_db::base_db::SourceRootId, uses::Exposure> {
+    use ra_ap_ide_db::base_db::{
+        Crate, LibraryRoots, LocalRoots, SourceDatabase, SourceRootId, all_crates,
+    };
+
+    let local = LocalRoots::get(db).roots(db);
+    // By crate: the local roots of it and its transitive dependencies.
+    let mut reaches: HashMap<Crate, HashSet<SourceRootId>> = HashMap::new();
+    // By root: the union over the crates rooted in it.
+    let mut exposed_to: HashMap<SourceRootId, HashSet<SourceRootId>> = HashMap::new();
+    for &krate in all_crates(db).iter() {
+        let mut roots: HashSet<SourceRootId> = HashSet::new();
+        for dependency in &krate.data(db).dependencies {
+            let theirs = reaches
+                .get(&dependency.crate_id)
+                .expect("all_crates lists a crate's dependencies before it");
+            roots.extend(theirs.iter().copied());
+        }
+        let own = db.file_source_root(krate.data(db).root_file_id).source_root_id(db);
+        if local.contains(&own) {
+            roots.insert(own);
+        }
+        exposed_to.entry(own).or_default().extend(roots.iter().copied());
+        reaches.insert(krate, roots);
+    }
+    // A root no crate is rooted in (files outside every crate's root) is
+    // exposed only to its own changes, as `roots_depending_on` has it — none
+    // for a library root.
+    for &root in local {
+        exposed_to.entry(root).or_default().insert(root);
+    }
+    for &root in LibraryRoots::get(db).roots(db) {
+        exposed_to.entry(root).or_default();
+    }
+    exposed_to
+        .into_iter()
+        .map(|(root, roots)| {
+            let count = u32::try_from(roots.len()).expect("fewer than 2^32 roots");
+            (root, uses::Exposure(count))
+        })
+        .collect()
 }
 
 /// Push the `*.rs` files that changed on disk into an already-loaded analysis:
@@ -1389,11 +1454,13 @@ fn load_into(
     );
     // Nothing described yet: until a file's uses are stored, queries sweep it.
     let uses = uses::UseTable::all_pending(position::project_rust_files(&vfs, canonical));
+    let exposure = exposure_by_root(host.raw_database());
     *context = Some(ProjectContext {
         host,
         vfs: shared_vfs(vfs),
         words: Arc::new(RwLock::new(words)),
         uses: Arc::new(RwLock::new(uses)),
+        exposure,
         layout,
         load_kind: requested,
         loaded_at: std::time::Instant::now(),
@@ -1645,6 +1712,7 @@ impl SemanticService {
                 vfs: shared_vfs(Vfs::default()),
                 words: Arc::default(),
                 uses: Arc::default(),
+                exposure: HashMap::new(),
                 layout: loader::SourceLayout::default(),
                 load_kind: LoadKind::Full,
                 loaded_at: std::time::Instant::now(),
@@ -1859,8 +1927,14 @@ impl SemanticService {
             };
             let Some(ctx) = guard.as_mut() else { continue };
             let (generation, files) = {
+                use ra_ap_ide_db::base_db::SourceDatabase as _;
+                let db = ctx.host.raw_database();
                 let uses = read_uses(&ctx.uses);
-                (uses.generation(), uses.next_pending(threads * files_per_thread))
+                let exposure = |file| {
+                    let root = db.file_source_root(file).source_root_id(db);
+                    *ctx.exposure.get(&root).expect("every source root has an exposure")
+                };
+                (uses.generation(), uses.next_pending(threads * files_per_thread, exposure))
             };
             if files.is_empty() {
                 continue;
@@ -2342,6 +2416,7 @@ impl SemanticService {
                 vfs: shared_vfs(Vfs::default()),
                 words: Arc::default(),
                 uses: Arc::default(),
+                exposure: HashMap::new(),
                 layout: loader::SourceLayout::default(),
                 load_kind: LoadKind::Fast,
                 loaded_at: std::time::Instant::now(),
@@ -4146,6 +4221,55 @@ pub fn hooked() {
             rebuilt.iter().any(|row| row.0 == "b/src/lib.rs" && row.2.ends_with("result.rs")),
             "`.map` in b follows the new signature into result.rs: {rebuilt:?}"
         );
+    }
+
+    /// `uses-bur`: the builder fills the table leaves of the crate graph
+    /// first. In [`freshness_workspace`] `b` depends on `a`, so a surface
+    /// change in `a` makes `b` pending, and nothing makes `a` or `c` pending
+    /// but their own: `b` is exposed to two roots, `a` and `c` to one each. A
+    /// batch of three files is therefore `a`'s two and `c`'s one, whatever
+    /// their `FileId`s — in `FileId` order `b` comes before `c`.
+    #[test]
+    fn the_builder_takes_the_least_exposed_crates_first() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        freshness_workspace(root);
+        let service = SemanticService::new();
+        service.get_or_load_full(root).expect("load");
+        let canonical = root.canonicalize().expect("canonicalize the workspace");
+        let exposures: Vec<(String, u32)> = service.with_context_for_test(&canonical, |ctx| {
+            use ra_ap_ide_db::base_db::SourceDatabase as _;
+            let vfs = read_vfs(&ctx.vfs);
+            let db = ctx.host.raw_database();
+            let mut exposures: Vec<(String, u32)> = read_uses(&ctx.uses)
+                .pending()
+                .iter()
+                .map(|&file| {
+                    let path = vfs.file_path(file).to_string();
+                    let path = path
+                        .strip_prefix(&format!("{}/", canonical.display()))
+                        .expect("a project file is under the project")
+                        .to_owned();
+                    let root = db.file_source_root(file).source_root_id(db);
+                    (path, ctx.exposure[&root].0)
+                })
+                .collect();
+            exposures.sort();
+            exposures
+        });
+        assert_eq!(
+            exposures,
+            [("a/src/lib.rs", 1), ("a/src/more.rs", 1), ("b/src/lib.rs", 2), ("c/src/lib.rs", 1)]
+                .map(|(path, exposure)| (path.to_owned(), exposure))
+        );
+
+        match service.build_uses_batch(1, 3) {
+            UsesBatch::Built { files: 3, completed: None, .. } => {}
+            other => panic!("one batch of three files, the table not complete: {other:?}"),
+        }
+        let (_, pending) = use_table_by_path(&service, root);
+        assert_eq!(pending, ["b/src/lib.rs"], "the most exposed file is built last");
     }
 
     /// Probe (run with `--ignored --nocapture`, `RMC_USES_RATE_PROJECT=<dir>`,

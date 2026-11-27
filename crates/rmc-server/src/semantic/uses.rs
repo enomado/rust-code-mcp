@@ -88,6 +88,21 @@ pub(crate) struct UseTable {
     building_since: Option<Instant>,
 }
 
+/// How many local source roots can make a file pending by a surface change:
+/// the roots holding the crates its crates transitively depend on, its own
+/// root included — what `apply_tree_change` widens a surface change to, read
+/// from the other side (`roots_depending_on`).
+///
+/// The builder takes the least exposed files first. A ready file survives
+/// every surface change outside its exposure, so building the leaves of the
+/// crate graph first keeps what is built: on a busy workspace a surface
+/// change lands every few minutes somewhere, and top-level application crates
+/// depend on nearly every root — built first (`FileId` order puts them first
+/// on one workspace measured), they were made pending again by almost every
+/// refresh, and the table never grew (plan item `uses-bur`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Exposure(pub u32);
+
 /// What [`UseTable::store_batch`] did.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Stored {
@@ -115,9 +130,26 @@ impl UseTable {
         self.generation
     }
 
-    /// Up to `count` pending files, in `FileId` order: the builder's next batch.
-    pub(crate) fn next_pending(&self, count: usize) -> Vec<FileId> {
-        self.pending.iter().copied().take(count).collect()
+    /// Up to `count` pending files, least exposed first (`FileId` among equals):
+    /// the builder's next batch. `exposure` — of each pending file's root
+    /// ([`Exposure`]).
+    ///
+    /// Cost: `exposure` once per pending file and a partial sort of them —
+    /// ≈ 9000 on a ~8000-file workspace just loaded, well under a millisecond
+    /// against a batch of ≈ 1 s.
+    pub(crate) fn next_pending(
+        &self,
+        count: usize,
+        mut exposure: impl FnMut(FileId) -> Exposure,
+    ) -> Vec<FileId> {
+        let mut ranked: Vec<(Exposure, FileId)> =
+            self.pending.iter().map(|&file| (exposure(file), file)).collect();
+        if count < ranked.len() {
+            ranked.select_nth_unstable(count);
+            ranked.truncate(count);
+        }
+        ranked.sort_unstable();
+        ranked.into_iter().map(|(_, file)| file).collect()
     }
 
     /// Make the files of a batch ready — if the table is still at `generation`,
@@ -472,6 +504,20 @@ mod tests {
         );
     }
 
+    /// The builder's batch is the least exposed pending files, `FileId` among
+    /// equals — whatever the `FileId` order of the exposures.
+    #[test]
+    fn the_next_batch_is_the_least_exposed_pending_files() {
+        let table = UseTable::all_pending((1..=6).map(file));
+        let exposure = |f: FileId| Exposure([0, 5, 1, 5, 1, 0, 9][f.index() as usize]);
+        assert_eq!(table.next_pending(3, exposure), vec![file(5), file(2), file(4)]);
+        assert_eq!(
+            table.next_pending(10, exposure),
+            vec![file(5), file(2), file(4), file(1), file(3), file(6)]
+        );
+        assert_eq!(table.next_pending(0, exposure), Vec::<FileId>::new());
+    }
+
     /// A batch computed before an invalidation is not stored: its rows describe
     /// texts (or what they resolved to) that the database no longer holds. The
     /// file stays pending and the next batch takes it again — an edit during
@@ -480,7 +526,7 @@ mod tests {
     #[test]
     fn a_batch_from_before_an_invalidation_is_not_stored() {
         let mut table = UseTable::all_pending([file(1), file(2)]);
-        assert_eq!(table.next_pending(1), vec![file(1)]);
+        assert_eq!(table.next_pending(1, |_| Exposure(0)), vec![file(1)]);
 
         let before = table.generation();
         table.mark_all_pending();
