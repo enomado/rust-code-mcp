@@ -601,7 +601,7 @@ fn build_word_index(host: &AnalysisHost, vfs: &Vfs, root: &Path) -> word_index::
 }
 
 /// What one in-place refresh did, for its log line.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct Patched {
     edited: usize,
     added: usize,
@@ -614,6 +614,44 @@ struct Patched {
     surface_changes: usize,
     /// Files of the table of uses pending after the refresh.
     uses_pending: usize,
+    /// Ready files of the table the surface changes made pending (beside the
+    /// changed files themselves).
+    uses_widened: usize,
+    /// Names of the crates whose root is in a root with a surface change, for
+    /// the log line: a wide invalidation is read by who caused it.
+    surface_crates: String,
+}
+
+/// The display names of the crates whose root file is in one of `roots`,
+/// sorted, deduplicated (a package's lib and its test targets share a name),
+/// at most eight and a count of the rest.
+fn surface_crate_names(
+    db: &ra_ap_ide::RootDatabase,
+    roots: &std::collections::BTreeSet<ra_ap_ide_db::base_db::SourceRootId>,
+) -> String {
+    use ra_ap_ide_db::base_db::source_root_crates;
+
+    let mut names: Vec<String> = roots
+        .iter()
+        .flat_map(|&root| source_root_crates(db, root).iter().copied())
+        .map(|krate| {
+            krate
+                .extra_data(db)
+                .display_name
+                .as_ref()
+                .map_or_else(|| "?".to_owned(), |name| name.to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    const SHOWN: usize = 8;
+    let rest = names.len().saturating_sub(SHOWN);
+    names.truncate(SHOWN);
+    let mut line = names.join(", ");
+    if rest > 0 {
+        line.push_str(&format!(" (+{rest} more)"));
+    }
+    line
 }
 
 /// The source roots holding files of `changed`'s crates — those whose root
@@ -876,10 +914,11 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
         let db = &*db;
         let stale_roots = roots_depending_on(db, &surface_roots);
         let mut uses = ctx.uses.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-        uses.mark_pending_where(|file| {
+        patched.uses_widened = uses.mark_pending_where(|file| {
             !stale_roots.is_empty()
                 && stale_roots.contains(&db.file_source_root(file).source_root_id(db))
         });
+        patched.surface_crates = surface_crate_names(db, &surface_roots);
         for (file_id, text) in &texts {
             match text {
                 Some(_) => uses.mark_pending(*file_id),
@@ -1431,7 +1470,7 @@ fn refresh_if_stale(
                 tracing::info!(
                     "Refreshed {} without a reload: {} edited, {} added, {} removed, {} outside \
                      the analysis; database loaded {} s ago; table of uses: {} file(s) pending, \
-                     surface changed in {} root(s)",
+                     {} ready made pending by a surface change in {} root(s) [{}]",
                     canonical.display(),
                     patched.edited,
                     patched.added,
@@ -1439,7 +1478,9 @@ fn refresh_if_stale(
                     patched.outside,
                     ctx.loaded_at.elapsed().as_secs(),
                     patched.uses_pending,
-                    patched.surface_changes
+                    patched.uses_widened,
+                    patched.surface_changes,
+                    patched.surface_crates
                 );
                 Ok(())
             }
@@ -4105,6 +4146,47 @@ pub fn hooked() {
             rebuilt.iter().any(|row| row.0 == "b/src/lib.rs" && row.2.ends_with("result.rs")),
             "`.map` in b follows the new signature into result.rs: {rebuilt:?}"
         );
+    }
+
+    /// Probe (run with `--ignored --nocapture`, `RMC_USES_RATE_PROJECT=<dir>`,
+    /// optional `RMC_USES_RATE_FILES_PER_BATCH`, default 8): how fast the
+    /// builder fills a table batch by batch, each batch after an LRU eviction
+    /// as in the daemon, against one batch of every file (one eviction).
+    #[test]
+    #[ignore]
+    fn probe_uses_builder_rate() {
+        let _analysis = holding_an_analysis();
+        let project = std::env::var("RMC_USES_RATE_PROJECT")
+            .expect("RMC_USES_RATE_PROJECT names the project");
+        let per_batch: usize = std::env::var("RMC_USES_RATE_FILES_PER_BATCH")
+            .map_or(8, |n| n.parse().expect("a number of files"));
+        let root = Path::new(&project);
+        for (label, files_per_batch) in [("batches", per_batch), ("one pass", usize::MAX / 2)] {
+            let service = SemanticService::new();
+            let at = std::time::Instant::now();
+            service.get_or_load_full(root).expect("load");
+            let load = at.elapsed();
+            let at = std::time::Instant::now();
+            let mut batches = 0;
+            let (files, rows) = loop {
+                match service.build_uses_batch(1, files_per_batch) {
+                    UsesBatch::Built { completed: Some(_), size: (files, _, rows), .. } => {
+                        batches += 1;
+                        break (files, rows);
+                    }
+                    UsesBatch::Built { .. } => batches += 1,
+                    other => panic!("nothing else holds the project: {other:?}"),
+                }
+            };
+            let took = at.elapsed();
+            eprintln!(
+                "{label}: load {:.1} s; {files} files, {rows} rows in {batches} batch(es), {:.1} s \
+                 = {:.0} ms a file",
+                load.as_secs_f64(),
+                took.as_secs_f64(),
+                took.as_secs_f64() * 1000.0 / files as f64
+            );
+        }
     }
 
     /// Probe kept for the record (run with `--ignored --nocapture`): what the

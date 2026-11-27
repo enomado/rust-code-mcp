@@ -216,14 +216,16 @@ impl UseTable {
     /// lot, even when it picks none: the caller marks the changed files right
     /// after, and a batch in flight is stale either way.
     ///
-    /// Cost: `stale` once per ready file.
-    pub(crate) fn mark_pending_where(&mut self, mut stale: impl FnMut(FileId) -> bool) {
+    /// Cost: `stale` once per ready file. Returns how many it made pending.
+    pub(crate) fn mark_pending_where(&mut self, mut stale: impl FnMut(FileId) -> bool) -> usize {
         let picked: Vec<FileId> = self.uses_of.keys().copied().filter(|&file| stale(file)).collect();
+        let count = picked.len();
         for file in picked {
             self.drop_rows(file);
             self.pending.insert(file);
         }
         self.invalidated();
+        count
     }
 
     /// Every row of the ready files, as (file, word start, key), sorted — what
