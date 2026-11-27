@@ -9,7 +9,46 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::deep_stack::try_run_exclusive_analysis;
-use crate::semantic::{SemanticService, SemanticServiceStatus};
+use crate::semantic::{SemanticService, SemanticServiceStatus, UsesBatch};
+
+/// Threads of the background builder of the tables of uses
+/// ([`ServerRuntime::start_uses_builder`]); `0` — no builder, every library
+/// reference query sweeps live.
+///
+/// Off by default until a refresh can keep the ready files it does not
+/// affect (`uses-freshness` of the plan): today any change makes every file
+/// pending again, and on a workspace edited every few minutes the builder —
+/// ≈ 13 min of a core on ~8000 files — would never finish and only burn the
+/// cores.
+pub const USES_THREADS_ENV: &str = "RMC_USES_THREADS";
+
+/// Files each builder thread takes per batch: ≈ 100 ms a file, so a batch
+/// holds the analysis gate for about a second — the longest a collection
+/// that wants in waits for the builder.
+const USES_FILES_PER_THREAD: usize = 8;
+/// How often an idle builder looks for a project with pending files.
+const USES_IDLE_POLL: Duration = Duration::from_secs(2);
+/// Wait after every project with pending files was held by somebody.
+const USES_BUSY_PAUSE: Duration = Duration::from_secs(1);
+/// Wait after a refresh cancelled a batch, for the refresh to land.
+const USES_STALE_PAUSE: Duration = Duration::from_millis(100);
+/// Longest the builder yields to a collection the gate turned away. The
+/// watchdog retries a deferred collection every 15 s (`IDLE_TICK`), so two
+/// ticks and change; past it, what keeps the collection out is somebody
+/// else's analysis, which the builder's waiting does not shorten.
+const USES_COLLECTION_YIELD_MAX: Duration = Duration::from_secs(40);
+const USES_COLLECTION_POLL: Duration = Duration::from_millis(250);
+
+/// [`USES_THREADS_ENV`], `0` when unset. A value that is not a number stops
+/// the daemon at start rather than quietly running without the builder.
+pub fn uses_builder_threads() -> usize {
+    match std::env::var(USES_THREADS_ENV) {
+        Err(_) => 0,
+        Ok(value) => value.trim().parse().unwrap_or_else(|_| {
+            panic!("{USES_THREADS_ENV}={value:?} is not a number of threads")
+        }),
+    }
+}
 
 use super::memory::{MemoryRelease, release_and_measure, rss_kib};
 use super::{
@@ -423,8 +462,97 @@ impl ServerRuntime {
             .push(handle);
     }
 
-    /// Stop the background tasks — today that is the background sync and
-    /// nothing else. A retiring daemon calls this long before it exits, so a
+    /// Start the background builder of the tables of uses, if
+    /// [`USES_THREADS_ENV`] asks for one (see [`uses_builder_threads`]).
+    ///
+    /// A loop of batches ([`SemanticService::build_uses_batch`]), each an
+    /// analysis of its own through the usual door, so the gate is let go
+    /// between two of them; before each it yields to a collection the gate
+    /// turned away ([`crate::deep_stack::CollectionWanted`]) — without that a
+    /// build of a large workspace, minutes of batch after batch, would keep
+    /// every garbage collection out for as long as it runs. Stops on
+    /// [`Self::request_shutdown`] and once the process refuses analyses.
+    ///
+    /// Cost: the threads it is given, for as long as a loaded project has
+    /// pending files; nothing (a registry look every [`USES_IDLE_POLL`]) once
+    /// none has.
+    pub fn start_uses_builder(&self) {
+        self.start_uses_builder_on(uses_builder_threads());
+    }
+
+    /// [`Self::start_uses_builder`] with the thread count given rather than
+    /// read from the environment.
+    fn start_uses_builder_on(&self, threads: usize) {
+        if threads == 0 {
+            tracing::info!(
+                "table of uses: no background builder ({USES_THREADS_ENV}=0); library references \
+                 are swept live"
+            );
+            return;
+        }
+        tracing::info!("table of uses: background builder on {threads} thread(s)");
+        let semantic = self.state.semantic();
+        let mut shutdown = self.shutdown_tx.subscribe();
+        let handle = tokio::spawn(async move {
+            loop {
+                if *shutdown.borrow() || crate::deep_stack::analyses_refused() {
+                    break;
+                }
+                // A shutdown does not wait out the yield (up to 40 s).
+                tokio::select! {
+                    _ = crate::deep_stack::collection_wanted()
+                        .yield_to(USES_COLLECTION_YIELD_MAX, USES_COLLECTION_POLL) => {}
+                    // `Err`: the runtime is gone, nobody can stop this any more.
+                    changed = shutdown.changed() => if changed.is_err() { break } else { continue },
+                }
+                let outcome = crate::deep_stack::with_semantic(&semantic, "uses builder", move |service| {
+                    Ok(service.build_uses_batch(threads, USES_FILES_PER_THREAD))
+                })
+                .await;
+                let pause = match outcome {
+                    Ok(UsesBatch::Built { project, files, completed, size: (ready, pending, rows) }) => {
+                        tracing::debug!(
+                            "table of uses of {}: a batch of {files} file(s); {ready} ready, {pending} pending",
+                            project.display()
+                        );
+                        if let Some(took) = completed {
+                            tracing::info!(
+                                "use table of {}: {ready} files, {rows} rows in {:.1} s",
+                                project.display(),
+                                took.as_secs_f64()
+                            );
+                        }
+                        Duration::ZERO
+                    }
+                    // Cancelled by a refresh, which is now waiting for the
+                    // snapshots to go: let it land before the next batch.
+                    Ok(UsesBatch::Stale) => USES_STALE_PAUSE,
+                    Ok(UsesBatch::Busy) => USES_BUSY_PAUSE,
+                    Ok(UsesBatch::Idle) => USES_IDLE_POLL,
+                    Err(error) => {
+                        if crate::deep_stack::analyses_refused() {
+                            break;
+                        }
+                        tracing::warn!("table of uses: a batch failed: {}", error.message);
+                        USES_IDLE_POLL
+                    }
+                };
+                if !pause.is_zero() {
+                    tokio::select! {
+                        _ = tokio::time::sleep(pause) => {}
+                        changed = shutdown.changed() => if changed.is_err() { break },
+                    }
+                }
+            }
+        });
+        self.tasks
+            .lock()
+            .expect("runtime task mutex poisoned")
+            .push(handle);
+    }
+
+    /// Stop the background tasks — the background sync and the builder of the
+    /// tables of uses. A retiring daemon calls this long before it exits, so a
     /// task added to this channel later must be one a draining daemon can do
     /// without.
     pub fn request_shutdown(&self) {
@@ -701,6 +829,76 @@ mod tests {
 
         let stopped_status = runtime.state().status().await;
         assert!(!stopped_status.background_sync.running);
+    }
+
+    /// The builder loop end to end: after a load the table of uses fills in
+    /// the background — batch after batch through the analysis door — until a
+    /// library query asks rust-analyzer nothing; a shutdown then ends the loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_uses_builder_fills_the_table_after_a_load_and_stops_on_shutdown() {
+        // The queries below drive the service directly, not through the door.
+        let _analysis = crate::deep_stack::test_holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create temp workspace");
+        let root = workspace.path().to_path_buf();
+        let files = 6;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"spawning\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        let mods: String = (0..files).map(|i| format!("mod m{i};\n")).collect();
+        std::fs::write(root.join("src/lib.rs"), mods).unwrap();
+        for i in 0..files {
+            std::fs::write(
+                root.join(format!("src/m{i}.rs")),
+                "pub fn f() {\n    std::thread::spawn(|| {}).join().unwrap();\n}\n",
+            )
+            .unwrap();
+        }
+
+        let runtime = ServerRuntime::new(3600);
+        let semantic = runtime.state().semantic();
+        let ask = {
+            let root = root.clone();
+            move || {
+                let semantic = Arc::clone(&semantic);
+                let root = root.clone();
+                tokio::task::spawn_blocking(move || {
+                    semantic
+                        .find_references_within(&root, "std::thread::spawn", true, Duration::from_secs(3600))
+                        .expect("references query")
+                })
+            }
+        };
+        // Loads the project: every file pending, swept live.
+        let first = ask().await.unwrap();
+        assert!(first.cost.ra_queries > 0, "{first:?}");
+
+        runtime.start_uses_builder_on(2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        loop {
+            let found = ask().await.unwrap();
+            if found.cost.ra_queries == 0 {
+                assert_eq!(found.cost.files_from_table, files, "{found:?}");
+                assert_eq!(found.locations.len(), first.locations.len(), "{found:?}");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the builder never completed the table: {found:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Shut down while the loop yields to a collection (up to 40 s): the
+        // shutdown does not wait the yield out.
+        crate::deep_stack::want_a_collection_for_test();
+        tokio::time::sleep(USES_IDLE_POLL + Duration::from_millis(500)).await;
+        let report = runtime.shutdown_gracefully(Duration::from_secs(10)).await;
+        assert_eq!(report.tasks_total, 1);
+        assert_eq!(report.tasks_completed, 1, "{report:?}");
+        assert!(!report.timed_out);
     }
 
     /// The defect this closes: `clear` used to report only its own bookkeeping,

@@ -197,6 +197,11 @@ pub(crate) fn refuse_new_analyses() {
     RETIRED.store(true, Ordering::SeqCst);
 }
 
+/// Whether [`refuse_new_analyses`] was called: background work stops for good.
+pub(crate) fn analyses_refused() -> bool {
+    RETIRED.load(Ordering::SeqCst)
+}
+
 /// Either kind of gate guard, so one spawn path can hold whichever it took.
 /// Held, never read.
 enum GateGuard {
@@ -210,7 +215,72 @@ enum GateGuard {
 /// completes it. 64 MiB doubles the headroom that measurement gives us, and
 /// costs only address space — thread stacks are mapped lazily, so the pages a
 /// shallower walk never touches are never backed by memory.
-const ANALYSIS_STACK_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const ANALYSIS_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// A garbage collection the gate turned away that has not run since.
+///
+/// # Why background work looks at it
+///
+/// A collection never waits for the gate ([`try_run_exclusive_analysis`]); it
+/// runs on a watchdog tick when no analysis is inside. Background analysis that
+/// is never done — the builder of the table of uses, which works through every
+/// file of a large workspace for minutes, batch after batch — leaves the gate
+/// free only between two batches, a gap no 15 s tick ever lands in. So it
+/// would starve every collection, and with them the LRU eviction that bounds
+/// what the analyses hold, for as long as it builds. Background work therefore
+/// checks this between its batches and, while a collection is wanted, waits
+/// outside the gate ([`CollectionWanted::yield_to`]) for it to run.
+///
+/// Served queries do not look at it: a collection skipped for them is the
+/// documented price of not queueing a writer ahead of them.
+pub(crate) struct CollectionWanted(AtomicBool);
+
+impl CollectionWanted {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    fn note_turned_away(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn note_admitted(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_wanted(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Wait, holding nothing, while a collection is wanted — at most `max`,
+    /// polling every `poll`. Returns how long it waited.
+    ///
+    /// Bounded because what keeps the collection out may be someone else's
+    /// analysis (a load: minutes), which this waiting does not shorten.
+    pub(crate) async fn yield_to(&self, max: std::time::Duration, poll: std::time::Duration) -> std::time::Duration {
+        let started = tokio::time::Instant::now();
+        while self.is_wanted() && started.elapsed() < max {
+            tokio::time::sleep(poll).await;
+        }
+        started.elapsed()
+    }
+}
+
+/// The served collection's flag; see [`CollectionWanted`].
+static COLLECTION_WANTED: CollectionWanted = CollectionWanted::new();
+
+/// The served collection's flag, for background work to yield to.
+pub(crate) fn collection_wanted() -> &'static CollectionWanted {
+    &COLLECTION_WANTED
+}
+
+/// Mark the served collection wanted, as a turned-away one does — for a test
+/// that judges what background work does while it yields. Cleared by the next
+/// collection that gets in.
+#[cfg(test)]
+pub(crate) fn want_a_collection_for_test() {
+    COLLECTION_WANTED.note_turned_away();
+}
 
 /// Run blocking rust-analyzer work on a dedicated thread with a deep stack, and
 /// await its result.
@@ -247,7 +317,7 @@ where
         return Err(McpError::internal_error(retired_refusal(what), None));
     }
     // Shared entry waits for the gate, so it always runs.
-    Ok(spawn_gated(what, work, false).await?.unwrap())
+    Ok(spawn_gated(what, work, false, &COLLECTION_WANTED).await?.unwrap())
 }
 
 /// What a draining session is told instead of an answer.
@@ -290,29 +360,34 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    spawn_gated(what, work, true).await
+    spawn_gated(what, work, true, &COLLECTION_WANTED).await
 }
 
 /// Enter the gate for one piece of work: shared waits for a collection inside;
 /// exclusive does not wait at all (see [`try_run_exclusive_analysis`]) and
-/// returns `None` when analyses are inside.
-fn enter_gate(exclusive: bool) -> Option<GateGuard> {
+/// returns `None` when analyses are inside — and says so in `wanted`, which
+/// it clears again once it gets in.
+fn enter_gate(exclusive: bool, wanted: &CollectionWanted) -> Option<GateGuard> {
     if !exclusive {
         return Some(GateGuard::Shared(enter_shared()));
     }
-    match ANALYSIS_GATE.try_write() {
-        Ok(guard) => Some(GateGuard::Exclusive(guard)),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            Some(GateGuard::Exclusive(poisoned.into_inner()))
+    let guard = match ANALYSIS_GATE.try_write() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            wanted.note_turned_away();
+            return None;
         }
-        Err(std::sync::TryLockError::WouldBlock) => None,
-    }
+    };
+    wanted.note_admitted();
+    Some(GateGuard::Exclusive(guard))
 }
 
 async fn spawn_gated<T, F>(
     what: &'static str,
     work: F,
     exclusive: bool,
+    wanted: &'static CollectionWanted,
 ) -> Result<Option<T>, McpError>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -327,7 +402,7 @@ where
             // the analysis thread's business, and doing it in the caller would
             // block a runtime worker on exactly what this module exists to keep
             // off one.
-            let Some(_guard) = enter_gate(exclusive) else {
+            let Some(_guard) = enter_gate(exclusive, wanted) else {
                 let _ = tx.send(Ok(None));
                 return;
             };
@@ -549,6 +624,53 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(EXCLUSIVE_STARTED.load(Ordering::SeqCst));
+    }
+
+    /// The flag background work yields to: a collection turned away by an
+    /// analysis inside is wanted until a collection gets in; work yielding to
+    /// it waits while it is wanted and goes on once one ran — and no longer
+    /// than its bound when none can. Its own flag, so the served one and the
+    /// other tests' collections do not move it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turned_away_collection_is_wanted_until_one_runs_and_background_work_waits_for_it() {
+        use std::time::Duration;
+        static WANTED: CollectionWanted = CollectionWanted::new();
+        let poll = Duration::from_millis(10);
+
+        let inside = test_holding_an_analysis();
+        let ran = spawn_gated("exclusive", || (), true, &WANTED).await.expect("collection");
+        assert!(ran.is_none(), "an analysis is inside: the collection is turned away");
+        assert!(WANTED.is_wanted(), "and wanted from then on");
+
+        let yielding = tokio::spawn(async move { WANTED.yield_to(Duration::from_secs(300), poll).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!yielding.is_finished(), "background work waits while a collection is wanted");
+        drop(inside);
+
+        // Retried as in the test above: other tests hold the gate too.
+        let _waiting = super::TestWriterWaiting::announce();
+        let deadline = std::time::Instant::now() + Duration::from_secs(300);
+        while spawn_gated("exclusive", || (), true, &WANTED)
+            .await
+            .expect("collection")
+            .is_none()
+        {
+            assert!(std::time::Instant::now() < deadline, "the gate never came free");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!WANTED.is_wanted(), "a collection that got in is no longer wanted");
+        let waited = tokio::time::timeout(Duration::from_secs(5), yielding)
+            .await
+            .expect("the yield ends once the collection ran")
+            .expect("yield task");
+        assert!(waited < Duration::from_secs(300));
+
+        WANTED.note_turned_away();
+        let waited = WANTED.yield_to(Duration::from_millis(100), poll).await;
+        assert!(
+            waited >= Duration::from_millis(100) && waited < Duration::from_secs(5),
+            "with nothing letting the collection in, the yield gives up at its bound: {waited:?}"
+        );
     }
 
     /// A retired process must not start the work at all — refusing only the

@@ -394,6 +394,9 @@ Memory watchdog (daemon only; 0 disables a threshold):
   RMC_GC_INTERVAL_SECS=300   how often loaded analyses are garbage-collected;
                              this is also what makes salsa's LRU capacities
                              evict anything at all
+  RMC_USES_THREADS=0         threads of the background builder of the tables
+                             of uses (library references answered from a
+                             table instead of a sweep); 0 = no builder
   RMC_TRIM_GROWTH_MB=2048    return freed heap to the kernel (malloc_trim)
                              whenever RSS grows this much above what the last
                              trim left, at most every 5 minutes

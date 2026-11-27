@@ -14,7 +14,7 @@ mod uses;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{
     Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, TryLockError,
 };
@@ -946,6 +946,52 @@ struct ProjectSlot {
     /// which contexts a panic interrupted. Set by [`SpoilOnPanic`], never
     /// cleared: a spoiled slot leaves the registry.
     spoiled: AtomicBool,
+    /// Queries running on a snapshot of this context right now. Raised under
+    /// the slot's lock, beside taking the snapshot, so a holder of the lock
+    /// that reads 0 knows no snapshot of a query exists — what lets the uses
+    /// builder evict LRU memos (a write, which would cancel them) without
+    /// costing anyone an attempt ([`SemanticService::build_uses_batch`]).
+    queries_in_flight: AtomicUsize,
+}
+
+/// Lowers [`ProjectSlot::queries_in_flight`] when the query ends, however.
+struct QueryInFlight<'a>(&'a ProjectSlot);
+
+impl<'a> QueryInFlight<'a> {
+    /// Call with the slot's lock held.
+    fn begin(slot: &'a ProjectSlot) -> Self {
+        slot.queries_in_flight.fetch_add(1, Ordering::SeqCst);
+        Self(slot)
+    }
+}
+
+impl Drop for QueryInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.queries_in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What one call of [`SemanticService::build_uses_batch`] did.
+#[derive(Debug)]
+pub(crate) enum UsesBatch {
+    /// No loaded project has a pending file.
+    Idle,
+    /// Projects with pending files exist, but each slot is held right now (a
+    /// load, a refresh, a query taking its snapshot): try again shortly.
+    Busy,
+    /// A write to the database cancelled the batch, or landed before its rows
+    /// were stored; its files stay pending.
+    Stale,
+    /// A batch was stored.
+    Built {
+        project: PathBuf,
+        files: usize,
+        /// The batch made the project's last pending file ready: the table
+        /// is complete, after this long since it last had pending files.
+        completed: Option<std::time::Duration>,
+        /// Ready files, pending files and rows of the project's table now.
+        size: (usize, usize, usize),
+    },
 }
 
 /// Marks its slot spoiled if a panic unwinds past it; see
@@ -970,6 +1016,7 @@ impl ProjectSlot {
             context: Mutex::new(None),
             loaded: AtomicU8::new(SLOT_EMPTY),
             spoiled: AtomicBool::new(false),
+            queries_in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -1624,6 +1671,101 @@ impl SemanticService {
         collected
     }
 
+    /// One batch of the background builder of the tables of uses (`uses`
+    /// module header): up to `threads × files_per_thread` pending files of the
+    /// most recently used project that has any, made ready.
+    ///
+    /// # How it shares the project
+    ///
+    /// The slot is held only to pick the files and take one snapshot per
+    /// thread — not for the batch, which runs on the snapshots beside the
+    /// queries, as a query does. A slot somebody holds is skipped, not waited
+    /// for (a load holds it for minutes). A refresh that lands meanwhile
+    /// cancels the snapshots ([`UsesBatch::Stale`]); rows computed before it
+    /// are refused by the table's generation check
+    /// ([`uses::UseTable::store_batch`]), so a file edited during the build
+    /// stays pending and is taken again — on its new text.
+    ///
+    /// # What it holds between batches
+    ///
+    /// The caller (the daemon's builder loop) runs each batch as an analysis
+    /// of its own, so the gate is let go between two batches and a garbage
+    /// collection can get in (`deep_stack::CollectionWanted`). A full pass
+    /// over a workspace would otherwise keep every tree and body it touched:
+    /// LRU capacities only evict at a revision bump or an explicit eviction
+    /// (`loader::prime_in_batches`). So before each batch, when no query has a
+    /// snapshot of the project, this evicts the LRU memos the last batch left
+    /// — `trigger_lru_eviction` needs the database exclusively, and with a
+    /// query in flight it would cancel that query instead. Measured on a
+    /// 318-file workspace (`use_census`): a whole pass without eviction grew
+    /// RSS from 1938 to 2984 MiB, all of it given back by the next collection.
+    ///
+    /// # Cost
+    ///
+    /// The batch itself ([`uses::library_uses_of_files`]): ≈ 100 ms a file on
+    /// a core. Picking is a look at each loaded project's pending set; the
+    /// eviction walks the LRU-capped ingredients once.
+    pub(crate) fn build_uses_batch(&self, threads: usize, files_per_thread: usize) -> UsesBatch {
+        assert!(threads > 0 && files_per_thread > 0, "a batch has files and threads");
+        let mut slots: Vec<(PathBuf, Arc<ProjectSlot>, u64)> = {
+            let registry = self.registry();
+            registry
+                .projects
+                .iter()
+                .map(|(path, entry)| (path.clone(), Arc::clone(&entry.slot), entry.last_used))
+                .collect()
+        };
+        slots.sort_by(|a, b| b.2.cmp(&a.2));
+        let mut busy = false;
+        for (path, slot, _) in slots {
+            let _spoil = SpoilOnPanic(&slot);
+            let mut guard = match slot.context.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => {
+                    busy = true;
+                    continue;
+                }
+                // Somebody panicked under it: theirs to clean up.
+                Err(TryLockError::Poisoned(_)) => continue,
+            };
+            let Some(ctx) = guard.as_mut() else { continue };
+            let (generation, files) = {
+                let uses = read_uses(&ctx.uses);
+                (uses.generation(), uses.next_pending(threads * files_per_thread))
+            };
+            if files.is_empty() {
+                continue;
+            }
+            if slot.queries_in_flight.load(Ordering::SeqCst) == 0 {
+                use ra_ap_ide_db::base_db::salsa::Database as _;
+                ctx.host.raw_database_mut().trigger_lru_eviction();
+            }
+            let analyses: Vec<Analysis> =
+                (0..threads.min(files.len())).map(|_| ctx.host.analysis()).collect();
+            let uses = Arc::clone(&ctx.uses);
+            drop(guard);
+
+            let Some(batch) = uses::library_uses_of_files(
+                analyses,
+                &files,
+                crate::deep_stack::ANALYSIS_STACK_BYTES,
+            ) else {
+                return UsesBatch::Stale;
+            };
+            let mut table = uses.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            return match table.store_batch(generation, batch) {
+                uses::Stored::Stale => UsesBatch::Stale,
+                uses::Stored::Ready { completed } => UsesBatch::Built {
+                    project: path,
+                    files: files.len(),
+                    completed,
+                    size: table.size(),
+                },
+            };
+        }
+        if busy { UsesBatch::Busy } else { UsesBatch::Idle }
+    }
+
     /// Per-ingredient memory of one *already loaded* analysis.
     ///
     /// # Why it refuses to load the project
@@ -1765,6 +1907,8 @@ impl SemanticService {
         for attempt in 1..=QUERY_ATTEMPTS {
             let context = self.up_to_date(&canonical, &slot, requested)?;
             let ctx = context.as_ref().unwrap();
+            // Under the slot, beside the snapshot: see `queries_in_flight`.
+            let _in_flight = QueryInFlight::begin(&slot);
             let analysis = ctx.host.analysis();
             let vfs = Arc::clone(&ctx.vfs);
             let words = Arc::clone(&ctx.words);
@@ -3493,19 +3637,27 @@ pub fn hooked() {
     }
 
     /// Make every pending file of `root`'s table of uses ready, the way the
-    /// background builder will (`uses-builder` of the plan): its uses stored
-    /// from `library_uses_in` on the served database.
+    /// daemon's background builder does: batches of
+    /// [`SemanticService::build_uses_batch`] until none is left. Loads the
+    /// project first if it is not.
     fn fill_use_table(service: &SemanticService, root: &Path) {
-        service
-            .with_project(root, LoadKind::Full, |_, analysis, _, indexes| {
-                let pending: Vec<_> = read_uses(indexes.uses).pending().iter().copied().collect();
-                for file in pending {
-                    let found = uses::library_uses_in(analysis, file)?;
-                    indexes.uses.write().unwrap().set_ready(file, found);
+        service.get_or_load_full(root).expect("load the project");
+        let mut built_once = false;
+        loop {
+            match service.build_uses_batch(2, 1) {
+                UsesBatch::Built { completed, .. } => {
+                    built_once = true;
+                    if completed.is_some() {
+                        return;
+                    }
                 }
-                Ok(())
-            })
-            .expect("fill the table of uses");
+                UsesBatch::Idle => {
+                    assert!(built_once, "a loaded project starts with every file pending");
+                    return;
+                }
+                other => panic!("nothing else holds the project in this test: {other:?}"),
+            }
+        }
     }
 
     /// Every location of an answer, comparable across two answers.
@@ -3611,6 +3763,50 @@ pub fn hooked() {
             .expect("references query");
         assert_eq!(location_rows(&stored.locations), location_rows(&found.locations));
         assert_eq!(stored.cost.ra_queries, 0, "{stored:?}");
+    }
+
+    /// An edit that lands while the builder is half way loses no file: the
+    /// batches after it work on the new texts, and the finished table answers
+    /// what a fresh load's live sweep does. (A batch computed *across* the
+    /// edit is refused by the table's generation —
+    /// `uses::tests::a_batch_from_before_an_invalidation_is_not_stored`.)
+    #[test]
+    fn an_edit_in_the_middle_of_the_build_loses_no_file() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        std_spawn_table_workspace(root);
+        let service = SemanticService::new();
+        service.get_or_load_full(root).expect("load");
+        let UsesBatch::Built { files: 1, completed: None, size: (1, pending, _), .. } =
+            service.build_uses_batch(1, 1)
+        else {
+            panic!("one file of several made ready");
+        };
+        assert!(pending > 0);
+
+        let edited = "pub fn elsewhere() {\n    std::thread::spawn(|| {}).join().unwrap();\n}\n\n\
+                      pub fn again() {\n    std::thread::spawn(|| {}).join().unwrap();\n}\n";
+        write_file(&root.join("src/more.rs"), edited);
+        let lib = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        write_file(
+            &root.join("src/lib.rs"),
+            &format!("{lib}\npub fn third() {{\n    std::thread::spawn(|| {{}});\n}}\n"),
+        );
+        // A query refreshes the context; the builder goes on from there.
+        service.get_or_load_full(root).expect("refresh");
+        fill_use_table(&service, root);
+        let stored = service
+            .find_references_within(root, "std::thread::spawn", true, std::time::Duration::from_secs(3600))
+            .expect("references query");
+        assert_eq!(stored.cost.ra_queries, 0, "the table is complete: {stored:?}");
+        assert_eq!(refs_in(&stored.locations, "src/more.rs"), 2, "{stored:?}");
+        assert_eq!(refs_in(&stored.locations, "src/lib.rs"), 4, "{stored:?}");
+
+        let fresh = SemanticService::new()
+            .find_references_within(root, "std::thread::spawn", true, std::time::Duration::from_secs(3600))
+            .expect("references query on a fresh load");
+        assert_eq!(location_rows(&stored.locations), location_rows(&fresh.locations));
     }
 
     /// `n` files calling `std::thread::spawn` once each.

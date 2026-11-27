@@ -254,6 +254,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // at spawn_ep_census_on_startup.
     let _ep_census = spawn_ep_census_on_startup();
 
+    runtime.start_uses_builder();
+
     if background_sync_enabled {
         runtime.start_background_sync();
         tracing::info!("Started background sync task");
