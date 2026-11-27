@@ -9,6 +9,7 @@ mod lru_sweep;
 pub(crate) mod position;
 mod rename;
 mod surface;
+mod tree_watch;
 /// What a name query costs and resolves when the name is fuzzy, a field or a
 /// path (plan item `no-brute-sweeps`): `find_references`, `rename_symbol`.
 #[cfg(test)]
@@ -102,6 +103,9 @@ struct ProjectContext {
     /// refreshed. Without it the cache has no way to notice that the code
     /// moved on — see [`refresh_if_stale`].
     stamps: HashMap<PathBuf, FileStamp>,
+    /// Keeps `stamps` current from file-change events instead of a walk of the
+    /// tree on every query ([`tree_watch`]); set up by the load, before it.
+    watch: tree_watch::TreeWatch,
 }
 
 fn stamp_of(path: &Path) -> Option<FileStamp> {
@@ -128,6 +132,12 @@ fn is_workspace_shape_file(path: &Path) -> bool {
     }
 }
 
+/// Whether the staleness check stamps `path`: a `*.rs` file or a
+/// workspace-shape file ([`is_workspace_shape_file`]).
+fn is_stamped_file(path: &Path) -> bool {
+    path.extension() == Some(std::ffi::OsStr::new("rs")) || is_workspace_shape_file(path)
+}
+
 /// Stat every `*.rs` file and every workspace-shape file of the project
 /// ([`is_workspace_shape_file`]), using the same walker as the indexer so both
 /// sides mean the same thing by "a project file".
@@ -135,9 +145,7 @@ fn is_workspace_shape_file(path: &Path) -> bool {
 /// Files that vanish between the walk and the stat are simply absent from the
 /// result, which reads as a deletion — the correct conclusion.
 fn collect_stamps(root: &Path) -> HashMap<PathBuf, FileStamp> {
-    let (files, walk_errors) = collect_project_files(root, |path| {
-        path.extension() == Some(std::ffi::OsStr::new("rs")) || is_workspace_shape_file(path)
-    });
+    let (files, walk_errors) = collect_project_files(root, is_stamped_file);
     if walk_errors > 0 {
         tracing::warn!(
             "{} unreadable entries while checking {} for staleness",
@@ -1478,8 +1486,9 @@ fn load_into(
     ));
     // Stamps are taken BEFORE the load, not after: a file edited while
     // rust-analyzer was reading the workspace must come out stale on the
-    // next query, not silently accepted as already analysed.
-    let stamps = collect_stamps(canonical);
+    // next query, not silently accepted as already analysed. The watches go
+    // up with them, so the edits of the load's own minute queue as events.
+    let (watch, stamps) = tree_watch::TreeWatch::start(canonical);
     // The context being replaced (a reload after a structural change, or
     // a Fast → Full upgrade) goes BEFORE the new one is built. Left in
     // the slot until the new one is stored, it kept a whole database alive
@@ -1550,6 +1559,7 @@ fn load_into(
         load_kind: requested,
         loaded_at: std::time::Instant::now(),
         stamps,
+        watch,
     });
     slot.publish(Some(requested));
     mem.finish();
@@ -1597,10 +1607,14 @@ fn refresh_if_stale(
     canonical: &Path,
     requested: LoadKind,
 ) -> Result<()> {
-    let current = collect_stamps(canonical);
     let ctx = context
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("Project not loaded"))?;
+    // No event since the last look: nothing a walk would see has changed, and
+    // the check was one `read` (`tree_watch`).
+    let Some(current) = ctx.watch.current(&ctx.stamps) else {
+        return Ok(());
+    };
 
     match classify_staleness(&ctx.stamps, &current, &ctx.layout) {
         Staleness::Fresh => {
@@ -1812,7 +1826,7 @@ impl SemanticService {
     #[cfg(test)]
     pub(crate) fn insert_for_test(&self, path: PathBuf, host: AnalysisHost) {
         self.insert_context_for_test(
-            path,
+            path.clone(),
             ProjectContext {
                 host,
                 vfs: shared_vfs(Vfs::default()),
@@ -1823,6 +1837,7 @@ impl SemanticService {
                 load_kind: LoadKind::Full,
                 loaded_at: std::time::Instant::now(),
                 stamps: HashMap::new(),
+                watch: tree_watch::TreeWatch::walking(&path),
             },
         );
     }
@@ -2570,7 +2585,7 @@ impl SemanticService {
         let canonical =
             std::fs::canonicalize(&project_path).unwrap_or(project_path);
         self.insert_context_for_test(
-            canonical,
+            canonical.clone(),
             ProjectContext {
                 host: AnalysisHost::new(None),
                 vfs: shared_vfs(Vfs::default()),
@@ -2581,6 +2596,7 @@ impl SemanticService {
                 load_kind: LoadKind::Fast,
                 loaded_at: std::time::Instant::now(),
                 stamps: HashMap::new(),
+                watch: tree_watch::TreeWatch::walking(&canonical),
             },
         );
     }

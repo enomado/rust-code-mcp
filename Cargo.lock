@@ -7192,6 +7192,7 @@ dependencies = [
  "hir-def",
  "ide",
  "ide-db",
+ "inotify 0.11.0",
  "intern",
  "libc",
  "libmimalloc-sys",

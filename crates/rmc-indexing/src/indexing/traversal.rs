@@ -52,7 +52,7 @@ pub(crate) const SKIPPED_DIRS: [&str; 6] =
 pub const NESTED_ROOT_MARKER: &str = ".rmcroot";
 
 /// True when a directory with this name must not be descended into.
-pub(crate) fn is_skipped_dir_name(name: &str) -> bool {
+pub fn is_skipped_dir_name(name: &str) -> bool {
     SKIPPED_DIRS.contains(&name)
 }
 
@@ -83,13 +83,47 @@ pub fn collect_project_rust_files(root: &Path) -> (Vec<PathBuf>, usize) {
 /// boundaries, one walk. The staleness check of the semantic service takes the
 /// `*.rs` files and the manifests in the same pass rather than walking twice.
 pub fn collect_project_files(root: &Path, keep: impl Fn(&Path) -> bool) -> (Vec<PathBuf>, usize) {
+    walk_project_files(root, root, keep, |_, _| {})
+}
+
+/// What the walk did with a directory it met, for [`walk_project_files`]'s
+/// `on_dir`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkedDir {
+    /// Entered: its entries are read right after the call.
+    Entered,
+    /// A nested project root ([`NESTED_ROOT_MARKER`]): not entered. A watcher
+    /// still needs to see its marker go, which would let the walk in.
+    NestedRoot,
+}
+
+/// [`collect_project_files`] for the part of `root`'s project under `subtree`
+/// (`root` itself, or a directory below it whose ancestors the caller knows to
+/// be walked), calling `on_dir` on every directory the walk enters — `subtree`
+/// first — BEFORE its entries are read, and on every nested root it stops at.
+///
+/// That order is what a watcher of the tree needs (the semantic service's
+/// staleness check, `tree_watch`): a watch set up in `on_dir` exists before
+/// the directory is listed, so a file created there either is in the listing or
+/// raises an event; none falls between the two.
+///
+/// `subtree` is judged like any directory below `root`: a skipped name yields
+/// nothing and no call, a nested project root yields nothing but its call.
+pub fn walk_project_files(
+    root: &Path,
+    subtree: &Path,
+    keep: impl Fn(&Path) -> bool,
+    mut on_dir: impl FnMut(&Path, WalkedDir),
+) -> (Vec<PathBuf>, usize) {
     let mut rust_files = Vec::new();
     let mut walk_errors = 0;
     // Filled by the closure below; readable once the walker that borrows it is
     // dropped, which is why the report comes after the loop.
     let mut nested_roots: Vec<PathBuf> = Vec::new();
 
-    let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
+    // `filter_entry` sees a directory when walkdir yields it, and walkdir opens
+    // it only on the step after: `on_dir` below runs before the listing.
+    let walker = WalkDir::new(subtree).into_iter().filter_entry(|entry| {
         if !entry.file_type().is_dir() {
             return true;
         }
@@ -101,12 +135,15 @@ pub fn collect_project_files(root: &Path, keep: impl Fn(&Path) -> bool) -> (Vec<
         // own), and honouring it here would make such a project unindexable.
         // The boundary applies to what lies BELOW the root.
         if entry.path() == root {
+            on_dir(entry.path(), WalkedDir::Entered);
             return true;
         }
         if is_nested_project_root(entry.path()) {
             nested_roots.push(entry.path().to_path_buf());
+            on_dir(entry.path(), WalkedDir::NestedRoot);
             return false;
         }
+        on_dir(entry.path(), WalkedDir::Entered);
         true
     });
 

@@ -18,6 +18,11 @@ directml = ["rmc-engine/embeddings-directml", "rmc-indexing/directml"]
 # `lib.rs`); the shipped binary sets its own.
 mimalloc = ["dep:libmimalloc-sys", "dep:mimalloc"]
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The staleness check's watcher reads the inotify fd in the query itself
+# (`semantic/tree_watch.rs`); `notify`'s reader thread would race the query.
+inotify = { version = "0.11", default-features = false }
+
 [dependencies]
 # In-workspace dependencies
 rmc-engine   = { path = "../rmc-engine", features = ["embeddings", "vector-store", "hybrid-search"] }
