@@ -8,6 +8,9 @@ mod lru_sweep;
 pub(crate) mod position;
 mod rename;
 mod word_index;
+#[cfg(test)]
+mod use_census;
+mod uses;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -73,6 +76,10 @@ struct ProjectContext {
     /// it describes exactly the texts the queries see. Shared with the queries
     /// like `vfs`, written under the same discipline.
     words: Arc<RwLock<word_index::WordIndex>>,
+    /// Where the project uses each library declaration, for the files it
+    /// describes (`uses` module header); every file pending after a load or a
+    /// refresh. Shared with the queries and written like `words`.
+    uses: Arc<RwLock<uses::UseTable>>,
     /// Where the load put files, so that a file added since goes where a
     /// reload would put it — see [`apply_tree_change`].
     layout: loader::SourceLayout,
@@ -561,6 +568,19 @@ fn read_words(words: &RwLock<word_index::WordIndex>) -> RwLockReadGuard<'_, word
     words.read().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// What a query reads beside its snapshot and the `Vfs`: the word index, read
+/// for the whole query, and the table of uses, which the query reads (and a
+/// test fills) through its lock.
+struct Indexes<'a> {
+    words: &'a word_index::WordIndex,
+    uses: &'a RwLock<uses::UseTable>,
+}
+
+/// A context's table of uses for reading; poisoning stepped over as for the `Vfs`.
+fn read_uses(uses: &RwLock<uses::UseTable>) -> RwLockReadGuard<'_, uses::UseTable> {
+    uses.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The word index of the project's own files (those under `root` the analysis
 /// holds — the files a sweep may read), from the texts in the database.
 ///
@@ -768,6 +788,19 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
         let mut words = ctx.words.write().unwrap_or_else(|poisoned| poisoned.into_inner());
         for (file_id, text) in &texts {
             words.set_file(*file_id, text.as_deref());
+        }
+    }
+    // The table of uses can no longer vouch for any file: what an unchanged
+    // file resolves to may follow a changed signature elsewhere (`uses` module
+    // header). The changed files themselves are pending, a removed one gone.
+    {
+        let mut uses = ctx.uses.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+        uses.mark_all_pending();
+        for (file_id, text) in &texts {
+            match text {
+                Some(_) => uses.mark_pending(*file_id),
+                None => uses.forget(*file_id),
+            }
         }
     }
 
@@ -1183,10 +1216,13 @@ fn load_into(
         canonical.display(),
         indexing.elapsed().as_millis()
     );
+    // Nothing described yet: until a file's uses are stored, queries sweep it.
+    let uses = uses::UseTable::all_pending(position::project_rust_files(&vfs, canonical));
     *context = Some(ProjectContext {
         host,
         vfs: shared_vfs(vfs),
         words: Arc::new(RwLock::new(words)),
+        uses: Arc::new(RwLock::new(uses)),
         layout,
         load_kind: requested,
         loaded_at: std::time::Instant::now(),
@@ -1432,6 +1468,7 @@ impl SemanticService {
                 host,
                 vfs: shared_vfs(Vfs::default()),
                 words: Arc::default(),
+                uses: Arc::default(),
                 layout: loader::SourceLayout::default(),
                 load_kind: LoadKind::Full,
                 loaded_at: std::time::Instant::now(),
@@ -1720,7 +1757,7 @@ impl SemanticService {
         &self,
         project_path: &Path,
         requested: LoadKind,
-        work: impl Fn(&Path, &Analysis, &Vfs, &word_index::WordIndex) -> Result<T>,
+        work: impl Fn(&Path, &Analysis, &Vfs, &Indexes<'_>) -> Result<T>,
     ) -> Result<T> {
         let canonical = project_path.canonicalize()?;
         let slot = self.slot_for(&canonical);
@@ -1731,6 +1768,7 @@ impl SemanticService {
             let analysis = ctx.host.analysis();
             let vfs = Arc::clone(&ctx.vfs);
             let words = Arc::clone(&ctx.words);
+            let uses = Arc::clone(&ctx.uses);
             let last = attempt == QUERY_ATTEMPTS;
             // Kept only on the last attempt: then no refresh can cancel it.
             let _held = if last {
@@ -1742,8 +1780,12 @@ impl SemanticService {
             let outcome = {
                 let vfs = read_vfs(&vfs);
                 let words = read_words(&words);
+                let indexes = Indexes {
+                    words: &words,
+                    uses: &uses,
+                };
                 Cancelled::catch(std::panic::AssertUnwindSafe(|| {
-                    work(&canonical, &analysis, &vfs, &words)
+                    work(&canonical, &analysis, &vfs, &indexes)
                 }))
             };
             match outcome {
@@ -1854,11 +1896,11 @@ impl SemanticService {
         limit: usize,
         exact: bool,
     ) -> Result<Vec<Location>> {
-        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, words| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, indexes| {
             position::symbol_search_with_exact(
                 analysis,
                 vfs,
-                words,
+                indexes.words,
                 symbol_name,
                 limit,
                 exact,
@@ -1876,11 +1918,11 @@ impl SemanticService {
         exact: bool,
         budget: std::time::Duration,
     ) -> Result<position::SweptAnswer> {
-        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, words| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, indexes| {
             position::symbol_search_within(
                 analysis,
                 vfs,
-                words,
+                indexes.words,
                 symbol_name,
                 limit,
                 exact,
@@ -1943,11 +1985,12 @@ impl SemanticService {
         symbol_name: &str,
         exact: bool,
     ) -> Result<Vec<Location>> {
-        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, words| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, indexes| {
             position::find_references_by_name_with_exact(
                 analysis,
                 vfs,
-                words,
+                indexes.words,
+                &read_uses(indexes.uses),
                 symbol_name,
                 exact,
             )
@@ -1967,11 +2010,12 @@ impl SemanticService {
         exact: bool,
         budget: std::time::Duration,
     ) -> Result<position::SweptAnswer> {
-        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, words| {
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, indexes| {
             position::find_references_within(
                 analysis,
                 vfs,
-                words,
+                indexes.words,
+                &read_uses(indexes.uses),
                 symbol_name,
                 exact,
                 position::SweepBudget::of(budget),
@@ -2024,6 +2068,7 @@ impl SemanticService {
                 host: AnalysisHost::new(None),
                 vfs: shared_vfs(Vfs::default()),
                 words: Arc::default(),
+                uses: Arc::default(),
                 layout: loader::SourceLayout::default(),
                 load_kind: LoadKind::Fast,
                 loaded_at: std::time::Instant::now(),
@@ -3444,6 +3489,164 @@ pub fn hooked() {
                 vec![4],
                 "exact={exact}: the one call of spawn, not add_spawn_hook, got {found:?}"
             );
+        }
+    }
+
+    /// Make every pending file of `root`'s table of uses ready, the way the
+    /// background builder will (`uses-builder` of the plan): its uses stored
+    /// from `library_uses_in` on the served database.
+    fn fill_use_table(service: &SemanticService, root: &Path) {
+        service
+            .with_project(root, LoadKind::Full, |_, analysis, _, indexes| {
+                let pending: Vec<_> = read_uses(indexes.uses).pending().iter().copied().collect();
+                for file in pending {
+                    let found = uses::library_uses_in(analysis, file)?;
+                    indexes.uses.write().unwrap().set_ready(file, found);
+                }
+                Ok(())
+            })
+            .expect("fill the table of uses");
+    }
+
+    /// Every location of an answer, comparable across two answers.
+    fn location_rows(found: &[Location]) -> Vec<(String, u32, u32, String, bool)> {
+        let mut rows: Vec<_> = found
+            .iter()
+            .map(|l| {
+                (
+                    l.file_path.to_string_lossy().into_owned(),
+                    l.line,
+                    l.column,
+                    l.name.clone(),
+                    l.exact,
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// `std::thread::spawn` used every way the live sweep has to tell apart:
+    /// by path, through the module, inside a macro call, in a second file —
+    /// beside a local `spawn` and `Builder::spawn`, which are not it.
+    fn std_spawn_table_workspace(root: &Path) {
+        std_spawn_workspace(root);
+        let lib = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        write_file(
+            &root.join("src/lib.rs"),
+            &format!(
+                "{lib}\npub fn in_a_macro() {{\n    let _handles = vec![thread::spawn(|| {{}})];\n}}\n\nmod more;\n"
+            ),
+        );
+        write_file(
+            &root.join("src/more.rs"),
+            "pub fn elsewhere() {\n    std::thread::spawn(|| {}).join().unwrap();\n}\n",
+        );
+    }
+
+    /// The references of a library item answered from the table of uses are
+    /// the ones the live sweep finds — by construction (`uses` module header),
+    /// checked here on every shape the sweep distinguishes — and asking costs
+    /// no rust-analyzer query about any occurrence.
+    #[test]
+    fn library_references_from_the_table_of_uses_equal_the_live_sweep() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        std_spawn_table_workspace(root);
+        let service = SemanticService::new();
+        let ask = || {
+            service
+                .find_references_within(root, "std::thread::spawn", true, std::time::Duration::from_secs(3600))
+                .expect("references query")
+        };
+
+        let swept = ask();
+        assert!(swept.incomplete.is_none(), "{swept:?}");
+        assert_eq!(swept.cost.files_from_table, 0, "nothing is ready after a load: {swept:?}");
+        assert!(swept.cost.ra_queries > 0, "the pending files are swept: {swept:?}");
+        // The full-path, module-path and macro calls in lib.rs, the call in
+        // more.rs; not the local `spawn` or `Builder::spawn`.
+        assert_eq!(refs_in(&swept.locations, "src/lib.rs"), 3, "{swept:?}");
+        assert_eq!(refs_in(&swept.locations, "src/more.rs"), 1, "{swept:?}");
+
+        fill_use_table(&service, root);
+        let stored = ask();
+        assert_eq!(
+            location_rows(&stored.locations),
+            location_rows(&swept.locations),
+            "the table answers what the sweep found"
+        );
+        assert_eq!(stored.cost.ra_queries, 0, "no occurrence is asked about: {stored:?}");
+        assert_eq!(stored.cost.files_read, 0, "no candidate file is read: {stored:?}");
+        assert_eq!(stored.cost.files_from_table, 2, "{stored:?}");
+    }
+
+    /// A refresh leaves no file ready (until `uses-freshness` can tell which
+    /// stay true): the edited file's new call is in the answer, swept live.
+    #[test]
+    fn an_edit_after_the_table_is_built_is_answered_live() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        std_spawn_table_workspace(root);
+        let service = SemanticService::new();
+        fill_use_table(&service, root);
+
+        write_file(
+            &root.join("src/more.rs"),
+            "pub fn elsewhere() {\n    std::thread::spawn(|| {}).join().unwrap();\n}\n\n\
+             pub fn again() {\n    std::thread::spawn(|| {}).join().unwrap();\n}\n",
+        );
+        let found = service
+            .find_references_within(root, "std::thread::spawn", true, std::time::Duration::from_secs(3600))
+            .expect("references query");
+        assert_eq!(refs_in(&found.locations, "src/more.rs"), 2, "{found:?}");
+        assert_eq!(refs_in(&found.locations, "src/lib.rs"), 3, "{found:?}");
+        assert_eq!(found.cost.files_from_table, 0, "every file pending again: {found:?}");
+
+        fill_use_table(&service, root);
+        let stored = service
+            .find_references_within(root, "std::thread::spawn", true, std::time::Duration::from_secs(3600))
+            .expect("references query");
+        assert_eq!(location_rows(&stored.locations), location_rows(&found.locations));
+        assert_eq!(stored.cost.ra_queries, 0, "{stored:?}");
+    }
+
+    /// `n` files calling `std::thread::spawn` once each.
+    fn spawning_files_workspace(root: &Path, n: usize) {
+        write_file(
+            &root.join("Cargo.toml"),
+            "[package]\nname = \"spawning_files\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        let mods: String = (0..n).map(|i| format!("mod m{i};\n")).collect();
+        write_file(&root.join("src/lib.rs"), &mods);
+        for i in 0..n {
+            write_file(
+                &root.join(format!("src/m{i}.rs")),
+                "pub fn f() {\n    std::thread::spawn(|| {}).join().unwrap();\n}\n",
+            );
+        }
+    }
+
+    /// With the table built, a query costs no rust-analyzer query about an
+    /// occurrence however many files use the item: 3 and 12 files alike.
+    #[test]
+    fn a_library_query_on_a_built_table_asks_nothing_on_four_times_the_files() {
+        let _analysis = holding_an_analysis();
+        for n in [3, 12] {
+            let workspace = tempfile::tempdir().expect("create workspace tempdir");
+            let root = workspace.path();
+            spawning_files_workspace(root, n);
+            let service = SemanticService::new();
+            fill_use_table(&service, root);
+            let found = service
+                .find_references_within(root, "std::thread::spawn", true, std::time::Duration::from_secs(3600))
+                .expect("references query");
+            assert_eq!(call_sites(&found.locations), n, "n={n}: {found:?}");
+            assert_eq!(found.cost.ra_queries, 0, "n={n}: {found:?}");
+            assert_eq!(found.cost.files_read, 0, "n={n}: {found:?}");
+            assert_eq!(found.cost.files_from_table, n, "n={n}: {found:?}");
         }
     }
 

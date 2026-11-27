@@ -84,4 +84,6 @@ optional = true
 ra_ap_syntax = { workspace = true }
 # `heap_size::DefMapCensus`, for the def map composition probe.
 ra_ap_hir_def = { workspace = true }
+# `Semantics`, for the identifier census probe (`semantic::use_census`).
+ra_ap_hir = { workspace = true }
 tempfile = "3"

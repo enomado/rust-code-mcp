@@ -6,6 +6,7 @@ use ra_ap_ide::{
 };
 use ra_ap_vfs::{Vfs, VfsPath};
 
+use super::uses::UseTable;
 use super::word_index::{WordIndex, code_occurrences, field_shape_occurrences};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -57,6 +58,9 @@ pub(crate) struct SweepCost {
     /// rust-analyzer queries asked about occurrences (`find_all_refs` /
     /// `goto_definition`).
     pub ra_queries: usize,
+    /// Files whose uses of a library declaration came from the table of uses
+    /// (`uses::UseTable`) rather than a sweep: no query asked about them.
+    pub files_from_table: usize,
 }
 
 /// When a file sweep must stop, and what it was doing when it did.
@@ -189,7 +193,7 @@ fn nav_target_to_location(
 }
 
 /// The one goto-definition configuration this module uses.
-fn goto_config() -> ra_ap_ide::GotoDefinitionConfig<'static> {
+pub(super) fn goto_config() -> ra_ap_ide::GotoDefinitionConfig<'static> {
     ra_ap_ide::GotoDefinitionConfig {
         ra_fixture: ra_ap_ide_db::ra_fixture::RaFixtureConfig::default(),
     }
@@ -203,7 +207,7 @@ fn nav_offset(nav: &NavigationTarget) -> TextSize {
 /// Identity of a declaration for comparing answers of different queries: the
 /// file and the offset `nav_offset` picks. Two navigation targets with the same
 /// key are the same declaration.
-fn nav_key(nav: &NavigationTarget) -> (ra_ap_vfs::FileId, TextSize) {
+pub(super) fn nav_key(nav: &NavigationTarget) -> (ra_ap_vfs::FileId, TextSize) {
     (nav.file_id, nav_offset(nav))
 }
 
@@ -604,6 +608,7 @@ pub(crate) fn find_references_by_name_with_exact(
     analysis: &Analysis,
     vfs: &Vfs,
     words: &WordIndex,
+    uses: &UseTable,
     symbol_name: &str,
     exact_only: bool,
 ) -> Result<Vec<Location>> {
@@ -611,6 +616,7 @@ pub(crate) fn find_references_by_name_with_exact(
         analysis,
         vfs,
         words,
+        uses,
         symbol_name,
         exact_only,
         SweepBudget::unlimited(),
@@ -624,6 +630,7 @@ pub(crate) fn find_references_within(
     analysis: &Analysis,
     vfs: &Vfs,
     words: &WordIndex,
+    uses: &UseTable,
     symbol_name: &str,
     exact_only: bool,
     budget: SweepBudget,
@@ -685,6 +692,7 @@ pub(crate) fn find_references_within(
             analysis,
             vfs,
             words,
+            uses,
             &library_symbols,
             budget,
             &mut cost,
@@ -918,18 +926,27 @@ pub(super) fn project_rust_files(vfs: &Vfs, project_root: &Path) -> Vec<ra_ap_vf
 /// put through `goto_definition` too, and both it and its targets count as a
 /// hit. The declarations reported are the resolved targets.
 ///
+/// # Ready files come from the table of uses
+///
+/// A file the table of uses ([`UseTable`]) describes is not swept: its uses of
+/// the wanted declarations are read from the table, which holds what this very
+/// sweep would find there (`uses` module header). Only the *pending* files
+/// among the candidates are swept live.
+///
 /// # Cost
 ///
-/// The files asked about are the word index's candidates for the names, and in
-/// them only occurrences in code: a `goto_definition` per occurrence of the
-/// name in code, nothing per file of the workspace. That is cheap for `spawn`
-/// (281 of ~8000 files) and still not for `new` (5194): such names wait for the
-/// graph's table of uses (`library-refs-scope` of the plan); the budget stops
-/// them meanwhile.
+/// With every file ready: the table's files for the wanted declarations, no
+/// rust-analyzer query about any occurrence — the same for `new` as for
+/// `spawn`. Per pending file among the word index's candidates for the names: a
+/// `goto_definition` per occurrence of the name in code — cheap for `spawn`
+/// (281 of ~8000 files), not for `new` (5194); the budget stops that while the
+/// table is still being built.
+#[allow(clippy::too_many_arguments)]
 fn collect_library_refs(
     analysis: &Analysis,
     vfs: &Vfs,
     words: &WordIndex,
+    uses: &UseTable,
     symbols: &[(&NavigationTarget, bool)],
     budget: SweepBudget,
     cost: &mut SweepCost,
@@ -971,14 +988,47 @@ fn collect_library_refs(
         out.push(location);
     }
 
-    // Every file holding one of the names, once, in `FileId` order.
+    // Ready files: the table's uses of each wanted declaration. A use reached
+    // through two wanted keys (a re-export and its target) is one location
+    // after the caller's dedup, exact if either was.
+    let mut from_table: BTreeSet<ra_ap_vfs::FileId> = BTreeSet::new();
+    for (&key, &exact) in &wanted {
+        for (file_id, starts) in uses.uses(key) {
+            let line_index = analysis.file_line_index(file_id)?;
+            let file_path = file_path_of(vfs, file_id)?;
+            from_table.insert(file_id);
+            for start in starts {
+                let line_col = line_index.line_col(start);
+                out.push(Location {
+                    file_path: file_path.clone(),
+                    line: line_col.line + 1,
+                    column: line_col.col + 1,
+                    name: "reference".to_string(),
+                    exact,
+                });
+            }
+        }
+    }
+    cost.files_from_table += from_table.len();
+
+    // Pending files holding one of the names, once, in `FileId` order: the
+    // only ones swept.
     let files: BTreeSet<ra_ap_vfs::FileId> = names
         .iter()
         .flat_map(|name| words.files_with(name).iter().copied())
+        .filter(|&file_id| uses.is_pending(file_id))
         .collect();
     for (done, &file_id) in files.iter().enumerate() {
         if budget.exhausted() {
-            return Ok(Some(budget.note("the library-item sweep", done, files.len())));
+            return Ok(Some(budget.note_of(
+                "the library-item sweep",
+                done,
+                files.len(),
+                &format!(
+                    "candidate files searched (the table of uses still has {} of the project's files pending)",
+                    uses.pending().len()
+                ),
+            )));
         }
         let text = analysis.file_text(file_id)?;
         let line_index = analysis.file_line_index(file_id)?;

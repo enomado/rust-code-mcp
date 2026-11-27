@@ -164,6 +164,15 @@ pub(crate) fn field_shape_occurrences(text: &str, word: &str) -> Vec<usize> {
     occurrences(text, word, true)
 }
 
+/// Every word in code of `text` with its byte offset, in text order — the
+/// occurrences [`code_occurrences`] picks from, for all words at once.
+#[cfg_attr(not(test), allow(dead_code))] // see `uses::library_uses_in`
+pub(crate) fn code_words(text: &str) -> Vec<(usize, &str)> {
+    let mut found = Vec::new();
+    for_each_code_word(text, |start, word, _| found.push((start, word)));
+    found
+}
+
 fn occurrences(text: &str, word: &str, field_shape_only: bool) -> Vec<usize> {
     let word = word.strip_prefix("r#").unwrap_or(word);
     let mut found = Vec::new();
