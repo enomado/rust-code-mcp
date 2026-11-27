@@ -1168,13 +1168,22 @@ pub(crate) enum UsesBatch {
     /// Projects with pending files exist, but each slot is held right now (a
     /// load, a refresh, a query taking its snapshot): try again shortly.
     Busy,
-    /// A write to the database cancelled the batch, or landed before its rows
-    /// were stored; its files stay pending.
-    Stale,
-    /// A batch was stored.
+    /// A batch ran — to its end, or until a write to the database cancelled
+    /// it.
     Built {
         project: PathBuf,
+        /// Files the batch was given.
         files: usize,
+        /// Files made ready.
+        stored: usize,
+        /// Files built but refused: a refresh made them pending since the
+        /// batch's snapshot ([`uses::UseTable::store_batch`]).
+        refused: usize,
+        /// Files a cancellation cut, by path, with how many times that has
+        /// happened to each; they stay pending.
+        interrupted: Vec<(String, u32)>,
+        /// The slowest file built, by path.
+        slowest: Option<(String, std::time::Duration)>,
         /// The batch made the project's last pending file ready: the table
         /// is complete, after this long since it last had pending files.
         completed: Option<std::time::Duration>,
@@ -1878,10 +1887,14 @@ impl SemanticService {
     /// thread — not for the batch, which runs on the snapshots beside the
     /// queries, as a query does. A slot somebody holds is skipped, not waited
     /// for (a load holds it for minutes). A refresh that lands meanwhile
-    /// cancels the snapshots ([`UsesBatch::Stale`]); rows computed before it
-    /// are refused by the table's generation check
-    /// ([`uses::UseTable::store_batch`]), so a file edited during the build
-    /// stays pending and is taken again — on its new text.
+    /// cancels the snapshots: the files built before it are kept unless the
+    /// refresh made them pending ([`uses::UseTable::store_batch`]), so a file
+    /// edited during the build stays pending and is taken again — on its new
+    /// text — while the rest of the batch is not lost. The file each thread was
+    /// on is noted as interrupted and goes behind the others of its exposure:
+    /// on a workspace refreshed every minute, a batch that had to finish
+    /// whole between two refreshes never did once it held one heavy file
+    /// (plan item `uses-bur`, 2026-11-27).
     ///
     /// # What it holds between batches
     ///
@@ -1946,24 +1959,33 @@ impl SemanticService {
             let analyses: Vec<Analysis> =
                 (0..threads.min(files.len())).map(|_| ctx.host.analysis()).collect();
             let uses = Arc::clone(&ctx.uses);
+            // For the log only; the `Vfs` is read beside the snapshots.
+            let vfs = Arc::clone(&ctx.vfs);
             drop(guard);
 
-            let Some(batch) = uses::library_uses_of_files(
+            let batch = uses::library_uses_of_files(
                 analyses,
                 &files,
                 crate::deep_stack::ANALYSIS_STACK_BYTES,
-            ) else {
-                return UsesBatch::Stale;
-            };
+            );
+            let path_of = |file| read_vfs(&vfs).file_path(file).to_string();
             let mut table = uses.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-            return match table.store_batch(generation, batch) {
-                uses::Stored::Stale => UsesBatch::Stale,
-                uses::Stored::Ready { completed } => UsesBatch::Built {
-                    project: path,
-                    files: files.len(),
-                    completed,
-                    size: table.size(),
-                },
+            let interrupted: Vec<(String, u32)> = batch
+                .interrupted
+                .iter()
+                .map(|&file| (path_of(file), table.note_interrupted(file)))
+                .collect();
+            let slowest = batch.slowest.map(|(file, took)| (path_of(file), took));
+            let stored = table.store_batch(generation, batch.done);
+            return UsesBatch::Built {
+                project: path,
+                files: files.len(),
+                stored: stored.stored,
+                refused: stored.refused,
+                interrupted,
+                slowest,
+                completed: stored.completed,
+                size: table.size(),
             };
         }
         if busy { UsesBatch::Busy } else { UsesBatch::Idle }
@@ -3972,9 +3994,9 @@ pub fn hooked() {
 
     /// An edit that lands while the builder is half way loses no file: the
     /// batches after it work on the new texts, and the finished table answers
-    /// what a fresh load's live sweep does. (A batch computed *across* the
-    /// edit is refused by the table's generation —
-    /// `uses::tests::a_batch_from_before_an_invalidation_is_not_stored`.)
+    /// what a fresh load's live sweep does. (The files of a batch computed
+    /// *across* the edit that the edit made pending are refused —
+    /// `uses::tests::a_batch_from_before_an_invalidation_keeps_only_the_files_it_left_alone`.)
     #[test]
     fn an_edit_in_the_middle_of_the_build_loses_no_file() {
         let _analysis = holding_an_analysis();

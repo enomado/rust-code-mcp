@@ -76,12 +76,27 @@ pub(crate) struct UseTable {
     /// Project files the table does not describe.
     pending: BTreeSet<FileId>,
     /// Bumped by every invalidation ([`Self::mark_pending`],
-    /// [`Self::mark_all_pending`], [`Self::forget`]). A builder computes a
-    /// batch on a snapshot taken at one generation and stores it only if the
-    /// table is still at that generation ([`Self::store_batch`]): otherwise a
-    /// refresh landed in between, and rows of the old texts — or of what they
-    /// resolved to before the change — would be filed as ready.
+    /// [`Self::mark_pending_where`], [`Self::forget`]). A builder computes a
+    /// batch on a snapshot taken at one generation; see [`Self::marked_at`].
     generation: u64,
+    /// By file: the generation at which it was last made pending (a load: 0)
+    /// — every pending file has one. A batch computed at generation `g` is
+    /// stored file by file ([`Self::store_batch`]): a file marked after `g`
+    /// is refused — a refresh between the snapshot and the store changed its
+    /// text or what it may resolve to, and its rows describe the old ones.
+    /// A file the refresh did not mark is stored: that refresh leaves its
+    /// resolution as it was, by the same rule that keeps a ready file ready
+    /// through it (module header). Refusing the whole batch instead made a
+    /// batch longer than the time between two refreshes — a heavy file, on a
+    /// workspace edited every minute — never stored, and taken again and again.
+    marked_at: HashMap<FileId, u64>,
+    /// By file: how many batches a refresh cut while this file was being
+    /// built. The builder takes such a file after the others of its exposure
+    /// ([`Self::next_pending`]), so that one file heavier than the time
+    /// between two refreshes does not hold up the rest; the memos it got
+    /// through stay in the database, so each new attempt goes further.
+    /// Dropped once the file is ready.
+    interruptions: HashMap<FileId, u32>,
     /// When the table last went from "every file ready" (or a load) to having
     /// pending files: what the builder's "built in T s" line measures from.
     /// `None` while nothing is pending.
@@ -105,13 +120,15 @@ pub(crate) struct Exposure(pub u32);
 
 /// What [`UseTable::store_batch`] did.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Stored {
-    /// The table moved on since the batch's snapshot; nothing was stored and
-    /// the batch's files stay pending.
-    Stale,
-    /// The files are ready. `completed` — the batch made the last pending
-    /// file ready; how long the table took since it last had pending files.
-    Ready { completed: Option<Duration> },
+pub(crate) struct Stored {
+    /// Files made ready.
+    pub(crate) stored: usize,
+    /// Files refused: made pending (or forgotten) since the batch's snapshot;
+    /// they stay pending (or gone).
+    pub(crate) refused: usize,
+    /// The batch made the last pending file ready: how long the table took
+    /// since it last had pending files.
+    pub(crate) completed: Option<Duration>,
 }
 
 impl UseTable {
@@ -120,6 +137,7 @@ impl UseTable {
         let pending: BTreeSet<FileId> = files.into_iter().collect();
         Self {
             building_since: (!pending.is_empty()).then(Instant::now),
+            marked_at: pending.iter().map(|&file| (file, 0)).collect(),
             pending,
             ..Self::default()
         }
@@ -130,8 +148,9 @@ impl UseTable {
         self.generation
     }
 
-    /// Up to `count` pending files, least exposed first (`FileId` among equals):
-    /// the builder's next batch. `exposure` — of each pending file's root
+    /// Up to `count` pending files, least exposed first; among equals the less
+    /// often interrupted ([`Self::interruptions`]), then by `FileId`: the
+    /// builder's next batch. `exposure` — of each pending file's root
     /// ([`Exposure`]).
     ///
     /// Cost: `exposure` once per pending file and a partial sort of them —
@@ -142,39 +161,59 @@ impl UseTable {
         count: usize,
         mut exposure: impl FnMut(FileId) -> Exposure,
     ) -> Vec<FileId> {
-        let mut ranked: Vec<(Exposure, FileId)> =
-            self.pending.iter().map(|&file| (exposure(file), file)).collect();
+        let mut ranked: Vec<(Exposure, u32, FileId)> = self
+            .pending
+            .iter()
+            .map(|&file| {
+                let cut = self.interruptions.get(&file).copied().unwrap_or(0);
+                (exposure(file), cut, file)
+            })
+            .collect();
         if count < ranked.len() {
             ranked.select_nth_unstable(count);
             ranked.truncate(count);
         }
         ranked.sort_unstable();
-        ranked.into_iter().map(|(_, file)| file).collect()
+        ranked.into_iter().map(|(_, _, file)| file).collect()
     }
 
-    /// Make the files of a batch ready — if the table is still at `generation`,
-    /// the one their uses were computed at; see
-    /// [`Self::generation`](UseTable#structfield.generation).
+    /// Make ready the files of a batch whose uses were computed at
+    /// `generation` and that nothing made pending since; see
+    /// [`Self::marked_at`](UseTable#structfield.marked_at).
     pub(crate) fn store_batch(
         &mut self,
         generation: u64,
         batch: Vec<(FileId, Vec<(DeclKey, TextSize)>)>,
     ) -> Stored {
-        if generation != self.generation {
-            return Stored::Stale;
-        }
         let had_pending = !self.pending.is_empty();
+        let mut stored = 0;
+        let mut refused = 0;
         for (file, uses) in batch {
-            // A file forgotten since cannot be here: forgetting bumps the
-            // generation. So every file of the batch is still pending.
-            self.set_ready(file, uses);
+            // Not pending: forgotten since (a ready file is not in a batch).
+            let current = self.pending.contains(&file)
+                && self.marked_at[&file] <= generation;
+            if current {
+                self.set_ready(file, uses);
+                stored += 1;
+            } else {
+                refused += 1;
+            }
         }
         let completed = if had_pending && self.pending.is_empty() {
             self.building_since.take().map(|since| since.elapsed())
         } else {
             None
         };
-        Stored::Ready { completed }
+        Stored { stored, refused, completed }
+    }
+
+    /// Note that a refresh cut a batch while `file` was being built; returns
+    /// how many times that has happened to it. See
+    /// [`Self::interruptions`](UseTable#structfield.interruptions).
+    pub(crate) fn note_interrupted(&mut self, file: FileId) -> u32 {
+        let cut = self.interruptions.entry(file).or_default();
+        *cut += 1;
+        *cut
     }
 
     /// Note that a file became pending (or might have); see `building_since`.
@@ -202,6 +241,7 @@ impl UseTable {
     pub(crate) fn set_ready(&mut self, file: FileId, uses: Vec<(DeclKey, TextSize)>) {
         self.drop_rows(file);
         self.pending.remove(&file);
+        self.interruptions.remove(&file);
         let mut rows: Vec<(u32, TextSize)> = uses
             .into_iter()
             .map(|(key, start)| (self.intern(key), start))
@@ -222,9 +262,17 @@ impl UseTable {
 
     /// Make `file` pending: it changed, or what it resolves to may have.
     pub(crate) fn mark_pending(&mut self, file: FileId) {
+        self.mark(file);
+        self.invalidated();
+    }
+
+    /// Make `file` pending as of the generation the next [`Self::invalidated`]
+    /// moves to — pending already or not: a batch in flight may be building
+    /// it on what it was before.
+    fn mark(&mut self, file: FileId) {
         self.drop_rows(file);
         self.pending.insert(file);
-        self.invalidated();
+        self.marked_at.insert(file, self.generation + 1);
     }
 
     /// Make every file pending — what a refresh did before it could tell which
@@ -235,26 +283,24 @@ impl UseTable {
     /// in flight was computed on the texts before the change.
     #[cfg(test)]
     pub(crate) fn mark_all_pending(&mut self) {
-        let ready: Vec<FileId> = self.uses_of.keys().copied().collect();
-        for file in ready {
-            self.drop_rows(file);
-            self.pending.insert(file);
-        }
-        self.invalidated();
+        self.mark_pending_where(|_| true);
     }
 
-    /// Make pending every ready file `stale` picks — the files a surface change
-    /// may have re-resolved (`apply_tree_change`). One generation bump for the
-    /// lot, even when it picks none: the caller marks the changed files right
-    /// after, and a batch in flight is stale either way.
+    /// Make pending every file `stale` picks — the files a surface change may
+    /// have re-resolved (`apply_tree_change`). Pending files are asked too: a
+    /// batch in flight may be building one of them on what it resolved to
+    /// before ([`Self::marked_at`](UseTable#structfield.marked_at)). One
+    /// generation bump for the lot.
     ///
-    /// Cost: `stale` once per ready file. Returns how many it made pending.
+    /// Cost: `stale` once per file of the table (≈ 9000 on a ~8000-file
+    /// workspace, a root lookup each — under a millisecond). Returns how many
+    /// ready files it made pending.
     pub(crate) fn mark_pending_where(&mut self, mut stale: impl FnMut(FileId) -> bool) -> usize {
-        let picked: Vec<FileId> = self.uses_of.keys().copied().filter(|&file| stale(file)).collect();
-        let count = picked.len();
-        for file in picked {
-            self.drop_rows(file);
-            self.pending.insert(file);
+        let ready: Vec<FileId> = self.uses_of.keys().copied().filter(|&file| stale(file)).collect();
+        let pending: Vec<FileId> = self.pending.iter().copied().filter(|&file| stale(file)).collect();
+        let count = ready.len();
+        for file in ready.into_iter().chain(pending) {
+            self.mark(file);
         }
         self.invalidated();
         count
@@ -279,6 +325,8 @@ impl UseTable {
     pub(crate) fn forget(&mut self, file: FileId) {
         self.drop_rows(file);
         self.pending.remove(&file);
+        self.marked_at.remove(&file);
+        self.interruptions.remove(&file);
         self.invalidated();
     }
 
@@ -371,30 +419,44 @@ pub(crate) fn library_uses_in(
     Ok(uses)
 }
 
+/// What one batch of [`library_uses_of_files`] got through.
+#[derive(Debug, Default)]
+pub(crate) struct BatchUses {
+    /// The files built, with their uses.
+    pub(crate) done: Vec<(FileId, Vec<(DeclKey, TextSize)>)>,
+    /// The files a cancellation cut — at most one a thread; their work is
+    /// lost (the memos they completed are not) and they stay pending.
+    pub(crate) interrupted: Vec<FileId>,
+    /// The slowest file built and how long it took — for the log.
+    pub(crate) slowest: Option<(FileId, Duration)>,
+}
+
 /// The uses of one batch of files: [`library_uses_in`] on each, the files dealt
 /// round-robin to one thread per snapshot in `analyses` (all of one database).
 ///
-/// `None` — a write to the database (a refresh, a reload) cancelled the
-/// snapshots: none of the batch is kept, its files stay pending, and the
-/// threads let go of their snapshots at once, which is what the write waits
-/// for.
+/// A write to the database (a refresh, a reload) cancels the snapshots: each
+/// thread stops at the file it is on ([`BatchUses::interrupted`]) and lets go
+/// of its snapshot at once, which is what the write waits for; the files it
+/// built before are returned, for [`UseTable::store_batch`] to sort out which
+/// the write left current. The files it never reached stay pending.
 ///
 /// Threads get `stack_bytes` each, the analysis thread's stack: inference on
 /// a body recurses over its shape, as on the thread that called this.
 ///
 /// Cost: the sum of [`library_uses_in`] over `files`, divided among the
-/// threads; on a ~8000-file workspace ≈ 100 ms a file on one core.
+/// threads; on a ~8000-file workspace ≈ 100 ms a file on one core on
+/// average, but one file can take minutes.
 pub(crate) fn library_uses_of_files(
     analyses: Vec<Analysis>,
     files: &[FileId],
     stack_bytes: usize,
-) -> Option<Vec<(FileId, Vec<(DeclKey, TextSize)>)>> {
+) -> BatchUses {
     let threads = analyses.len();
     assert!(threads > 0, "a batch needs at least one snapshot");
     // Thread `t` takes files `t`, `t + threads`, … — neighbours in `FileId`
     // order are often neighbours in a crate, and a crate's first file pays its
     // def map for the rest; dealing them out spreads that cost.
-    let found: Vec<Option<Vec<(FileId, Vec<(DeclKey, TextSize)>)>>> = std::thread::scope(|scope| {
+    let parts: Vec<BatchUses> = std::thread::scope(|scope| {
         let handles: Vec<_> = analyses
             .into_iter()
             .enumerate()
@@ -403,25 +465,36 @@ pub(crate) fn library_uses_of_files(
                     .name("rmc-uses".to_string())
                     .stack_size(stack_bytes)
                     .spawn_scoped(scope, move || {
-                        let mut mine = Vec::new();
+                        let mut mine = BatchUses::default();
                         for &file in files.iter().skip(thread).step_by(threads) {
+                            let started = Instant::now();
                             let outcome = Cancelled::catch(std::panic::AssertUnwindSafe(|| {
                                 library_uses_in(&analysis, file)
                             }));
                             match outcome {
-                                Ok(Ok(uses)) => mine.push((file, uses)),
+                                Ok(Ok(uses)) => {
+                                    let took = started.elapsed();
+                                    if mine.slowest.is_none_or(|(_, slowest)| took > slowest) {
+                                        mine.slowest = Some((file, took));
+                                    }
+                                    mine.done.push((file, uses));
+                                }
                                 Ok(Err(error)) => {
                                     // Every query in it is `Cancellable`: an
                                     // error is a cancellation carried by `?`.
                                     if !super::is_cancellation(&error) {
                                         tracing::warn!("table of uses: {error:#}");
                                     }
-                                    return None;
+                                    mine.interrupted.push(file);
+                                    return mine;
                                 }
-                                Err(_cancelled) => return None,
+                                Err(_cancelled) => {
+                                    mine.interrupted.push(file);
+                                    return mine;
+                                }
                             }
                         }
-                        Some(mine)
+                        mine
                     })
                     .expect("spawn a thread of the uses builder")
             })
@@ -434,11 +507,17 @@ pub(crate) fn library_uses_of_files(
             })
             .collect()
     });
-    let mut batch = Vec::with_capacity(files.len());
-    for part in found {
-        batch.extend(part?);
+    let mut batch = BatchUses::default();
+    for part in parts {
+        batch.done.extend(part.done);
+        batch.interrupted.extend(part.interrupted);
+        if let Some((file, took)) = part.slowest
+            && batch.slowest.is_none_or(|(_, slowest)| took > slowest)
+        {
+            batch.slowest = Some((file, took));
+        }
     }
-    Some(batch)
+    batch
 }
 
 #[cfg(test)]
@@ -518,45 +597,73 @@ mod tests {
         assert_eq!(table.next_pending(0, exposure), Vec::<FileId>::new());
     }
 
-    /// A batch computed before an invalidation is not stored: its rows describe
-    /// texts (or what they resolved to) that the database no longer holds. The
-    /// file stays pending and the next batch takes it again — an edit during
-    /// the build loses no file. Even `mark_all_pending` with nothing ready
-    /// moves the table on: what was in flight is just as stale.
+    /// The files of a batch computed before an invalidation that the
+    /// invalidation made pending are not stored: their rows describe texts (or
+    /// what they resolved to) that the database no longer holds. They stay
+    /// pending and the next batch takes them again — an edit during the build
+    /// loses no file. A file the invalidation left alone is stored: that
+    /// refresh does not change what it resolves to. A pending file a surface
+    /// change reaches counts as made pending, though it already was: the batch
+    /// may have been building it on the old resolution.
     #[test]
-    fn a_batch_from_before_an_invalidation_is_not_stored() {
-        let mut table = UseTable::all_pending([file(1), file(2)]);
-        assert_eq!(table.next_pending(1, |_| Exposure(0)), vec![file(1)]);
-
+    fn a_batch_from_before_an_invalidation_keeps_only_the_files_it_left_alone() {
+        let mut table = UseTable::all_pending([file(1), file(2), file(3)]);
+        let row = || vec![(key(9, 4), TextSize::new(5))];
         let before = table.generation();
         table.mark_all_pending();
         assert_eq!(
-            table.store_batch(before, vec![(file(1), vec![(key(9, 4), TextSize::new(5))])]),
-            Stored::Stale
+            table.store_batch(before, vec![(file(1), row())]),
+            Stored { stored: 0, refused: 1, completed: None }
         );
-        assert!(table.is_pending(file(1)), "the stale batch's file stays pending");
+        assert!(table.is_pending(file(1)), "the refused file stays pending");
         assert!(table.uses(key(9, 4)).is_empty());
 
         let now = table.generation();
-        assert_eq!(
-            table.store_batch(now, vec![(file(1), vec![(key(9, 4), TextSize::new(5))])]),
-            Stored::Ready { completed: None },
-            "one of two files: not complete yet"
-        );
+        // An edit of file 1 and a surface change reaching file 3, both pending,
+        // land while the batch builds all three.
         table.mark_pending(file(1));
-        assert!(matches!(
-            table.store_batch(now, vec![(file(2), Vec::new())]),
-            Stored::Stale
-        ));
+        table.mark_pending_where(|f| f == file(3));
+        assert_eq!(
+            table.store_batch(now, vec![(file(1), row()), (file(2), row()), (file(3), row())]),
+            Stored { stored: 1, refused: 2, completed: None },
+            "only the file nothing touched is stored"
+        );
+        assert!(!table.is_pending(file(2)));
+        assert!(table.is_pending(file(1)) && table.is_pending(file(3)));
+
+        // A forgotten file is refused, whatever the generation.
         let now = table.generation();
-        let Stored::Ready { completed } = table.store_batch(
-            now,
-            vec![(file(1), vec![(key(9, 4), TextSize::new(5))]), (file(2), Vec::new())],
-        ) else {
-            panic!("a current batch is stored");
-        };
-        assert!(completed.is_some(), "the last pending file made the table complete");
+        table.forget(file(3));
+        assert_eq!(
+            table.store_batch(now, vec![(file(3), row())]),
+            Stored { stored: 0, refused: 1, completed: None }
+        );
+
+        let now = table.generation();
+        let stored = table.store_batch(now, vec![(file(1), row())]);
+        assert_eq!((stored.stored, stored.refused), (1, 0));
+        assert!(stored.completed.is_some(), "the last pending file made the table complete");
         assert!(table.pending().is_empty());
-        assert_eq!(table.uses(key(9, 4)), vec![(file(1), vec![TextSize::new(5)])]);
+        assert_eq!(
+            table.uses(key(9, 4)),
+            vec![(file(1), vec![TextSize::new(5)]), (file(2), vec![TextSize::new(5)])]
+        );
+    }
+
+    /// A file a refresh cut goes behind the other files of its exposure, not
+    /// behind more exposed ones, and is back in place once ready.
+    #[test]
+    fn an_interrupted_file_goes_behind_the_others_of_its_exposure() {
+        let mut table = UseTable::all_pending((1..=4).map(file));
+        let exposure = |f: FileId| Exposure([0, 1, 1, 1, 2][f.index() as usize]);
+        assert_eq!(table.next_pending(4, exposure), vec![file(1), file(2), file(3), file(4)]);
+        assert_eq!(table.note_interrupted(file(1)), 1);
+        assert_eq!(table.note_interrupted(file(1)), 2);
+        assert_eq!(table.note_interrupted(file(2)), 1);
+        assert_eq!(table.next_pending(4, exposure), vec![file(3), file(2), file(1), file(4)]);
+
+        table.set_ready(file(1), Vec::new());
+        table.mark_pending(file(1));
+        assert_eq!(table.next_pending(2, exposure), vec![file(1), file(3)]);
     }
 }

@@ -35,8 +35,10 @@ const USES_FILES_PER_THREAD: usize = 8;
 const USES_IDLE_POLL: Duration = Duration::from_secs(2);
 /// Wait after every project with pending files was held by somebody.
 const USES_BUSY_PAUSE: Duration = Duration::from_secs(1);
-/// Wait after a refresh cancelled a batch, for the refresh to land.
+/// Wait after a refresh cut a batch, for the refresh to land.
 const USES_STALE_PAUSE: Duration = Duration::from_millis(100);
+/// A file of the table of uses slower than this is named in the log.
+const USES_SLOW_FILE: Duration = Duration::from_secs(10);
 /// Longest the builder yields to a collection the gate turned away. The
 /// watchdog retries a deferred collection every 15 s (`IDLE_TICK`), so two
 /// ticks and change; past it, what keeps the collection out is somebody
@@ -516,11 +518,41 @@ impl ServerRuntime {
                 })
                 .await;
                 let pause = match outcome {
-                    Ok(UsesBatch::Built { project, files, completed, size: (ready, pending, rows) }) => {
+                    Ok(UsesBatch::Built {
+                        project,
+                        files,
+                        stored,
+                        refused,
+                        interrupted,
+                        slowest,
+                        completed,
+                        size: (ready, pending, rows),
+                    }) => {
                         tracing::debug!(
-                            "table of uses of {}: a batch of {files} file(s); {ready} ready, {pending} pending",
+                            "table of uses of {}: a batch of {files} file(s), {stored} stored, \
+                             {refused} refused; {ready} ready, {pending} pending",
                             project.display()
                         );
+                        // A file cut again and again is heavier than the time
+                        // between two refreshes: worth a line, now and then.
+                        for (path, cut) in &interrupted {
+                            if [3, 10, 30, 100, 300].contains(cut) {
+                                tracing::info!(
+                                    "table of uses of {}: {path} cut by a refresh {cut} times; \
+                                     {ready} ready, {pending} pending",
+                                    project.display()
+                                );
+                            }
+                        }
+                        if let Some((path, took)) = &slowest
+                            && *took >= USES_SLOW_FILE
+                        {
+                            tracing::info!(
+                                "table of uses of {}: {path} took {:.1} s",
+                                project.display(),
+                                took.as_secs_f64()
+                            );
+                        }
                         if let Some(took) = completed {
                             tracing::info!(
                                 "use table of {}: {ready} files, {rows} rows in {:.1} s",
@@ -528,11 +560,10 @@ impl ServerRuntime {
                                 took.as_secs_f64()
                             );
                         }
-                        Duration::ZERO
+                        // Cut by a refresh, which is now waiting for the
+                        // snapshots to go: let it land before the next batch.
+                        if interrupted.is_empty() { Duration::ZERO } else { USES_STALE_PAUSE }
                     }
-                    // Cancelled by a refresh, which is now waiting for the
-                    // snapshots to go: let it land before the next batch.
-                    Ok(UsesBatch::Stale) => USES_STALE_PAUSE,
                     Ok(UsesBatch::Busy) => USES_BUSY_PAUSE,
                     Ok(UsesBatch::Idle) => USES_IDLE_POLL,
                     Err(error) => {
