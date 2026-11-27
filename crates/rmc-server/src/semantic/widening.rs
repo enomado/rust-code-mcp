@@ -31,7 +31,12 @@
 //! hands out too, not only for the changed units: a type `S` whose values
 //! matter makes pending the callers of `S::new`, not every file naming a
 //! `new`. Those nested closures share the parsed files and the second half of
-//! the budget; one that does not end leaves its name to its bare files.
+//! the budget; one that does not end leaves its name to the files naming it
+//! as a member can be named (`x.f`, `T::f`, a literal naming `T`, a glob —
+//! [`Closer::shaped`]), which bounds every narrowed name in any case. A field
+//! or method name in at most [`HOLDERS_ABOVE`] such files takes them without
+//! the closure (step `uses-narrow-untold`: a god-type's holders are thousands
+//! of files, a rare field's closure cost more than it spared).
 //!
 //! A private item reaches the files below its module that name it after a
 //! path to the module (`super::x`, `crate::x`, `m::x`) or hold a glob import
@@ -67,6 +72,11 @@ pub(crate) const PARSE_BUDGET: usize = 2000;
 /// module; past it the rest are kept as they are.
 const LEX_BUDGET: usize = 4 * PARSE_BUDGET;
 
+/// A field's, method's, variant's or trait item's name is narrowed by the
+/// holders of its type only when the files naming it in its shape are more
+/// than this ([`Closer::narrowed`]).
+const HOLDERS_ABOVE: usize = 32;
+
 /// The files a surface change can make re-resolve.
 #[derive(Debug)]
 pub(crate) enum Widening {
@@ -77,6 +87,9 @@ pub(crate) enum Widening {
     Files {
         files: HashSet<FileId>,
         names: Vec<String>,
+        /// By name as `names` shows it, the files it makes pending (they
+        /// overlap) — what the count is made of, for the probe.
+        widths: HashMap<String, usize>,
         /// Files parsed and macros expanded to close the names, files lexed
         /// for the paths to private items.
         parsed: usize,
@@ -438,9 +451,25 @@ impl Closer<'_, '_> {
         files
     }
 
-    /// The files a narrowed name makes pending — see [`Narrow`]. Its bare
-    /// name's files when the other side cannot be told.
+    /// The files a narrowed name makes pending — see [`Narrow`] — among those
+    /// naming it in a shape it can be reached by ([`Self::shaped`]). Only that
+    /// shape when the other side cannot be told.
     fn narrowed(&mut self, narrow: &Narrow) -> Vec<FileId> {
+        let shaped = self.shaped(narrow);
+        let name = narrow.name().to_owned();
+        let shaped_files: Vec<FileId> = self
+            .files_with(&name)
+            .filter(|file| shaped.contains(file))
+            .collect();
+        // A closure of holders parses its candidates under the refresh (a few
+        // hundred to thousands of files on a god-type): for a field's or a
+        // method's name already in few files it costs more than the files it
+        // could spare. Not for a trait's item: a method call `x.k()` is in
+        // the member shape on every `k` of the workspace, the trait's holders
+        // are what tells them apart.
+        if shaped_files.len() <= HOLDERS_ABOVE && matches!(narrow, Narrow::Holding(..)) {
+            return shaped_files;
+        }
         let among: Option<HashSet<FileId>> = match narrow {
             Narrow::Through(_, ty) => Some(
                 self.scope
@@ -456,19 +485,62 @@ impl Closer<'_, '_> {
             Narrow::Holding(_, ty) | Narrow::InScope(_, ty) => self.holders_of(ty),
         };
         let with_glob = matches!(narrow, Narrow::InScope(..));
-        let name = narrow.name().to_owned();
         match among {
-            Some(among) => self
-                .files_with(&name)
+            Some(among) => shaped_files
+                .into_iter()
                 .filter(|file| {
                     among.contains(file) || (with_glob && self.scope.words.has_glob(*file))
                 })
                 .collect(),
             None => {
                 self.bare.insert(narrow.clone());
-                self.files_with(&name).collect()
+                shaped_files
             }
         }
+    }
+
+    /// The files that can reach a narrowed name at all, by how it is written:
+    /// a field, a method, a variant, an associated or a trait's item is named
+    /// as a member (`x.f`, `x.m()`, `T::v`, `Self::new`, `<T as Tr>::k`, in a
+    /// `use` item: `WordIndex::member_files_with`). A field and a variant also
+    /// bare in a literal or a pattern naming the type (`S { f, .. }`, `Self {
+    /// f }` in an `impl` naming `S`, or an alias of it) and a variant after a
+    /// glob import (`use E::*`; `Some`, a variant of std, is not the
+    /// project's); a trait's item is defined bare in an `impl` naming the
+    /// trait. An associated function of an inherent `impl` (`Through`) is
+    /// never bare: no `use S::new`, no glob of a type. The rest of the files
+    /// with the bare word declare it (`fn f`, a binding `let f`, a field `f:`
+    /// of another struct) or name something else: on a day of a ~9000-file
+    /// workspace, a god-type's field `error` with untold holders stood in
+    /// 23.7 k files summed over the commits, 2.9 k of them in this shape. Both bounds are
+    /// sound, so is their intersection with the told side's.
+    ///
+    /// Cost: the word index's member list and the files of the type's names —
+    /// lookups, no lexing.
+    fn shaped(&self, narrow: &Narrow) -> HashSet<FileId> {
+        let words = self.scope.words;
+        let (name, owner) = match narrow {
+            Narrow::Through(name, _) => {
+                return words.member_files_with(name).iter().copied().collect();
+            }
+            Narrow::Holding(name, owner) | Narrow::InScope(name, owner) => (name, owner),
+        };
+        let mut files: HashSet<FileId> = words.member_files_with(name).iter().copied().collect();
+        files.extend(
+            words
+                .names_for(owner)
+                .iter()
+                .flat_map(|owner| words.files_with(owner))
+                .copied(),
+        );
+        files.extend(
+            words
+                .files_with(name)
+                .iter()
+                .copied()
+                .filter(|&file| words.has_glob(file)),
+        );
+        files
     }
 
     /// The files that may hold a value of the type (or trait) `ty`: its
@@ -636,6 +708,7 @@ fn widen_or_why(
     let mut roots: Vec<String> = Vec::new();
     let mut narrow: Vec<Narrow> = Vec::new();
     let mut lexed = 0;
+    let mut widths: HashMap<String, usize> = HashMap::new();
     for (file, witness) in &witnesses {
         match resolve(witness, scope.words) {
             Taken::Plain {
@@ -663,6 +736,7 @@ fn widen_or_why(
                     None => prefixes.extend((scope.module_names)(*file)),
                 }
                 let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
+                let width = widths.entry(format!("{name}@")).or_default();
                 for below_file in reachable_files_with(&name)
                     .into_iter()
                     .filter(|file| below.contains(file))
@@ -675,6 +749,7 @@ fn widen_or_why(
                     };
                     if keep {
                         files.insert(below_file);
+                        *width += 1;
                     }
                 }
                 names.push(format!("{name}@"));
@@ -692,24 +767,33 @@ fn widen_or_why(
     main.names
         .extend(names.iter().filter(|name| !name.ends_with('@')).cloned());
     main.narrow.extend(narrow);
-    files.extend(closer.files_of(&main));
-    let mut shown: Vec<String> = names
-        .into_iter()
-        .chain(main.names)
-        .chain(main.held.into_iter().map(|name| format!("{name}*")))
-        .chain(main.narrow.iter().map(|narrow| {
-            if closer.bare.contains(narrow) {
-                format!("{}!", narrow.shown())
-            } else {
-                narrow.shown()
-            }
-        }))
-        .collect();
+    // `Closer::files_of`, name by name to count each one's files.
+    for (name, shown) in main
+        .names
+        .iter()
+        .map(|name| (name, name.clone()))
+        .chain(main.held.iter().map(|name| (name, format!("{name}*"))))
+    {
+        let of_name: Vec<FileId> = closer.files_with(name).collect();
+        *widths.entry(shown).or_default() += of_name.len();
+        files.extend(of_name);
+    }
+    for narrow in &main.narrow {
+        let of_name = closer.narrowed(narrow);
+        let shown = if closer.bare.contains(narrow) {
+            format!("{}!", narrow.shown())
+        } else {
+            narrow.shown()
+        };
+        *widths.entry(shown).or_default() += of_name.len();
+        files.extend(of_name);
+    }
+    let mut shown: Vec<String> = widths.keys().cloned().collect();
     shown.sort();
-    shown.dedup();
     Ok(Widening::Files {
         files,
         names: shown,
+        widths,
         parsed: closer.parsed.len(),
         expanded: closer.expanded,
         lexed,

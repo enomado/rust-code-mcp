@@ -54,6 +54,9 @@ pub(crate) struct WordIndex {
     /// every named field's declaration (and of struct literal fields, typed
     /// parameters and bindings, which only add candidates). Sorted.
     field_files_of: Vec<Vec<FileId>>,
+    /// By word id: the files where the word stands as a member — right after
+    /// `.` or `::`, or anywhere in a `use` item (`Shape::member`). Sorted.
+    member_files_of: Vec<Vec<FileId>>,
     /// By word id: how many files declare a type of that name — `struct`,
     /// `enum`, `union`, `type`, `trait` right before it, or `as` (an import
     /// alias; a cast `as u32` counts too, which only keeps a name). Whether a
@@ -74,6 +77,7 @@ pub(crate) struct WordIndex {
 struct FileWords {
     words: Vec<u32>,
     fields: Vec<u32>,
+    members: Vec<u32>,
     declared: Vec<u32>,
     glob: bool,
     /// (alias, target); sorted, no duplicates.
@@ -94,6 +98,9 @@ impl WordIndex {
             }
             for word in old.fields {
                 remove_sorted(&mut self.field_files_of[word as usize], file);
+            }
+            for word in old.members {
+                remove_sorted(&mut self.member_files_of[word as usize], file);
             }
             for word in old.declared {
                 self.declaring_files[word as usize] -= 1;
@@ -120,6 +127,9 @@ impl WordIndex {
             if shape.field {
                 new.fields.push(id);
             }
+            if shape.member {
+                new.members.push(id);
+            }
             if shape.declared {
                 new.declared.push(id);
             }
@@ -144,7 +154,12 @@ impl WordIndex {
                 .entry(alias)
                 .or_default() += 1;
         }
-        for list in [&mut new.words, &mut new.fields, &mut new.declared] {
+        for list in [
+            &mut new.words,
+            &mut new.fields,
+            &mut new.members,
+            &mut new.declared,
+        ] {
             list.sort_unstable();
             list.dedup();
         }
@@ -153,6 +168,9 @@ impl WordIndex {
         }
         for &word in &new.fields {
             insert_sorted(&mut self.field_files_of[word as usize], file);
+        }
+        for &word in &new.members {
+            insert_sorted(&mut self.member_files_of[word as usize], file);
         }
         for &word in &new.declared {
             self.declaring_files[word as usize] += 1;
@@ -188,6 +206,18 @@ impl WordIndex {
         let word = word.strip_prefix("r#").unwrap_or(word);
         match self.ids.get(word) {
             Some(&id) => &self.field_files_of[id as usize],
+            None => &[],
+        }
+    }
+
+    /// The files where `word` stands as a member (`x.word`, `T::word`, in a
+    /// `use` item) — a subset of [`Self::files_with`]. How a file names a field,
+    /// a method, a variant or an associated item other than in a literal or a
+    /// pattern naming its type, or through a glob import (`widening`).
+    pub(crate) fn member_files_with(&self, word: &str) -> &[FileId] {
+        let word = word.strip_prefix("r#").unwrap_or(word);
+        match self.ids.get(word) {
+            Some(&id) => &self.member_files_of[id as usize],
             None => &[],
         }
     }
@@ -251,6 +281,7 @@ impl WordIndex {
         self.spelling_of.push(word.into());
         self.files_of.push(Vec::new());
         self.field_files_of.push(Vec::new());
+        self.member_files_of.push(Vec::new());
         self.declaring_files.push(0);
         id
     }
@@ -314,6 +345,10 @@ struct Shape {
     /// The next token past whitespace and comments is a single `:` (a `::`
     /// path separator is two adjacent `:` tokens).
     field: bool,
+    /// The previous one is `.` or `::` (a field or method, a path's segment
+    /// past the first), or the word is in a `use` item (a group's member, an
+    /// alias). A `..word` range counts too, which only adds a file.
+    member: bool,
     /// The previous one is `struct`, `enum`, `union`, `type`, `trait` or `as`.
     declared: bool,
 }
@@ -494,7 +529,23 @@ fn for_each_code_word<'t>(
                     | SyntaxKind::AS_KW
             ) || (lexed.kind(previous - 1) == SyntaxKind::IDENT
                 && lexed.text(previous - 1) == "union"));
-        Shape { field, declared }
+        // `::` is one `COLON2` or two adjacent `COLON`s, as the lexer goes.
+        let member = previous > 0
+            && match lexed.kind(previous - 1) {
+                SyntaxKind::DOT | SyntaxKind::COLON2 => true,
+                SyntaxKind::COLON => {
+                    previous > 1
+                        && lexed.kind(previous - 2) == SyntaxKind::COLON
+                        && lexed.text_range(previous - 2).end
+                            == lexed.text_range(previous - 1).start
+                }
+                _ => false,
+            };
+        Shape {
+            field,
+            member,
+            declared,
+        }
     };
     for token in 0..lexed.len() {
         // Sliced from `text` itself, so the words outlive the lexer.
@@ -600,10 +651,14 @@ fn for_each_code_word<'t>(
             last_two = [last_two[1], kind];
         }
         match kind {
-            SyntaxKind::IDENT => match token_text.strip_prefix("r#") {
-                Some(raw) => visit(start + 2, raw, shape(token)),
-                None => visit(start, token_text, shape(token)),
-            },
+            SyntaxKind::IDENT => {
+                let mut shape = shape(token);
+                shape.member |= in_use.is_some();
+                match token_text.strip_prefix("r#") {
+                    Some(raw) => visit(start + 2, raw, shape),
+                    None => visit(start, token_text, shape),
+                }
+            }
             SyntaxKind::STRING => {
                 for (offset, word) in format_captures(token_text) {
                     visit(start + offset, word, Shape::default());
@@ -712,6 +767,43 @@ fn f(p: &Probe) -> u32 {
         assert_eq!(index.field_shape_files_with("rop"), [file(1)]);
         index.set_file(file(1), None);
         assert!(index.field_shape_files_with("rop").is_empty());
+    }
+
+    /// A member: after `.` or `::` (one `COLON2` token or two `:`), or in a
+    /// `use` item; not a declaration, a binding, a call, a field in a literal.
+    #[test]
+    fn a_member_is_a_word_after_a_dot_or_a_path_separator_or_in_a_use() {
+        let member = |text: &str| {
+            let mut index = WordIndex::default();
+            index.set_file(file(1), Some(text));
+            !index.member_files_with("err").is_empty()
+        };
+        for text in [
+            "fn f(x: S) { x.err; }",
+            "fn f(x: S) { x . err(); }",
+            "fn f() { S::err(); }",
+            "fn f() { Self :: err; }",
+            "fn f() { <S as T>::err(); }",
+            "use a::{b, err};",
+            "use a::b as err;",
+            "fn f() { x.0.err; }",
+        ] {
+            assert!(member(text), "{text}");
+        }
+        for text in [
+            "fn err() {}",
+            "fn f(err: u8) { let err = 1; err(); }",
+            "fn f() { S { err: 1 }; }",
+            "struct S { err: u8 }",
+            "// x.err\nfn f() { \"x.err\"; }",
+        ] {
+            assert!(!member(text), "{text}");
+        }
+        let mut index = WordIndex::default();
+        index.set_file(file(1), Some("fn f(x: S) { x.err; }"));
+        index.set_file(file(1), Some("fn err() {}"));
+        assert!(index.member_files_with("err").is_empty(), "patched away");
+        assert_eq!(index.files_with("err"), [file(1)]);
     }
 
     /// A glob that may bring names from outside the file counts; one of std,

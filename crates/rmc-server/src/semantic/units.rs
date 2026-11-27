@@ -500,9 +500,9 @@ fn is_private(vis: Option<ast::Visibility>) -> bool {
     vis.is_none_or(|vis| vis.syntax().text() == "pub(self)")
 }
 
-/// A struct's or union's reach and holders: its name and each named field's
-/// (a field is reached as `x.field` and in patterns and literals); a tuple
-/// field is reached as `x.0` on any value of the type.
+/// A tuple or unit struct's reach and holders: its name, and a tuple field is
+/// reached as `x.0` on any value of the type — one unit for the whole struct.
+/// Named fields are units of their own ([`member_units`]).
 fn fields_reach(
     name: Option<String>,
     fields: Option<ast::FieldList>,
@@ -510,16 +510,8 @@ fn fields_reach(
     let mut reach: Vec<Witness> = name.clone().into_iter().map(Witness::Name).collect();
     let mut holders = Vec::new();
     match fields {
-        Some(ast::FieldList::RecordFieldList(list)) => {
-            for field in list.fields() {
-                if let Some(field_name) = name_of(&field) {
-                    reach.push(match &name {
-                        Some(owner) => Witness::Both(field_name.clone(), owner.clone()),
-                        None => Witness::Name(field_name.clone()),
-                    });
-                    holders.push(holder(Witness::Name(field_name), refs_of(field.syntax())));
-                }
-            }
+        Some(ast::FieldList::RecordFieldList(_)) => {
+            unreachable!("a struct with named fields is cut by `member_units`")
         }
         Some(ast::FieldList::TupleFieldList(list)) => {
             let held: Vec<String> = name.into_iter().collect();
@@ -534,6 +526,72 @@ fn fields_reach(
         None => {}
     }
     (reach, holders)
+}
+
+/// The units of a struct or union with named fields, or of an enum: a shell —
+/// the item without its list of `members` (attributes, visibility, name,
+/// generics, `where`), reaching the files naming the type — and one unit per
+/// member, its tokens after the shell's, reaching the member's name among the
+/// holders of the type ([`Witness::Both`]; [`Witness::Name`] when the type has
+/// no name) and handing out what the member's type names.
+///
+/// Why not one unit: a new field of a struct with a hundred fields made every
+/// field's users pending (`x.project`, `x.error` … of a god-type, 2026-11-27);
+/// an unchanged field resolves as it did. A changed shell changes every
+/// member's prefix as well, so all members are changed then. A literal or a
+/// pattern that misses a new field, a `match` that misses a new variant, are
+/// errors, not resolutions: the table of uses holds what names resolve to.
+/// Not seen, as before the cut: a field's type changing an auto trait of the
+/// type (`Send`), which a blanket impl's method on a holder may follow.
+fn member_units(
+    item: &ast::Item,
+    name: Option<String>,
+    list: SyntaxKind,
+    members: Vec<(SyntaxNode, Option<String>)>,
+    context: &Context,
+    out: &mut Vec<Unit>,
+) {
+    let private = is_private(visibility_of(item.syntax()));
+    let scoped = |witness: Witness| {
+        if private {
+            scope_name(witness, context)
+        } else {
+            witness
+        }
+    };
+    let mut prefix = header_tokens(item.syntax(), list, &context.prefix);
+    out.push(named(
+        prefix.clone(),
+        name.clone()
+            .into_iter()
+            .map(Witness::Name)
+            .map(scoped)
+            .collect(),
+        Vec::new(),
+    ));
+    prefix.push((SyntaxKind::L_CURLY, "{".to_owned()));
+    for (member, member_name) in members {
+        let mut tokens = prefix.clone();
+        emit_without_bodies(&member, &mut tokens);
+        // A value of a type the member names comes out as `x.f`, `S { f, .. }`,
+        // `E::V(x)` — from a value of the owner: the same witness hands it out
+        // (the bare name reached every `id`, `from` of the workspace).
+        let (reach, holders) = match member_name {
+            Some(member_name) => {
+                let witness = match &name {
+                    Some(owner) => Witness::Both(member_name, owner.clone()),
+                    None => Witness::Name(member_name),
+                };
+                (
+                    vec![scoped(witness.clone())],
+                    vec![holder(witness, refs_of(&member))],
+                )
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        out.push(named(tokens, reach, holders));
+    }
+    nested_units(item.syntax(), context, out);
 }
 
 /// The units of one item at `context`, nested ones included; `as_written`:
@@ -661,33 +719,54 @@ fn item_units(item: &ast::Item, context: &Context, as_written: bool, out: &mut V
             (reach, holders)
         }
         ast::Item::Fn(f) => by_name(name_of(f)),
-        ast::Item::Struct(s) => fields_reach(name_of(s), s.field_list()),
-        ast::Item::Union(u) => fields_reach(
-            name_of(u),
-            u.record_field_list().map(ast::FieldList::RecordFieldList),
-        ),
+        ast::Item::Struct(s) => match s.field_list() {
+            Some(ast::FieldList::RecordFieldList(list)) => {
+                let fields = list
+                    .fields()
+                    .map(|field| (field.syntax().clone(), name_of(&field)))
+                    .collect();
+                return member_units(
+                    item,
+                    name_of(s),
+                    SyntaxKind::RECORD_FIELD_LIST,
+                    fields,
+                    context,
+                    out,
+                );
+            }
+            fields => fields_reach(name_of(s), fields),
+        },
+        ast::Item::Union(u) => {
+            let fields = u
+                .record_field_list()
+                .into_iter()
+                .flat_map(|list| list.fields())
+                .map(|field| (field.syntax().clone(), name_of(&field)))
+                .collect();
+            return member_units(
+                item,
+                name_of(u),
+                SyntaxKind::RECORD_FIELD_LIST,
+                fields,
+                context,
+                out,
+            );
+        }
         ast::Item::Enum(e) => {
-            let enum_name = name_of(e);
-            let mut reach: Vec<Witness> =
-                enum_name.clone().into_iter().map(Witness::Name).collect();
-            let mut holders = Vec::new();
-            for variant in e
+            let variants = e
                 .variant_list()
                 .into_iter()
                 .flat_map(|list| list.variants())
-            {
-                if let Some(variant_name) = name_of(&variant) {
-                    reach.push(match &enum_name {
-                        Some(owner) => Witness::Both(variant_name.clone(), owner.clone()),
-                        None => Witness::Name(variant_name.clone()),
-                    });
-                    holders.push(holder(
-                        Witness::Name(variant_name),
-                        refs_of(variant.syntax()),
-                    ));
-                }
-            }
-            (reach, holders)
+                .map(|variant| (variant.syntax().clone(), name_of(&variant)))
+                .collect();
+            return member_units(
+                item,
+                name_of(e),
+                SyntaxKind::VARIANT_LIST,
+                variants,
+                context,
+                out,
+            );
         }
         ast::Item::TypeAlias(t) => {
             // Where an item names the alias, its target is meant.
@@ -1116,10 +1195,43 @@ mod tests {
             reach("mod m { fn a(x: u8) {} }", "mod m { fn a(x: u16) {} }"),
             ["a@m"]
         );
-        // A struct by its name and fields; a tuple struct by its values too.
+        // A named field by itself, a new one too: the others resolve as they
+        // did. The header (attributes, generics, `where`): the name and every
+        // field. A tuple struct by its name and its values.
         assert_eq!(
-            reach("pub struct S { a: u8 }", "pub struct S { a: u16 }"),
-            ["S", "a&S"]
+            reach(
+                "pub struct S { a: u8, b: u8 }",
+                "pub struct S { a: u16, b: u8 }"
+            ),
+            ["a&S"]
+        );
+        assert_eq!(
+            reach(
+                "pub struct S { a: u8, b: u8 }",
+                "pub struct S { a: u8, b: u8, c: u8 }"
+            ),
+            ["c&S"]
+        );
+        assert_eq!(
+            reach(
+                "pub struct S { a: u8, b: u8 }",
+                "pub struct S { b: u8, a: u8 }"
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            reach(
+                "pub struct S { a: u8, b: u8 }",
+                "pub struct S<T> { a: u8, b: u8 }"
+            ),
+            ["S", "a&S", "b&S"]
+        );
+        assert_eq!(
+            reach(
+                "struct S { a: u8 }",
+                "struct S { a: u8 }\nstruct R { a: u8 }"
+            ),
+            ["R@", "a&R"]
         );
         assert_eq!(
             reach("pub struct S(u8);", "pub struct S(u16);"),
@@ -1127,7 +1239,11 @@ mod tests {
         );
         assert_eq!(
             reach("pub enum E { A }", "pub enum E { A, B(u8) }"),
-            ["A&E", "B&E", "E"]
+            ["B&E"]
+        );
+        assert_eq!(
+            reach("pub enum E { A }", "#[repr(u8)]\npub enum E { A }"),
+            ["A&E", "E"]
         );
         assert_eq!(
             reach("pub type A = u8;", "pub type A = u16;"),
@@ -1210,8 +1326,10 @@ mod tests {
                     use crate::T as Alias;\n";
         assert_eq!(
             handed_out(text, "T"),
+            // A field and a variant: their name among the holders of their
+            // owner, as their change reaches.
             [
-                "V",
+                "V&E",
                 "get&Q",
                 "holds(A)",
                 "holds(Alias)",
@@ -1220,7 +1338,7 @@ mod tests {
                 "make",
                 "next",
                 "out~Tr",
-                "t"
+                "t&S"
             ]
         );
         // An associated function without `self`: through its type.

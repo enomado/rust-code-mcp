@@ -223,12 +223,16 @@ fn widening_census() {
     let mut totals = Totals::default();
     let mut rows: Vec<(usize, usize, String, String)> = Vec::new();
     let mut closure_secs = 0.0;
+    // By commit: the closure's time (ms), files parsed, macros expanded.
+    let mut closure_ms: Vec<usize> = Vec::new();
+    let mut parsed_per_commit: Vec<usize> = Vec::new();
+    let mut expanded_per_commit: Vec<usize> = Vec::new();
     let mut parsed_total = 0;
     let mut lexed_total = 0;
     let mut optimistic_total = 0;
     // By name as the widening shows it (`x@`, `x&T`, `T*`): the files holding
     // its bare word, summed over the commits — an upper bound of its share.
-    let mut widest_names: HashMap<String, usize> = HashMap::new();
+    let mut widest_names: HashMap<String, (usize, usize)> = HashMap::new();
     for commit in commits.lines() {
         totals.commits += 1;
         let changes = git(
@@ -411,6 +415,14 @@ fn widening_census() {
         };
         let clock = Instant::now();
         let widening = widening::widen(&changed, &scope);
+        closure_ms.push(clock.elapsed().as_millis() as usize);
+        if let Widening::Files {
+            parsed, expanded, ..
+        } = &widening
+        {
+            parsed_per_commit.push(*parsed);
+            expanded_per_commit.push(*expanded);
+        }
         if tracing_this {
             let lines = trace.borrow();
             eprintln!("trace of {commit}: {} names", lines.len());
@@ -438,6 +450,7 @@ fn widening_census() {
             Widening::Files {
                 files,
                 names,
+                widths,
                 parsed,
                 expanded,
                 lexed,
@@ -445,20 +458,19 @@ fn widening_census() {
                 lexed_total += lexed;
                 totals.by_names += 1;
                 parsed_total += parsed;
-                // The widest names first: what the count is made of.
-                let mut by_width: Vec<(usize, &String)> = names
-                    .iter()
-                    .map(|name| {
-                        // `x@`, `T*`, `x&T`, `x~Tr`, `T::x`, a `!` when untold.
-                        let bare = name.trim_end_matches(['@', '*', '!']);
-                        let bare = bare.rsplit("::").next().unwrap_or(bare);
-                        let bare = bare.split(['&', '~']).next().unwrap_or(bare);
-                        (words.files_with(bare).len(), name)
-                    })
-                    .collect();
+                // The widest names first: what the count is made of — the
+                // files each made pending, and the files with its bare word.
+                let mut by_width: Vec<(usize, &String)> =
+                    names.iter().map(|name| (widths[name], name)).collect();
                 by_width.sort_by(|a, b| b.0.cmp(&a.0));
                 for (width, name) in &by_width {
-                    *widest_names.entry((*name).clone()).or_default() += width;
+                    // `x@`, `T*`, `x&T`, `x~Tr`, `T::x`, a `!` when untold.
+                    let bare = name.trim_end_matches(['@', '*', '!']);
+                    let bare = bare.rsplit("::").next().unwrap_or(bare);
+                    let bare = bare.split(['&', '~']).next().unwrap_or(bare);
+                    let entry = widest_names.entry((*name).clone()).or_default();
+                    entry.0 += width;
+                    entry.1 += words.files_with(bare).len();
                 }
                 let shown: Vec<String> = by_width
                     .iter()
@@ -512,17 +524,25 @@ fn widening_census() {
     eprintln!(
         "closure: {parsed_total} files parsed, {lexed_total} lexed in {closure_secs:.1} s; {optimistic_total} macros taken optimistically (attribute as written, body macro empty)"
     );
+    eprintln!(
+        "by commit: closure ms {}; parsed {}; expanded {}",
+        quantiles(&closure_ms),
+        quantiles(&parsed_per_commit),
+        quantiles(&expanded_per_commit)
+    );
     eprintln!("\nwhy the crates (commits):");
     let mut reasons: Vec<(&String, &usize)> = totals.reasons.iter().collect();
     reasons.sort_by(|a, b| b.1.cmp(a.1));
     for (why, count) in reasons.iter().take(40) {
         eprintln!("  {count:4}  {why}");
     }
-    let mut widest: Vec<(&String, &usize)> = widest_names.iter().collect();
+    let mut widest: Vec<(&String, &(usize, usize))> = widest_names.iter().collect();
     widest.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-    eprintln!("\nwidest names (files with the bare word, summed over commits):");
-    for (name, width) in widest.iter().take(30) {
-        eprintln!("  {width:7}  {name}");
+    eprintln!(
+        "\nwidest names (files made pending, and files with the bare word, summed over commits):"
+    );
+    for (name, (width, bare)) in widest.iter().take(30) {
+        eprintln!("  {width:7} {bare:7}  {name}");
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0));
     eprintln!("\nwidest by crates (crates → names):");

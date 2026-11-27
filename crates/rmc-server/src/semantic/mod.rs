@@ -1070,10 +1070,17 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
         patched.widening = match &reached {
             None => String::new(),
             Some(widening::Widening::Roots(why)) => format!(" — by the crates: {why}"),
-            Some(widening::Widening::Files { files, names, parsed, expanded, lexed }) => {
+            Some(widening::Widening::Files { files, names, widths, parsed, expanded, lexed }) => {
+                // The widest first, with the files each makes pending.
                 const SHOWN: usize = 8;
+                let mut by_width: Vec<&String> = names.iter().collect();
+                by_width.sort_by_key(|name| std::cmp::Reverse(widths[*name]));
                 let rest = names.len().saturating_sub(SHOWN);
-                let mut shown = names[..names.len().min(SHOWN)].join(", ");
+                let mut shown = by_width[..names.len().min(SHOWN)]
+                    .iter()
+                    .map(|name| format!("{name}:{}", widths[*name]))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 if rest > 0 {
                     shown.push_str(&format!(" (+{rest} more)"));
                 }
@@ -4802,7 +4809,49 @@ edition = "2021"
              pub fn by_trait() -> u8 {\n    a::W.k().map(|x| x).unwrap_or(0)\n}\n"
                 .to_owned()
         }
-        let steps: [(&str, &dyn Fn(&Path), &[&str]); 13] = [
+        // Crate `a` of the member steps: the trait steps' crate, a struct `S`
+        // of named fields, an enum `E` whose variants `a::v` re-exports by a
+        // glob, and an `Outer` whose field derefs to `target`.
+        struct Adt<'s> {
+            two: &'s str,
+            two_value: &'s str,
+            three: bool,
+            first: &'s str,
+            first_value: &'s str,
+            target: &'s str,
+            target_field: &'s str,
+        }
+        fn adt_crate(adt: Adt<'_>) -> String {
+            let (three, three_value) = if adt.three { ("    pub three: u8,\n", " three: 0,") } else { ("", "") };
+            format!(
+                "{}\npub struct S {{\n    pub one: Option<u8>,\n    pub two: {},\n{three}}}\n\n\
+                 pub fn s() -> S {{\n    S {{ one: None, two: {},{three_value} }}\n}}\n\n\
+                 pub enum E {{\n    First({}),\n}}\n\npub fn e() -> E {{\n    E::First({})\n}}\n\n\
+                 pub mod v {{\n    pub use super::E::*;\n}}\n\n\
+                 pub struct Wrap(pub Option<u8>, pub Result<u8, ()>);\n\n\
+                 impl std::ops::Deref for Wrap {{\n    type Target = {};\n    \
+                 fn deref(&self) -> &Self::Target {{\n        &self.{}\n    }}\n}}\n\n\
+                 pub struct Outer {{\n    pub inner: Wrap,\n}}\n\n\
+                 pub fn outer() -> Outer {{\n    Outer {{ inner: Wrap(None, Err(())) }}\n}}\n",
+                trait_crate("Result<u8, ()>", "Err(())"),
+                adt.two,
+                adt.two_value,
+                adt.first,
+                adt.first_value,
+                adt.target,
+                adt.target_field,
+            )
+        }
+        let first_adt = || Adt {
+            two: "Option<u8>",
+            two_value: "None",
+            three: false,
+            first: "Option<u8>",
+            first_value: "None",
+            target: "Option<u8>",
+            target_field: "0",
+        };
+        let steps: [(&str, &dyn Fn(&Path), &[&str]); 18] = [
             (
                 "an edit inside a body",
                 &|root| {
@@ -4970,6 +5019,101 @@ edition = "2021"
                 // `other.rs` calls a `helper` of its own; `plain.rs` reaches
                 // the root's as `super::helper`.
                 &["b/src/lib.rs", "b/src/plain.rs"],
+            ),
+            (
+                "a struct's fields, an enum behind a public glob and a deref, with their users",
+                &|root| {
+                    write_file(&root.join("a/src/lib.rs"), &adt_crate(first_adt()));
+                    write_file(
+                        &root.join("b/src/lib.rs"),
+                        &format!(
+                            "{}\nmod other;\n\nfn helper() -> Result<u8, ()> {{\n    Ok(1)\n}}\n\n\
+                             mod one;\nmod two;\nmod glob;\nmod deref;\n",
+                            b_with_trait()
+                        ),
+                    );
+                    write_file(
+                        &root.join("b/src/one.rs"),
+                        "pub fn one() -> u8 {\n    a::s().one.map(|x| x).unwrap_or(0)\n}\n",
+                    );
+                    write_file(
+                        &root.join("b/src/two.rs"),
+                        "pub fn two() -> u8 {\n    a::s().two.map(|x| x).unwrap_or(0)\n}\n",
+                    );
+                    write_file(
+                        &root.join("b/src/glob.rs"),
+                        "use a::v::*;\n\npub fn g() -> u8 {\n    match a::e() {\n        \
+                         First(x) => x.map(|y| y).unwrap_or(0),\n    }\n}\n",
+                    );
+                    write_file(
+                        &root.join("b/src/deref.rs"),
+                        "pub fn d() -> u8 {\n    a::outer().inner.map(|x| x).unwrap_or(0)\n}\n",
+                    );
+                },
+                // A new public glob: the crates.
+                &[
+                    "a/src/lib.rs",
+                    "b/src/deref.rs",
+                    "b/src/glob.rs",
+                    "b/src/lib.rs",
+                    "b/src/one.rs",
+                    "b/src/other.rs",
+                    "b/src/plain.rs",
+                    "b/src/two.rs",
+                ],
+            ),
+            (
+                "a field's type",
+                &|root| {
+                    let adt = Adt { two: "Result<u8, ()>", two_value: "Err(())", ..first_adt() };
+                    write_file(&root.join("a/src/lib.rs"), &adt_crate(adt))
+                },
+                // `one.rs` reads the other field of `S`: one unit per field.
+                &["a/src/lib.rs", "b/src/two.rs"],
+            ),
+            (
+                "a new field",
+                &|root| {
+                    let adt = Adt { two: "Result<u8, ()>", two_value: "Err(())", three: true, ..first_adt() };
+                    write_file(&root.join("a/src/lib.rs"), &adt_crate(adt))
+                },
+                // Nobody names `three`; the other fields resolve as they did.
+                &["a/src/lib.rs"],
+            ),
+            (
+                "a variant's payload behind a glob",
+                &|root| {
+                    let adt = Adt {
+                        two: "Result<u8, ()>",
+                        two_value: "Err(())",
+                        three: true,
+                        first: "Result<u8, ()>",
+                        first_value: "Err(())",
+                        ..first_adt()
+                    };
+                    write_file(&root.join("a/src/lib.rs"), &adt_crate(adt))
+                },
+                // `glob.rs` names `First` bare and neither `E` nor a path to
+                // it: through its glob import.
+                &["a/src/lib.rs", "b/src/glob.rs"],
+            ),
+            (
+                "a deref's target behind a field",
+                &|root| {
+                    let adt = Adt {
+                        two: "Result<u8, ()>",
+                        two_value: "Err(())",
+                        three: true,
+                        first: "Result<u8, ()>",
+                        first_value: "Err(())",
+                        target: "Result<u8, ()>",
+                        target_field: "1",
+                    };
+                    write_file(&root.join("a/src/lib.rs"), &adt_crate(adt))
+                },
+                // `deref.rs` holds a `Wrap` it never names: `Outer`'s field
+                // `inner` hands it out.
+                &["a/src/lib.rs", "b/src/deref.rs"],
             ),
         ];
         for (edit, apply, expected_pending) in steps {
