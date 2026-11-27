@@ -62,6 +62,9 @@ ra_ap_vfs           = { workspace = true }
 ra_ap_intern        = { workspace = true }
 # The lexer the word index reads code words with (`semantic::word_index`).
 ra_ap_parser        = { workspace = true }
+# The parser a refresh tells a file's surface from its fn bodies with
+# (`semantic::surface`); a dependency of `ra_ap_ide` already.
+ra_ap_syntax        = { workspace = true }
 # The `Arc` rust-analyzer's database inputs are built with (a source root set
 # when a refresh patches an added file in); the lockfile's version.
 triomphe = { version = "0.1.14", default-features = false, features = ["std"] }
@@ -81,7 +84,6 @@ version = "0.1"
 optional = true
 
 [dev-dependencies]
-ra_ap_syntax = { workspace = true }
 # `heap_size::DefMapCensus`, for the def map composition probe.
 ra_ap_hir_def = { workspace = true }
 # `Semantics`, for the identifier census probe (`semantic::use_census`).

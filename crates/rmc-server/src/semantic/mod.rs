@@ -7,12 +7,13 @@ mod loader;
 mod lru_sweep;
 pub(crate) mod position;
 mod rename;
+mod surface;
 mod word_index;
 #[cfg(test)]
 mod use_census;
 mod uses;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{
@@ -608,6 +609,52 @@ struct Patched {
     /// Changed files no load reads (outside every loader entry, or under an
     /// excluded directory) — a reload would not see them either.
     outside: usize,
+    /// Source roots with a surface change (`surface` module header; an added
+    /// or removed file counts as one).
+    surface_changes: usize,
+    /// Files of the table of uses pending after the refresh.
+    uses_pending: usize,
+}
+
+/// The source roots holding files of `changed`'s crates — those whose root
+/// file is in one of the `changed` roots — and of all their transitive reverse
+/// dependencies: where a surface change in `changed` may alter what a use
+/// resolves to.
+///
+/// Cost: one pass over the crate graph (≈ 2000 crates on a ~8000-file
+/// workspace, microseconds), and nothing when `changed` is empty.
+fn roots_depending_on(
+    db: &ra_ap_ide::RootDatabase,
+    changed: &std::collections::BTreeSet<ra_ap_ide_db::base_db::SourceRootId>,
+) -> HashSet<ra_ap_ide_db::base_db::SourceRootId> {
+    use ra_ap_ide_db::base_db::{Crate, SourceDatabase, all_crates, source_root_crates};
+
+    let mut roots = HashSet::new();
+    if changed.is_empty() {
+        return roots;
+    }
+    let mut dependents: HashMap<Crate, Vec<Crate>> = HashMap::new();
+    for &krate in all_crates(db).iter() {
+        for dependency in &krate.data(db).dependencies {
+            dependents.entry(dependency.crate_id).or_default().push(krate);
+        }
+    }
+    let mut seen: HashSet<Crate> = HashSet::new();
+    let mut work: Vec<Crate> = changed
+        .iter()
+        .flat_map(|&root| source_root_crates(db, root).iter().copied())
+        .collect();
+    while let Some(krate) = work.pop() {
+        if !seen.insert(krate) {
+            continue;
+        }
+        roots.insert(db.file_source_root(krate.data(db).root_file_id).source_root_id(db));
+        work.extend(dependents.get(&krate).into_iter().flatten().copied());
+    }
+    // A changed root with no crate of its own (a file outside every crate's
+    // root) still holds its changed files.
+    roots.extend(changed.iter().copied());
+    roots
 }
 
 /// Push the `*.rs` files that changed on disk into an already-loaded analysis:
@@ -712,6 +759,37 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
         return Ok(patched);
     }
 
+    // The source roots of changes that may re-resolve other files' uses
+    // (`surface` module header): an edit that changed the file's surface, an
+    // added or a removed file (the module tree may follow). Decided on the
+    // texts the database holds before the change. Cost: the edited files'
+    // old and new texts parsed once each.
+    let mut surface_roots: std::collections::BTreeSet<SourceRootId> = Default::default();
+    {
+        let db = ctx.host.raw_database();
+        // Dropped before `trigger_cancellation`, which would wait for it.
+        let analysis = ctx.host.analysis();
+        for (_, target, text) in &writes {
+            match target {
+                Target::New(root) => {
+                    surface_roots.insert(*root);
+                }
+                Target::Known(file_id) => {
+                    let old = analysis
+                        .file_text(*file_id)
+                        .expect("the slot is held: nothing writes the database");
+                    if surface::surface_of(&old) != surface::surface_of(text) {
+                        surface_roots.insert(db.file_source_root(*file_id).source_root_id(db));
+                    }
+                }
+            }
+        }
+        for (_, file_id) in &deletions {
+            surface_roots.insert(db.file_source_root(*file_id).source_root_id(db));
+        }
+    }
+    patched.surface_changes = surface_roots.len();
+
     // Queries may still run on snapshots of this project, with the slot let go,
     // and read the `Vfs` beside their snapshot. Cancelling them first (it waits
     // for their snapshots to drop) frees the `Vfs` to write; the slot is held,
@@ -790,18 +868,25 @@ fn apply_tree_change(ctx: &mut ProjectContext, change: &TreeChange) -> Result<Pa
             words.set_file(*file_id, text.as_deref());
         }
     }
-    // The table of uses can no longer vouch for any file: what an unchanged
-    // file resolves to may follow a changed signature elsewhere (`uses` module
-    // header). The changed files themselves are pending, a removed one gone.
+    // The table of uses: the changed files are pending, a removed one gone;
+    // after a surface change also every file whose resolution may follow it —
+    // the files of the changed roots' crates and of their reverse dependencies
+    // (`uses` module header).
     {
+        let db = &*db;
+        let stale_roots = roots_depending_on(db, &surface_roots);
         let mut uses = ctx.uses.write().unwrap_or_else(|poisoned| poisoned.into_inner());
-        uses.mark_all_pending();
+        uses.mark_pending_where(|file| {
+            !stale_roots.is_empty()
+                && stale_roots.contains(&db.file_source_root(file).source_root_id(db))
+        });
         for (file_id, text) in &texts {
             match text {
                 Some(_) => uses.mark_pending(*file_id),
                 None => uses.forget(*file_id),
             }
         }
+        patched.uses_pending = uses.size().1;
     }
 
     let mut change = ChangeWithProcMacros::default();
@@ -1345,13 +1430,16 @@ fn refresh_if_stale(
                 ctx.stamps = current;
                 tracing::info!(
                     "Refreshed {} without a reload: {} edited, {} added, {} removed, {} outside \
-                     the analysis; database loaded {} s ago",
+                     the analysis; database loaded {} s ago; table of uses: {} file(s) pending, \
+                     surface changed in {} root(s)",
                     canonical.display(),
                     patched.edited,
                     patched.added,
                     patched.removed,
                     patched.outside,
-                    ctx.loaded_at.elapsed().as_secs()
+                    ctx.loaded_at.elapsed().as_secs(),
+                    patched.uses_pending,
+                    patched.surface_changes
                 );
                 Ok(())
             }
@@ -3734,8 +3822,9 @@ pub fn hooked() {
         assert_eq!(stored.cost.files_from_table, 2, "{stored:?}");
     }
 
-    /// A refresh leaves no file ready (until `uses-freshness` can tell which
-    /// stay true): the edited file's new call is in the answer, swept live.
+    /// A refresh that adds an item leaves no file of the crate ready (a surface
+    /// change, `surface` module header): the edited file's new call is in the
+    /// answer, swept live.
     #[test]
     fn an_edit_after_the_table_is_built_is_answered_live() {
         let _analysis = holding_an_analysis();
@@ -3844,6 +3933,178 @@ pub fn hooked() {
             assert_eq!(found.cost.files_read, 0, "n={n}: {found:?}");
             assert_eq!(found.cost.files_from_table, n, "n={n}: {found:?}");
         }
+    }
+
+    /// Three packages: `b` depends on `a` and resolves `.map` / `.unwrap_or`
+    /// on what `a::get` returns; `a/src/more.rs` does the same inside `a`;
+    /// `c` depends on nothing local.
+    fn freshness_workspace(root: &Path) {
+        write_file(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
+        );
+        for (name, deps) in [("a", ""), ("b", "a = { path = \"../a\" }\n"), ("c", "")] {
+            write_file(
+                &root.join(format!("{name}/Cargo.toml")),
+                &format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                     [dependencies]\n{deps}"
+                ),
+            );
+        }
+        write_file(
+            &root.join("a/src/lib.rs"),
+            "mod more;\n\npub fn get() -> Option<u8> {\n    Some(1)\n}\n",
+        );
+        write_file(
+            &root.join("a/src/more.rs"),
+            "pub fn twice() -> u8 {\n    crate::get().map(|x| x * 2).unwrap_or(0)\n}\n",
+        );
+        write_file(
+            &root.join("b/src/lib.rs"),
+            "pub fn use_it() -> u8 {\n    a::get().map(|x| x + 1).unwrap_or(0)\n}\n",
+        );
+        write_file(
+            &root.join("c/src/lib.rs"),
+            "pub fn other() {\n    std::thread::spawn(|| {}).join().unwrap();\n}\n",
+        );
+    }
+
+    /// The table of uses of `root` as paths — comparable across two loads —
+    /// and its pending files, relative to `root`.
+    #[allow(clippy::type_complexity)]
+    fn use_table_by_path(
+        service: &SemanticService,
+        root: &Path,
+    ) -> (Vec<(String, u32, String, u32)>, Vec<String>) {
+        let canonical = root.canonicalize().expect("canonicalize the workspace");
+        service.with_context_for_test(&canonical, |ctx| {
+            let vfs = read_vfs(&ctx.vfs);
+            let path_of = |file: ra_ap_vfs::FileId| {
+                let path = vfs.file_path(file).to_string();
+                path.strip_prefix(&format!("{}/", canonical.display()))
+                    .map_or(path.clone(), str::to_owned)
+            };
+            let uses = read_uses(&ctx.uses);
+            let mut rows: Vec<_> = uses
+                .rows()
+                .into_iter()
+                .map(|(file, start, (decl_file, decl_at))| {
+                    (path_of(file), u32::from(start), path_of(decl_file), u32::from(decl_at))
+                })
+                .collect();
+            rows.sort();
+            let pending = uses.pending().iter().map(|&file| path_of(file)).collect();
+            (rows, pending)
+        })
+    }
+
+    /// The table a fresh load of `root` builds, by path.
+    fn fresh_use_table(root: &Path) -> Vec<(String, u32, String, u32)> {
+        let service = SemanticService::new();
+        fill_use_table(&service, root);
+        use_table_by_path(&service, root).0
+    }
+
+    /// `uses-freshness`: a refresh makes pending only what may now resolve
+    /// differently — the edited file for an edit inside a body; the files of
+    /// its crate and of the crates depending on it for a surface change (a
+    /// signature, an `impl` inside a body, a new or a removed file) — and the
+    /// table rebuilt from there is the table a fresh load builds, after every
+    /// kind of edit. The signature edit re-resolves `.map` in files that did
+    /// not change (`Option::map` → `Result::map` in `b` and in `a/src/more.rs`):
+    /// keeping them ready would leave rows of a type that is gone.
+    #[test]
+    fn after_each_edit_the_table_rebuilt_from_its_pending_files_is_a_fresh_one() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        freshness_workspace(root);
+        let service = SemanticService::new();
+        fill_use_table(&service, root);
+        let (built, pending) = use_table_by_path(&service, root);
+        assert!(pending.is_empty(), "{pending:?}");
+        assert!(
+            built.iter().any(|row| row.0 == "b/src/lib.rs" && row.2.ends_with("option.rs")),
+            "`.map` in b resolves into core's option.rs: {built:?}"
+        );
+        assert_eq!(built, fresh_use_table(root), "a built table is a fresh one");
+
+        let a_crate = ["a/src/lib.rs", "a/src/more.rs", "b/src/lib.rs"];
+        let steps: [(&str, &dyn Fn(&Path), &[&str]); 5] = [
+            (
+                "an edit inside a body",
+                &|root| {
+                    write_file(
+                        &root.join("a/src/lib.rs"),
+                        "mod more;\n\npub fn get() -> Option<u8> {\n    println!(\"{}\", 2);\n    Some(2)\n}\n",
+                    )
+                },
+                &["a/src/lib.rs"],
+            ),
+            (
+                "an impl inside a body",
+                &|root| {
+                    write_file(
+                        &root.join("a/src/lib.rs"),
+                        "mod more;\n\npub struct W;\n\npub fn get() -> Option<u8> {\n    \
+                         impl W {\n        pub fn w(&self) {}\n    }\n    Some(2)\n}\n",
+                    )
+                },
+                &a_crate,
+            ),
+            (
+                "a signature",
+                &|root| {
+                    write_file(
+                        &root.join("a/src/lib.rs"),
+                        "mod more;\n\npub fn get() -> Result<u8, ()> {\n    Ok(1)\n}\n",
+                    )
+                },
+                &a_crate,
+            ),
+            (
+                "a new file",
+                &|root| {
+                    write_file(
+                        &root.join("c/src/lib.rs"),
+                        "mod extra;\n\npub fn other() {\n    std::thread::spawn(|| {}).join().unwrap();\n}\n",
+                    );
+                    write_file(
+                        &root.join("c/src/extra.rs"),
+                        "pub fn more() {\n    std::thread::spawn(|| {});\n}\n",
+                    );
+                },
+                &["c/src/extra.rs", "c/src/lib.rs"],
+            ),
+            (
+                "a removed file",
+                &|root| {
+                    write_file(
+                        &root.join("a/src/lib.rs"),
+                        "pub fn get() -> Result<u8, ()> {\n    Ok(1)\n}\n",
+                    );
+                    fs::remove_file(root.join("a/src/more.rs")).expect("remove more.rs");
+                },
+                &["a/src/lib.rs", "b/src/lib.rs"],
+            ),
+        ];
+        for (edit, apply, expected_pending) in steps {
+            apply(root);
+            service.get_or_load_full(root).expect("refresh");
+            let (_, mut pending) = use_table_by_path(&service, root);
+            pending.sort();
+            assert_eq!(pending, expected_pending, "{edit}: what is pending");
+            fill_use_table(&service, root);
+            let (rebuilt, pending) = use_table_by_path(&service, root);
+            assert!(pending.is_empty(), "{edit}: {pending:?}");
+            assert_eq!(rebuilt, fresh_use_table(root), "{edit}: the rebuilt table is a fresh one");
+        }
+        let (rebuilt, _) = use_table_by_path(&service, root);
+        assert!(
+            rebuilt.iter().any(|row| row.0 == "b/src/lib.rs" && row.2.ends_with("result.rs")),
+            "`.map` in b follows the new signature into result.rs: {rebuilt:?}"
+        );
     }
 
     /// Probe kept for the record (run with `--ignored --nocapture`): what the

@@ -15,12 +15,17 @@ use crate::semantic::{SemanticService, SemanticServiceStatus, UsesBatch};
 /// ([`ServerRuntime::start_uses_builder`]); `0` — no builder, every library
 /// reference query sweeps live.
 ///
-/// Off by default until a refresh can keep the ready files it does not
-/// affect (`uses-freshness` of the plan): today any change makes every file
-/// pending again, and on a workspace edited every few minutes the builder —
-/// ≈ 13 min of a core on ~8000 files — would never finish and only burn the
-/// cores.
+/// One thread by default ([`DEFAULT_USES_THREADS`]). A refresh keeps ready
+/// what an edit cannot re-resolve (`semantic::surface`): an edit inside a fn
+/// body leaves one file to rebuild, a signature edit its crate and the crates
+/// depending on it. The full build after a load is ≈ 13 min of a core on
+/// ~8000 files (measured on 318 files, ×21); more threads finish sooner but
+/// take cores from the queries of every client of the daemon, and the
+/// transient memory of a pass grows with the threads.
 pub const USES_THREADS_ENV: &str = "RMC_USES_THREADS";
+
+/// [`USES_THREADS_ENV`] when unset; see there.
+const DEFAULT_USES_THREADS: usize = 1;
 
 /// Files each builder thread takes per batch: ≈ 100 ms a file, so a batch
 /// holds the analysis gate for about a second — the longest a collection
@@ -39,11 +44,12 @@ const USES_STALE_PAUSE: Duration = Duration::from_millis(100);
 const USES_COLLECTION_YIELD_MAX: Duration = Duration::from_secs(40);
 const USES_COLLECTION_POLL: Duration = Duration::from_millis(250);
 
-/// [`USES_THREADS_ENV`], `0` when unset. A value that is not a number stops
-/// the daemon at start rather than quietly running without the builder.
+/// [`USES_THREADS_ENV`], [`DEFAULT_USES_THREADS`] when unset. A value that
+/// is not a number stops the daemon at start rather than quietly running
+/// without the builder.
 pub fn uses_builder_threads() -> usize {
     match std::env::var(USES_THREADS_ENV) {
-        Err(_) => 0,
+        Err(_) => DEFAULT_USES_THREADS,
         Ok(value) => value.trim().parse().unwrap_or_else(|_| {
             panic!("{USES_THREADS_ENV}={value:?} is not a number of threads")
         }),

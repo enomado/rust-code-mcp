@@ -27,10 +27,14 @@
 //!
 //! What an occurrence resolves to depends on more than its own file: `.map` on
 //! a value whose type comes from another crate's signature. So a refresh does
-//! not get to keep a file ready just because its text is unchanged — for now
-//! every change makes every file pending again ([`UseTable::mark_all_pending`]);
-//! narrowing that to the changed file and what depends on its surface is the
-//! plan's `uses-freshness`.
+//! not get to keep a file ready just because its text is unchanged. What it
+//! does (`apply_tree_change`): an edited file is pending; if its **surface**
+//! changed (`super::surface` — the file without its private fn bodies), or a
+//! file was added or removed (the module tree may change), every file of the
+//! crates whose root is in that file's source root, and of all their
+//! transitive reverse dependencies, is pending too
+//! ([`UseTable::mark_pending_where`]). An edit inside a body therefore costs
+//! one file; an edit of a signature in a leaf crate costs that crate.
 //!
 //! # Cost
 //!
@@ -191,11 +195,13 @@ impl UseTable {
         self.invalidated();
     }
 
-    /// Make every file pending — what a refresh does until the table can tell
-    /// which ready files a change leaves describing the truth (module header).
+    /// Make every file pending — what a refresh did before it could tell which
+    /// ready files a change leaves describing the truth; the tests' blunt
+    /// invalidation now.
     ///
     /// Bumps the generation even when every file already was pending: a batch
     /// in flight was computed on the texts before the change.
+    #[cfg(test)]
     pub(crate) fn mark_all_pending(&mut self) {
         let ready: Vec<FileId> = self.uses_of.keys().copied().collect();
         for file in ready {
@@ -203,6 +209,36 @@ impl UseTable {
             self.pending.insert(file);
         }
         self.invalidated();
+    }
+
+    /// Make pending every ready file `stale` picks — the files a surface change
+    /// may have re-resolved (`apply_tree_change`). One generation bump for the
+    /// lot, even when it picks none: the caller marks the changed files right
+    /// after, and a batch in flight is stale either way.
+    ///
+    /// Cost: `stale` once per ready file.
+    pub(crate) fn mark_pending_where(&mut self, mut stale: impl FnMut(FileId) -> bool) {
+        let picked: Vec<FileId> = self.uses_of.keys().copied().filter(|&file| stale(file)).collect();
+        for file in picked {
+            self.drop_rows(file);
+            self.pending.insert(file);
+        }
+        self.invalidated();
+    }
+
+    /// Every row of the ready files, as (file, word start, key), sorted — what
+    /// a test compares with a table built from scratch.
+    #[cfg(test)]
+    pub(crate) fn rows(&self) -> Vec<(FileId, TextSize, DeclKey)> {
+        let keys: HashMap<u32, DeclKey> = self.ids.iter().map(|(&key, &id)| (id, key)).collect();
+        let mut rows: Vec<_> = self
+            .uses_of
+            .iter()
+            .flat_map(|(&file, uses)| uses.iter().map(move |&(id, start)| (file, start, id)))
+            .map(|(file, start, id)| (file, start, keys[&id]))
+            .collect();
+        rows.sort();
+        rows
     }
 
     /// `file` left the analysis: neither ready nor pending.
