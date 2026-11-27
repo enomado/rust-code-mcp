@@ -1099,6 +1099,10 @@ pub(crate) struct SemanticService {
     /// Admits a load only when its measured peak fits the machine; a leaf
     /// lock, taken under a project's slot. See [`load_gate`].
     gate: load_gate::LoadGate,
+    /// Evict the LRU memos over capacity after each query ([`evict_when_idle`]).
+    /// Off only for the capacity sweep (`lru_sweep`), which prices what a
+    /// garbage collection evicts and so needs the query to leave its memos.
+    evict_after_queries: bool,
 }
 
 /// The map of contexts and what orders their eviction. Lock level 2.
@@ -1172,6 +1176,48 @@ impl Drop for QueryInFlight<'_> {
     fn drop(&mut self) {
         self.0.queries_in_flight.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// Evict the LRU-capped memos over capacity (`parse` keeps 128 trees,
+/// `parse_macro_expansion` 512) if no query and no batch of the uses builder
+/// has a snapshot of the project; returns whether it did.
+///
+/// # Why after a query (plan item `heavy-query-eviction`, 2026-11-27)
+///
+/// salsa evicts an LRU memo only at a new revision or on this call. A query
+/// that sweeps thousands of files — `find_references` over files the table of
+/// uses has not described yet — parses each of them inside one revision, and
+/// every tree stayed alive until the next refresh or the five-minute garbage
+/// collection: `parse` measured 0.96 GB on a live daemon
+/// (`RA_MEMORY_FINDINGS` §3).
+///
+/// # Why only when idle, and why that is exact
+///
+/// The eviction takes the database mutably, which cancels every snapshot in
+/// flight — a query would be asked again for nothing, and a cancelled
+/// fixpoint cycle is only cleared by a revision bump, which an eviction does
+/// not make (`loader::prime_in_batches`). `queries_in_flight` is raised under
+/// the slot's lock beside taking the snapshot, so reading 0 under that lock
+/// means no snapshot exists. With one in flight nothing is lost by skipping:
+/// the one that ends last finds 0 and evicts. A lock held by somebody else
+/// (a load, a refresh — a new revision evicts by itself — or another query
+/// taking its snapshot) is the same case.
+fn evict_when_idle(slot: &ProjectSlot) -> bool {
+    if slot.queries_in_flight.load(Ordering::SeqCst) != 0 {
+        return false;
+    }
+    let Ok(mut guard) = slot.context.try_lock() else {
+        return false;
+    };
+    if slot.queries_in_flight.load(Ordering::SeqCst) != 0 {
+        return false;
+    }
+    let Some(ctx) = guard.as_mut() else {
+        return false;
+    };
+    use ra_ap_ide_db::base_db::salsa::Database as _;
+    ctx.host.raw_database_mut().trigger_lru_eviction();
+    true
 }
 
 /// What one call of [`SemanticService::build_uses_batch`] did.
@@ -1618,7 +1664,17 @@ impl SemanticService {
                 clock: 0,
             }),
             gate: load_gate::LoadGate::from_install(),
+            evict_after_queries: true,
         }
+    }
+
+    /// A service whose queries leave their memos for the next collection —
+    /// see [`Self::evict_after_queries`].
+    #[cfg(test)]
+    pub(super) fn without_eviction_after_queries() -> Self {
+        let mut service = Self::new();
+        service.evict_after_queries = false;
+        service
     }
 
     /// A service whose loads go through `gate` rather than the process's
@@ -1993,6 +2049,9 @@ impl SemanticService {
                 use ra_ap_ide_db::base_db::salsa::Database as _;
                 ctx.host.raw_database_mut().trigger_lru_eviction();
             }
+            // The batch's snapshots count as a query's: an eviction after a
+            // query ending meanwhile would cancel the whole batch.
+            let in_flight = QueryInFlight::begin(&slot);
             let analyses: Vec<Analysis> =
                 (0..threads.min(files.len())).map(|_| ctx.host.analysis()).collect();
             let uses = Arc::clone(&ctx.uses);
@@ -2005,6 +2064,9 @@ impl SemanticService {
                 &files,
                 crate::deep_stack::ANALYSIS_STACK_BYTES,
             );
+            drop(in_flight);
+            // The last batch's trees too, not only the next batch's start.
+            evict_when_idle(&slot);
             let path_of = |file| read_vfs(&vfs).file_path(file).to_string();
             let mut table = uses.write().unwrap_or_else(|poisoned| poisoned.into_inner());
             let interrupted: Vec<(String, u32)> = batch
@@ -2157,6 +2219,9 @@ impl SemanticService {
     /// The one door every served path and every probe goes through: the lock
     /// order in [`SemanticService`]'s header holds because nothing else takes
     /// a slot for rust-analyzer work.
+    ///
+    /// When the answer is back and every snapshot of the call is gone, the
+    /// LRU memos the query left over capacity are evicted ([`evict_when_idle`]).
     fn with_project<T>(
         &self,
         project_path: &Path,
@@ -2165,7 +2230,22 @@ impl SemanticService {
     ) -> Result<T> {
         let canonical = project_path.canonicalize()?;
         let slot = self.slot_for(&canonical);
-        let _spoil = SpoilOnPanic(&slot);
+        let answer = self.answer_on(&canonical, &slot, requested, work);
+        if self.evict_after_queries {
+            evict_when_idle(&slot);
+        }
+        answer
+    }
+
+    /// [`Self::with_project`] without the eviction after it.
+    fn answer_on<T>(
+        &self,
+        canonical: &Path,
+        slot: &ProjectSlot,
+        requested: LoadKind,
+        work: impl Fn(&Path, &Analysis, &Vfs, &Indexes<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let _spoil = SpoilOnPanic(slot);
         for attempt in 1..=QUERY_ATTEMPTS {
             let context = self.up_to_date(&canonical, &slot, requested)?;
             let ctx = context.as_ref().unwrap();
@@ -2435,15 +2515,26 @@ impl SemanticService {
         })
     }
 
-    /// Preview rename of a symbol by name. Does not modify any files.
+    /// Preview rename of a symbol by name. Does not modify any files. The
+    /// declarations are `find_definition`'s, its sweep bounded by `budget`
+    /// (`rename::rename_by_name`).
     pub(crate) fn rename_by_name(
         &self,
         project_path: &Path,
         symbol_name: &str,
         new_name: &str,
+        budget: std::time::Duration,
     ) -> Result<RenamePreview> {
-        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, _| {
-            rename::rename_by_name(analysis, vfs, symbol_name, new_name)
+        self.with_project(project_path, LoadKind::Full, |_, analysis, vfs, indexes| {
+            rename::rename_by_name(
+                analysis,
+                indexes.db,
+                vfs,
+                indexes.words,
+                symbol_name,
+                new_name,
+                position::SweepBudget::of(budget),
+            )
         })
     }
 
@@ -2688,6 +2779,62 @@ pub fn first() {
         assert!(
             load_gate::read_price(&prices_dir, &canonical).is_some_and(|mb| mb > 0),
             "the load's measured peak is kept as its price"
+        );
+    }
+
+    /// A query that parses more files than `parse` keeps (`lru = 128`) leaves
+    /// no more than that many trees behind: the eviction after the query, not
+    /// the next garbage collection, drops the rest. Two hundred modules, each
+    /// calling `target`; the table of uses is still all pending (no builder in
+    /// a test), so `find_references` sweeps — parses — every one of them.
+    #[test]
+    fn a_sweeping_query_leaves_at_most_the_lru_capacity_of_trees() {
+        const MODULES: usize = 200;
+        const PARSE_LRU: usize = 128;
+        let dir = tempfile::tempdir().expect("create workspace tempdir");
+        let root = dir.path();
+        write_file(
+            &root.join("Cargo.toml"),
+            "[package]\nname = \"sweep_probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        let mut lib = String::from("pub fn target() {}\n");
+        for m in 0..MODULES {
+            lib.push_str(&format!("pub mod m{m};\n"));
+            write_file(
+                &root.join(format!("src/m{m}.rs")),
+                &format!("pub fn f{m}() {{ crate::target(); }}\n"),
+            );
+        }
+        write_file(&root.join("src/lib.rs"), &lib);
+
+        // Heap, not `count`: an evicted memo keeps its entry with the value
+        // dropped, so the count is every file ever parsed (1266 here, with
+        // the sysroot) whatever was evicted.
+        let parse_heap = |service: &SemanticService| -> usize {
+            let report = service.memory_breakdown(root, 0).expect("memory report");
+            report
+                .rows
+                .iter()
+                .find(|row| row.name == "EditionedFileId::parse_")
+                .and_then(|row| row.heap_bytes)
+                .expect("the fork weighs `parse` memos")
+        };
+        let service = SemanticService::new();
+        // The load primes in batches and evicts after the last: what it
+        // leaves is the LRU's 128 trees, the yardstick.
+        service.get_or_load_full(root).expect("load");
+        let after_load = parse_heap(&service);
+        let refs = service
+            .find_references_by_name_with_exact(root, "target", true)
+            .expect("references");
+        assert_eq!(call_sites(&refs), MODULES, "every module's call is found");
+        let after_query = parse_heap(&service);
+        // Measured 2026-11-27: 295 840 B after the load and after the query
+        // with the eviction; 1 682 800 B (5.7×) without it.
+        assert!(
+            after_query <= 2 * after_load,
+            "the query left {after_query} B of parse trees, the load {after_load} B: the trees \
+             over the LRU's {PARSE_LRU} were not evicted after the query"
         );
     }
 

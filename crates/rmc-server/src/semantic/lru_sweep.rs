@@ -442,7 +442,8 @@ path = "src/lib.rs"
     /// memoized before any capacity is priced.
     fn probed_service(root: &Path) -> (SemanticService, Probe) {
         let probe = Probe::Symbols { name: "probe_target".to_string() };
-        let mut service = SemanticService::new();
+        // Queries must leave their memos: the collection is what is priced.
+        let mut service = SemanticService::without_eviction_after_queries();
         let found = probe.run(&mut service, root);
         assert!(
             found > 0,
@@ -713,7 +714,8 @@ path = "src/lib.rs"
             &std::env::var("RMC_LRU_SWEEP").unwrap_or_else(|_| "128,32,8,1".to_string()),
         );
 
-        let mut service = SemanticService::new();
+        // Queries must leave their memos: the collection is what is priced.
+        let mut service = SemanticService::without_eviction_after_queries();
         let started = std::time::Instant::now();
         let found = probe.run(&mut service, &project);
         println!(
