@@ -2045,6 +2045,17 @@ pub async fn run_daemon(
         describe_machine(machine_now, limits.min_available_mb),
         MIN_AVAILABLE_ENV,
     );
+    // Before the first tool can load anything: the storm of 2026-11-27 was a
+    // fresh daemon whose very first tool loaded the workspace into a machine
+    // with no room for it.
+    let gate = rmc_server::semantic::load_gate::GateConfig::for_daemon(limits.min_available_mb);
+    tracing::info!(
+        "load admission: a project load starts only when its peak measured at its last load, \
+         plus the loads in flight, fits above the {} MB floor; prices in {}",
+        limits.min_available_mb,
+        gate.prices_dir.display(),
+    );
+    rmc_server::semantic::load_gate::install(gate);
     let retire_grace = retire_grace_from_env();
     tracing::info!(
         "retire deadline: a retired daemon exits after {:?} even with clients attached ({} to change; 0 waits forever)",

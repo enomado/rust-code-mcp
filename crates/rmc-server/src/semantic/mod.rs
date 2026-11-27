@@ -1,5 +1,6 @@
 //! Semantic code analysis using rust-analyzer
 
+pub mod load_gate;
 mod loader;
 /// Pricing an LRU capacity at both ends — bytes handed back against the time the
 /// next query pays for them. Measurement only, so it ships with the tests.
@@ -1095,6 +1096,9 @@ fn max_projects_from_env() -> usize {
 /// interner sweep is process-wide whatever lock a context has.
 pub(crate) struct SemanticService {
     registry: Mutex<Registry>,
+    /// Admits a load only when its measured peak fits the machine; a leaf
+    /// lock, taken under a project's slot. See [`load_gate`].
+    gate: load_gate::LoadGate,
 }
 
 /// The map of contexts and what orders their eviction. Lock level 2.
@@ -1345,6 +1349,7 @@ fn is_cancellation(error: &anyhow::Error) -> bool {
 /// Load `canonical` into its slot, or refresh what is there. The caller holds
 /// the slot's lock.
 fn bring_up_to_date(
+    gate: &load_gate::LoadGate,
     slot: &ProjectSlot,
     context: &mut Option<ProjectContext>,
     canonical: &Path,
@@ -1360,11 +1365,11 @@ fn bring_up_to_date(
         } else {
             LoadReason::NotLoaded
         };
-        load_into(slot, context, canonical, requested, reason)
+        load_into(gate, slot, context, canonical, requested, reason)
     } else {
         // Cached — but "cached" said nothing about "current" until this call
         // existed. See [`refresh_if_stale`].
-        refresh_if_stale(slot, context, canonical, requested)
+        refresh_if_stale(gate, slot, context, canonical, requested)
     }
 }
 
@@ -1398,6 +1403,7 @@ impl LoadReason {
 }
 
 fn load_into(
+    gate: &load_gate::LoadGate,
     slot: &ProjectSlot,
     context: &mut Option<ProjectContext>,
     canonical: &Path,
@@ -1447,10 +1453,16 @@ fn load_into(
         drop(previous);
         crate::mcp::memory::release_free_memory();
     }
-    let (host, vfs, layout) = match requested {
-        LoadKind::Fast => loader::load_project(canonical)?,
-        LoadKind::Full => loader::load_project_full(canonical)?,
-    };
+    // Checked after the old context is gone — its memory is free for this
+    // load — and before anything of the new one is allocated. A refusal
+    // leaves the project unloaded, like any failed load. The measured span is
+    // the load itself; the word index and the table of uses below are small
+    // beside it.
+    let admitted = gate.admit(canonical)?;
+    let (host, vfs, layout) = admitted.measure(|| match requested {
+        LoadKind::Fast => loader::load_project(canonical),
+        LoadKind::Full => loader::load_project_full(canonical),
+    })?;
     // The one exception to stamping before the load: `cargo metadata` writes
     // the workspace's lockfile itself (creates it, or updates it after a
     // manifest changed). Stamped before, the load's own write would read as a
@@ -1529,6 +1541,7 @@ fn load_into(
 /// workspace where a fleet of agents adds test modules all day that was 72
 /// reloads in four days (6638 s of loading), most of the calls over 40 s.
 fn refresh_if_stale(
+    gate: &load_gate::LoadGate,
     slot: &ProjectSlot,
     context: &mut Option<ProjectContext>,
     canonical: &Path,
@@ -1552,7 +1565,7 @@ fn refresh_if_stale(
                 manifest.display(),
                 canonical.display()
             );
-            load_into(slot, context, canonical, requested, LoadReason::ManifestChanged)
+            load_into(gate, slot, context, canonical, requested, LoadReason::ManifestChanged)
         }
         Staleness::Changed(change) => match apply_tree_change(ctx, &change) {
             Ok(patched) => {
@@ -1583,7 +1596,7 @@ fn refresh_if_stale(
                     "Cannot patch {} incrementally ({e}); reloading",
                     canonical.display()
                 );
-                load_into(slot, context, canonical, requested, LoadReason::CannotPatch)
+                load_into(gate, slot, context, canonical, requested, LoadReason::CannotPatch)
             }
         },
     }
@@ -1604,7 +1617,17 @@ impl SemanticService {
                 max_projects,
                 clock: 0,
             }),
+            gate: load_gate::LoadGate::from_install(),
         }
+    }
+
+    /// A service whose loads go through `gate` rather than the process's
+    /// installed one (a test binary installs none).
+    #[cfg(test)]
+    fn with_gate(gate: load_gate::LoadGate) -> Self {
+        let mut service = Self::with_max_projects(max_projects_from_env());
+        service.gate = gate;
+        service
     }
 
     /// The registry, stepping over poison: every change under it is a single
@@ -2197,7 +2220,7 @@ impl SemanticService {
         requested: LoadKind,
     ) -> Result<MutexGuard<'s, Option<ProjectContext>>> {
         let mut context = slot.lock();
-        let outcome = bring_up_to_date(slot, &mut context, canonical, requested);
+        let outcome = bring_up_to_date(&self.gate, slot, &mut context, canonical, requested);
         let evicted = {
             let mut registry = self.registry();
             match outcome {
@@ -2629,6 +2652,43 @@ pub fn first() {
 "#,
         );
         lib
+    }
+
+    /// The gate is on the load path: a project priced over any machine is
+    /// refused before rust-analyzer allocates anything and is left unloaded;
+    /// without a price it loads, and its measured peak becomes its price.
+    /// The night of 2026-11-26/27 is the refused half — a fresh daemon loading
+    /// the workspace into a machine with no room for it.
+    #[test]
+    fn a_load_goes_through_the_gate_and_prices_the_next_one() {
+        let dir = tempfile::tempdir().expect("create workspace tempdir");
+        let root = dir.path().join("w");
+        one_crate_workspace(&root);
+        let canonical = root.canonicalize().unwrap();
+        let prices_dir = dir.path().join("load-peaks");
+        let service = SemanticService::with_gate(load_gate::LoadGate::fixed(
+            load_gate::GateConfig {
+                floor_mb: 1,
+                prices_dir: prices_dir.clone(),
+            },
+        ));
+
+        load_gate::write_price(&prices_dir, &canonical, 1 << 40);
+        let refused = service
+            .get_or_load_full(&root)
+            .expect_err("a load priced at 2^40 MB must not start");
+        assert!(
+            refused.to_string().contains("no room"),
+            "the tool error says why: {refused:#}"
+        );
+        assert_eq!(service.project_count(), 0, "a refused load leaves nothing loaded");
+
+        std::fs::remove_dir_all(&prices_dir).unwrap();
+        service.get_or_load_full(&root).expect("unpriced load above the floor");
+        assert!(
+            load_gate::read_price(&prices_dir, &canonical).is_some_and(|mb| mb > 0),
+            "the load's measured peak is kept as its price"
+        );
     }
 
     /// The defect: a cached rust-analyzer context was never invalidated, so
