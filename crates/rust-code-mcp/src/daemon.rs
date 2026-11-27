@@ -65,7 +65,7 @@ use fs2::FileExt;
 use rmc_server::mcp::{
     BACKGROUND_SYNC_ENV, EMBEDDING_PROFILE_ENV, EP_CENSUS_ENV, RuntimeClearRequest,
     RuntimeClearScope, RuntimeState, RuntimeTaskReport, ServerRuntime, gpu_vram_budget,
-    mem_available_kib, probe_runtime_dir, release_free_memory, release_idle_gpu_sessions,
+    MachineMemory, PsiShare, machine_memory, mem_available_kib, probe_runtime_dir, release_free_memory, release_idle_gpu_sessions,
     release_query_sessions_once_free, rss_kib,
 };
 use rmc_server::tools::SearchTool;
@@ -381,14 +381,19 @@ with the session asking, and will refuse a relative path rather than resolve it
 against a directory nobody chose.
 
 Memory watchdog (daemon only; 0 disables a threshold):
-  RMC_RSS_SOFT_MB=24576      unload the analysis contexts above this RSS
-  RMC_RSS_HARD_MB=28672      above this, retire: stop taking new clients,
+  RMC_RSS_SOFT_MB            unload the analysis contexts above this RSS
+                             (default 38% of MemTotal; 24576 if unreadable)
+  RMC_RSS_HARD_MB            above this, retire: stop taking new clients,
                              unload contexts, let the current clients finish;
                              a successor is started on demand
+                             (default 45% of MemTotal; 28672 if unreadable)
   RMC_RSS_COOLDOWN_SECS=300  minimum gap between two unloads
-  RMC_MIN_AVAILABLE_MB=6144  unload when the MACHINE has less than this free,
-                             whatever this daemon's own RSS is — the only
-                             reading that sees pressure it did not cause
+  RMC_MIN_AVAILABLE_MB       unload when the MACHINE has less than this free,
+                             whatever this daemon's own RSS is
+                             (default 10% of MemTotal; 6144 if unreadable).
+                             The machine watch also unloads on memory stall
+                             (/proc/pressure/memory) and on swap filling under
+                             twice this floor; 0 turns the whole watch off
   RMC_RETIRE_GRACE_SECS=1800 a retired daemon exits after this even with
                              clients still attached (those connections drop)
   RMC_GC_INTERVAL_SECS=300   how often loaded analyses are garbage-collected;
@@ -623,12 +628,42 @@ const DEFAULT_RSS_COOLDOWN_SECS: u64 = 300;
 /// cannot be read, since an unknown reading must not act like a violated floor.
 const DEFAULT_MIN_AVAILABLE_MB: u64 = 6144;
 
+/// The three MB defaults as shares of `MemTotal`, in percent.
+///
+/// The absolute numbers above were measured on one 61 GiB desktop, and on it
+/// these shares give the same limits to within half a gigabyte (24.1 / 28.5 /
+/// 6.3 GB of 63431 MB). What changes is every other machine: a 32 GB laptop
+/// gets 12 / 14 / 3 GB instead of a soft limit it can never reach before
+/// earlyoom does, and a floor of 10 % keeps above earlyoom's 8 % on any size.
+const SOFT_SHARE_PCT: u64 = 38;
+const HARD_SHARE_PCT: u64 = 45;
+const FLOOR_SHARE_PCT: u64 = 10;
+
+/// Default `(soft, hard, floor)` in MB for a machine of `total_mb`; the
+/// absolute measured defaults where `MemTotal` cannot be read.
+pub fn default_limits_mb(total_mb: Option<u64>) -> (u64, u64, u64) {
+    match total_mb {
+        Some(total) if total > 0 => (
+            total * SOFT_SHARE_PCT / 100,
+            total * HARD_SHARE_PCT / 100,
+            total * FLOOR_SHARE_PCT / 100,
+        ),
+        _ => (
+            DEFAULT_RSS_SOFT_MB,
+            DEFAULT_RSS_HARD_MB,
+            DEFAULT_MIN_AVAILABLE_MB,
+        ),
+    }
+}
+
 impl WatchdogLimits {
     pub fn from_env() -> Self {
+        let (soft, hard, floor) =
+            default_limits_mb(machine_memory().map(|machine| machine.total_mb));
         Self {
-            soft_mb: env_u64(RSS_SOFT_ENV, DEFAULT_RSS_SOFT_MB),
-            hard_mb: env_u64(RSS_HARD_ENV, DEFAULT_RSS_HARD_MB),
-            min_available_mb: env_u64(MIN_AVAILABLE_ENV, DEFAULT_MIN_AVAILABLE_MB),
+            soft_mb: env_u64(RSS_SOFT_ENV, soft),
+            hard_mb: env_u64(RSS_HARD_ENV, hard),
+            min_available_mb: env_u64(MIN_AVAILABLE_ENV, floor),
             cooldown: Duration::from_secs(env_u64(RSS_COOLDOWN_ENV, DEFAULT_RSS_COOLDOWN_SECS)),
         }
     }
@@ -758,21 +793,148 @@ pub fn decide_watchdog_action(
     }
 }
 
-/// One reading of the two numbers the watchdog decides on, in MB.
+/// One reading of what the watchdog decides on, in MB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryReading {
     pub rss_mb: u64,
     pub available_mb: Option<u64>,
+    /// Swap and stall time beside `available_mb`, for [`pressure_level`].
+    /// `None` where `/proc/meminfo` lacks the fields: the RSS limits and the
+    /// floor still decide then, exactly as before the pressure watch existed.
+    pub machine: Option<MachineMemory>,
 }
 
 impl MemoryReading {
     /// `None` where RSS cannot be read — the watchdog then does nothing, as it
     /// always has on such platforms.
     fn now() -> Option<Self> {
+        let machine = machine_memory();
         rss_kib().map(|kib| Self {
             rss_mb: kib / 1024,
-            available_mb: mem_available_kib().map(|kib| kib / 1024),
+            available_mb: machine
+                .map(|machine| machine.available_mb)
+                .or_else(|| mem_available_kib().map(|kib| kib / 1024)),
+            machine,
         })
+    }
+}
+
+/// How hard the machine is pressed for memory, beyond what `MemAvailable`
+/// says. Read by [`decide_for_reading`].
+///
+/// # Why `MemAvailable` alone came too late (2026-11-27)
+///
+/// The station was reset twice by its hardware watchdog in thirty minutes,
+/// each time with `MemAvailable` still reading 4–8 GB — above or near this
+/// daemon's 6 GB floor — and the 16 GB swap already at zero. The floor fired
+/// once, three seconds before earlyoom; the night before it never fired in the
+/// daemon that was serving, because between two 15 s ticks the machine went
+/// from comfortable to killing. Swap filling and tasks stalling on reclaim
+/// come first; `MemAvailable` dropping to the floor comes last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureLevel {
+    /// No stall to speak of, swap not filling under a short machine.
+    Calm,
+    /// The first sign of thrash: tasks wait on memory a tenth of the time, or
+    /// half the swap is gone while `MemAvailable` is under twice the floor.
+    /// Unload, under the usual cooldown.
+    Strained,
+    /// Thrash that lasts or that stalls everything: a minute-long average
+    /// still high, the whole machine stalled, or the swap almost full under a
+    /// short machine. Unload with the short [`SEVERE_UNLOAD_COOLDOWN`].
+    Severe,
+}
+
+/// A tenth of wall time with some task waiting on memory, over ten seconds.
+/// A build that only fills the page cache reads 0 here; this is reclaim and
+/// swap-in, not cache.
+const PSI_STRAINED_SOME_AVG10: PsiShare = PsiShare::percent(10);
+/// A fifth of wall time over a whole minute: no burst, a state.
+const PSI_SEVERE_SOME_AVG60: PsiShare = PsiShare::percent(20);
+/// A tenth of wall time in which *no* task made progress. The watchdog daemon
+/// PID 1 pets is one of the tasks stalled here.
+const PSI_SEVERE_FULL_AVG10: PsiShare = PsiShare::percent(10);
+/// Swap use, in percent of the swap, that counts as strain or as severe — but
+/// only under a short machine (see [`pressure_level`]). Half-used swap next to
+/// 30 GB available is ordinary on this desktop (earlyoom's hourly lines of the
+/// 2026-11-27 morning: 42–54 % swap free beside 27–42 GB available).
+const SWAP_STRAINED_USED_PCT: u64 = 50;
+/// earlyoom's own SIGTERM line is 10 % swap free; be there first.
+const SWAP_SEVERE_USED_PCT: u64 = 90;
+
+/// One minute between unloads while the machine is [`PressureLevel::Severe`],
+/// instead of the five of [`DEFAULT_RSS_COOLDOWN_SECS`]. The five-minute pace
+/// exists so that a healthy daemon does not unload what the next question
+/// reloads; under severe pressure that reload is what has to be undone, and
+/// waiting five minutes is waiting for earlyoom.
+const SEVERE_UNLOAD_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// The level of pressure in one reading. `floor_mb` is the machine floor
+/// ([`WatchdogLimits::min_available_mb`]); "a short machine" is one with less
+/// than twice the floor available. With the floor at `0` (disabled) only the
+/// stall readings count.
+pub fn pressure_level(machine: &MachineMemory, floor_mb: u64) -> PressureLevel {
+    let short = floor_mb > 0 && machine.available_mb < floor_mb.saturating_mul(2);
+    let swap_used_pct = match machine.swap_total_mb {
+        0 => 0,
+        total => total.saturating_sub(machine.swap_free_mb) * 100 / total,
+    };
+    let psi = machine.psi;
+    let severe = psi.is_some_and(|psi| {
+        psi.full_avg10 >= PSI_SEVERE_FULL_AVG10 || psi.some_avg60 >= PSI_SEVERE_SOME_AVG60
+    }) || (short && swap_used_pct >= SWAP_SEVERE_USED_PCT);
+    if severe {
+        return PressureLevel::Severe;
+    }
+    let strained = psi.is_some_and(|psi| psi.some_avg10 >= PSI_STRAINED_SOME_AVG10)
+        || (short && swap_used_pct >= SWAP_STRAINED_USED_PCT);
+    if strained {
+        PressureLevel::Strained
+    } else {
+        PressureLevel::Calm
+    }
+}
+
+/// [`decide_watchdog_action`] plus the machine's pressure.
+///
+/// The RSS limits and the floor decide first, unchanged. Pressure can only add
+/// an `Unload` that they did not ask for, or bring the next one closer —
+/// never a retirement. Retiring under machine pressure was considered and left
+/// out on purpose: a retired daemon keeps its attached sessions until the
+/// grace deadline, while the next new session starts a successor that loads
+/// its own analysis — the 2026-08-29 doubling. That waits for a load gate the
+/// successor obeys.
+///
+/// A floor of `0` turns the whole machine watch off, pressure included: it is
+/// the one documented switch for "do not react to the rest of the machine".
+pub fn decide_for_reading(
+    reading: MemoryReading,
+    limits: WatchdogLimits,
+    since_unload: Option<Duration>,
+    retiring: bool,
+) -> WatchdogAction {
+    let base = decide_watchdog_action(
+        reading.rss_mb,
+        reading.available_mb,
+        limits,
+        since_unload,
+        retiring,
+    );
+    if base != WatchdogAction::None {
+        return base;
+    }
+    let level = match (limits.min_available_mb, reading.machine) {
+        (0, _) | (_, None) => PressureLevel::Calm,
+        (floor, Some(machine)) => pressure_level(&machine, floor),
+    };
+    let cooldown = match level {
+        PressureLevel::Calm => return WatchdogAction::None,
+        PressureLevel::Strained => limits.cooldown,
+        PressureLevel::Severe => limits.cooldown.min(SEVERE_UNLOAD_COOLDOWN),
+    };
+    match since_unload {
+        Some(elapsed) if elapsed < cooldown => WatchdogAction::None,
+        _ => WatchdogAction::Unload,
     }
 }
 
@@ -824,13 +986,7 @@ pub fn watchdog_tick(
     retiring: bool,
     trim: impl FnOnce() -> MemoryReading,
 ) -> WatchdogTick {
-    let raw = decide_watchdog_action(
-        reading.rss_mb,
-        reading.available_mb,
-        limits,
-        since_unload,
-        retiring,
-    );
+    let raw = decide_for_reading(reading, limits, since_unload, retiring);
     let trim_is_due = since_trim.is_none_or(|elapsed| elapsed >= TRIM_COOLDOWN);
     if raw == WatchdogAction::None || !trim_is_due {
         return WatchdogTick {
@@ -840,13 +996,7 @@ pub fn watchdog_tick(
     }
     let after = trim();
     WatchdogTick {
-        action: decide_watchdog_action(
-            after.rss_mb,
-            after.available_mb,
-            limits,
-            since_unload,
-            retiring,
-        ),
+        action: decide_for_reading(after, limits, since_unload, retiring),
         trimmed: Some((reading, after)),
     }
 }
@@ -1588,21 +1738,45 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// The machine half of a watchdog log line: pressure level, swap, stall time.
+/// Without it an unload at "RSS 3 GB, 9 GB available" reads as a bug — the
+/// reason was the swap or the stall, and the line has to say so.
+pub fn describe_machine(machine: Option<MachineMemory>, floor_mb: u64) -> String {
+    let Some(machine) = machine else {
+        return "pressure unknown".to_string();
+    };
+    let psi = machine.psi.map_or_else(
+        || "PSI off".to_string(),
+        |psi| {
+            format!(
+                "PSI some {} (60s {}), full {}",
+                psi.some_avg10, psi.some_avg60, psi.full_avg10
+            )
+        },
+    );
+    format!(
+        "pressure {:?}: swap {} of {} MB used, {psi}",
+        pressure_level(&machine, floor_mb),
+        machine.swap_total_mb.saturating_sub(machine.swap_free_mb),
+        machine.swap_total_mb,
+    )
+}
+
 async fn unload_analysis_contexts(
     runtime: &ServerRuntime,
     retiring: bool,
-    rss_mb: u64,
-    available_mb: Option<u64>,
+    reading: MemoryReading,
     limits: WatchdogLimits,
 ) {
     tracing::warn!(
         "unloading analysis contexts{}: RSS {} MB (soft limit {} MB), \
-         machine has {:?} MB available (floor {} MB)",
+         machine has {:?} MB available (floor {} MB), {}",
         if retiring { " (retired, draining)" } else { "" },
-        rss_mb,
+        reading.rss_mb,
         limits.soft_mb,
-        available_mb,
-        limits.min_available_mb
+        reading.available_mb,
+        limits.min_available_mb,
+        describe_machine(reading.machine, limits.min_available_mb),
     );
     let report = runtime
         .state()
@@ -1663,10 +1837,20 @@ pub async fn run_daemon(
     // daemon never names is a knob nobody knows to reach for. It also reports
     // what it can actually see: on a platform without /proc the floor is dead,
     // and that must be visible at startup rather than inferred from silence.
+    let machine_now = machine_memory();
     tracing::info!(
-        "machine memory floor: unload when less than {} MB is available, now {:?} MB ({} to change; 0 disables)",
+        "machine memory floor: unload when less than {} MB is available, now {:?} MB of {:?} MB; \
+         also on memory stall (PSI some avg10 >= {}, severe at avg60 >= {} or full >= {}) and on swap \
+         {}%/{}% used under twice the floor; {} ({} to change; 0 disables the whole machine watch)",
         limits.min_available_mb,
         mem_available_kib().map(|kib| kib / 1024),
+        machine_now.map(|machine| machine.total_mb),
+        PSI_STRAINED_SOME_AVG10,
+        PSI_SEVERE_SOME_AVG60,
+        PSI_SEVERE_FULL_AVG10,
+        SWAP_STRAINED_USED_PCT,
+        SWAP_SEVERE_USED_PCT,
+        describe_machine(machine_now, limits.min_available_mb),
         MIN_AVAILABLE_ENV,
     );
     let retire_grace = retire_grace_from_env();
@@ -1707,6 +1891,7 @@ pub async fn run_daemon(
     let mut retiring = false;
     let mut retiring_since: Option<SystemTime> = None;
     let mut last_logged_rss_mb: Option<u64> = None;
+    let mut last_level = PressureLevel::Calm;
 
     // Signals must reach the same exit path as an idle timeout. A daemon killed
     // outright leaves its socket file behind; clients survive that (they clear it
@@ -1786,10 +1971,7 @@ pub async fn run_daemon(
             })
             .await
             .expect("watchdog tick is pure apart from the trim and cannot panic");
-            let MemoryReading {
-                rss_mb,
-                available_mb,
-            } = match tick.trimmed {
+            let settled = match tick.trimmed {
                 Some((before, after)) => {
                     last_trim = Some(SystemTime::now());
                     trim_baseline_mb = after.rss_mb;
@@ -1830,6 +2012,28 @@ pub async fn run_daemon(
                 }
                 None => reading,
             };
+            let MemoryReading {
+                rss_mb,
+                available_mb,
+                machine,
+            } = settled;
+            // Every change of level is one line, both ways: the morning after,
+            // "Calm -> Severe at 10:24:58, unloaded at 10:24:58" is the evidence
+            // that the watch saw the thrash, and "-> Calm" says when it passed.
+            let level = match (limits.min_available_mb, machine) {
+                (0, _) | (_, None) => PressureLevel::Calm,
+                (floor, Some(machine)) => pressure_level(&machine, floor),
+            };
+            if level != last_level {
+                tracing::warn!(
+                    "machine memory pressure {:?} -> {:?}: {:?} MB available, {}",
+                    last_level,
+                    level,
+                    available_mb,
+                    describe_machine(machine, limits.min_available_mb),
+                );
+                last_level = level;
+            }
             // Memory returned any other way — an unload, `clear_runtime` — moves
             // the baseline down with it, or growth would be measured from a level
             // the daemon has left.
@@ -1854,7 +2058,7 @@ pub async fn run_daemon(
                     // `retiring` is named too: a retired daemon unloading at 21 GB
                     // reads as a broken soft limit unless the line says which
                     // daemon it came from, and both daemons write to one log file.
-                    unload_analysis_contexts(runtime, retiring, rss_mb, available_mb, limits).await;
+                    unload_analysis_contexts(runtime, retiring, settled, limits).await;
                     last_unload = Some(SystemTime::now());
                 }
                 WatchdogAction::RetireAndUnload => {
@@ -1891,7 +2095,7 @@ pub async fn run_daemon(
                     // load its own context. Do not carry an old five-minute
                     // cooldown into that state; release the retired daemon's
                     // contexts on this very tick.
-                    unload_analysis_contexts(runtime, true, rss_mb, available_mb, limits).await;
+                    unload_analysis_contexts(runtime, true, settled, limits).await;
                     last_unload = Some(SystemTime::now());
                 }
             }
@@ -2100,6 +2304,7 @@ async fn serve_connection(stream: UnixStream, state: RuntimeState) -> Result<(),
 #[cfg(test)]
 mod watchdog_tests {
     use super::*;
+    use rmc_server::mcp::MemoryPsi;
 
     const LIMITS: WatchdogLimits = WatchdogLimits {
         soft_mb: 4096,
@@ -2115,7 +2320,133 @@ mod watchdog_tests {
         MemoryReading {
             rss_mb,
             available_mb: ROOMY,
+            machine: None,
         }
+    }
+
+    /// A 63 GB machine with 16 GB of swap, as this desktop is; each case sets
+    /// only what it is about.
+    fn machine(available_mb: u64, swap_used_mb: u64, psi: Option<MemoryPsi>) -> MachineMemory {
+        MachineMemory {
+            total_mb: 63_431,
+            available_mb,
+            swap_total_mb: 16_383,
+            swap_free_mb: 16_383 - swap_used_mb,
+            psi,
+        }
+    }
+
+    fn psi(some_avg10: u32, some_avg60: u32, full_avg10: u32) -> Option<MemoryPsi> {
+        Some(MemoryPsi {
+            some_avg10: PsiShare::percent(some_avg10),
+            some_avg60: PsiShare::percent(some_avg60),
+            full_avg10: PsiShare::percent(full_avg10),
+        })
+    }
+
+    const CALM_PSI: Option<MemoryPsi> = Some(MemoryPsi {
+        some_avg10: PsiShare(0),
+        some_avg60: PsiShare(0),
+        full_avg10: PsiShare(0),
+    });
+
+    /// The oracle of `pressure_level`: inputs → level, one row per rule and
+    /// one per boundary. Floor 6144, so "short" is under 12288 available.
+    #[test]
+    fn pressure_level_table() {
+        use PressureLevel::*;
+        let rows: &[(&str, MachineMemory, PressureLevel)] = &[
+            ("idle desktop", machine(40_000, 0, CALM_PSI), Calm),
+            // The 2026-11-27 07:14 reading: half the swap gone, 27 GB free.
+            ("swap half used, roomy", machine(27_796, 9_380, CALM_PSI), Calm),
+            ("swap almost full, roomy", machine(20_000, 16_000, CALM_PSI), Calm),
+            ("swap half used, short", machine(12_000, 8_192, CALM_PSI), Strained),
+            ("swap 49% used, short", machine(12_000, 8_027, CALM_PSI), Calm),
+            ("swap almost full, short", machine(12_000, 14_745, CALM_PSI), Severe),
+            // The second reset: 4.3 GB available, swap at zero.
+            ("10:55 reset", machine(4_320, 16_382, CALM_PSI), Severe),
+            ("stall 10% over 10 s", machine(40_000, 0, psi(10, 0, 0)), Strained),
+            ("stall 9.99% over 10 s", machine(40_000, 0, Some(MemoryPsi {
+                some_avg10: PsiShare(999), ..CALM_PSI.unwrap()
+            })), Calm),
+            ("stall 20% over a minute", machine(40_000, 0, psi(25, 20, 0)), Severe),
+            ("whole machine stalled", machine(40_000, 0, psi(10, 5, 10)), Severe),
+            ("no PSI, roomy", machine(40_000, 0, None), Calm),
+            ("no PSI, swap almost full, short", machine(5_000, 16_000, None), Severe),
+        ];
+        for (name, input, want) in rows {
+            assert_eq!(pressure_level(input, 6144), *want, "{name}: {input:?}");
+        }
+        // No swap at all is not "swap full".
+        let no_swap = MachineMemory {
+            swap_total_mb: 0,
+            swap_free_mb: 0,
+            ..machine(7_000, 0, CALM_PSI)
+        };
+        assert_eq!(pressure_level(&no_swap, 6144), Calm);
+        // Floor disabled: swap no longer counts, stall still does.
+        assert_eq!(pressure_level(&machine(5_000, 16_000, CALM_PSI), 0), Calm);
+        assert_eq!(pressure_level(&machine(5_000, 0, psi(30, 30, 0)), 0), Severe);
+    }
+
+    fn pressed(rss_mb: u64, machine: MachineMemory) -> MemoryReading {
+        MemoryReading {
+            rss_mb,
+            available_mb: Some(machine.available_mb),
+            machine: Some(machine),
+        }
+    }
+
+    /// The oracle of `decide_for_reading`: what pressure adds to the RSS and
+    /// floor decision. LIMITS: soft 4096, hard 10240, floor 6144, cooldown 300 s.
+    #[test]
+    fn pressure_decision_table() {
+        use WatchdogAction::{RetireAndUnload, Unload};
+        const STAY: WatchdogAction = WatchdogAction::None;
+        let strained = machine(40_000, 0, psi(15, 5, 0));
+        let severe = machine(40_000, 0, psi(40, 30, 12));
+        let calm = machine(40_000, 0, CALM_PSI);
+        let secs = |s| Some(Duration::from_secs(s));
+        let first = None;
+        let rows: &[(&str, MemoryReading, Option<Duration>, bool, WatchdogAction)] = &[
+            ("calm, small", pressed(3000, calm), first, false, STAY),
+            ("strained, small, first time", pressed(3000, strained), first, false, Unload),
+            ("strained, within cooldown", pressed(3000, strained), secs(120), false, STAY),
+            ("strained, past cooldown", pressed(3000, strained), secs(300), false, Unload),
+            ("severe, 59 s after an unload", pressed(3000, severe), secs(59), false, STAY),
+            ("severe, 60 s after an unload", pressed(3000, severe), secs(60), false, Unload),
+            // Pressure never retires: that is the hard limit's alone.
+            ("severe, retired", pressed(3000, severe), secs(60), true, Unload),
+            ("severe, over hard", pressed(12000, severe), first, false, RetireAndUnload),
+            ("calm, over soft", pressed(5000, calm), first, false, Unload),
+            ("calm, over soft, cooldown", pressed(5000, calm), secs(120), false, STAY),
+            // The floor still decides on its own, without PSI.
+            ("floor, no PSI", pressed(3000, machine(5_000, 0, None)), first, false, Unload),
+            ("no machine reading", reading(3000), first, false, STAY),
+        ];
+        for (name, input, since_unload, retiring, want) in rows {
+            assert_eq!(
+                decide_for_reading(*input, LIMITS, *since_unload, *retiring),
+                *want,
+                "{name}"
+            );
+        }
+        // Floor 0 switches the machine watch off, stall included.
+        let off = WatchdogLimits {
+            min_available_mb: 0,
+            ..LIMITS
+        };
+        assert_eq!(decide_for_reading(pressed(3000, severe), off, None, false), STAY);
+    }
+
+    /// The defaults as shares reproduce the measured absolute numbers on the
+    /// machine they were measured on, and fall back to them when unreadable.
+    #[test]
+    fn default_limits_follow_the_machine() {
+        assert_eq!(default_limits_mb(Some(63_431)), (24_103, 28_543, 6_343));
+        assert_eq!(default_limits_mb(Some(32_000)), (12_160, 14_400, 3_200));
+        assert_eq!(default_limits_mb(None), (24_576, 28_672, 6_144));
+        assert_eq!(default_limits_mb(Some(0)), (24_576, 28_672, 6_144));
     }
 
     fn no_trim_expected() -> MemoryReading {

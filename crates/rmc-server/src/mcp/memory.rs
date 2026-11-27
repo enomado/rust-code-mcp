@@ -368,10 +368,124 @@ pub fn mem_available_kib() -> Option<u64> {
 }
 
 pub(crate) fn parse_proc_meminfo_available_kib(meminfo: &str) -> Option<u64> {
+    parse_proc_meminfo_kib(meminfo, "MemAvailable")
+}
+
+/// One `/proc/meminfo` field, in KiB. `key` is the name without the colon;
+/// `MemFree` does not match `MemAvailable` or the other way round, because the
+/// colon is part of what is stripped.
+fn parse_proc_meminfo_kib(meminfo: &str, key: &str) -> Option<u64> {
     meminfo.lines().find_map(|line| {
-        let value = line.strip_prefix("MemAvailable:")?;
+        let value = line.strip_prefix(key)?.strip_prefix(':')?;
         value.split_whitespace().next()?.parse::<u64>().ok()
     })
+}
+
+/// A share of wall time, as `/proc/pressure/*` reports it, in hundredths of a
+/// percent: `10.00%` is `PsiShare(1000)`. Integer so that readings compare
+/// exactly in tests and in the decision table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PsiShare(pub u32);
+
+impl PsiShare {
+    pub const fn percent(whole: u32) -> Self {
+        Self(whole * 100)
+    }
+}
+
+impl std::fmt::Display for PsiShare {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{:02}%", self.0 / 100, self.0 % 100)
+    }
+}
+
+/// The three PSI averages the watchdog reads from `/proc/pressure/memory`.
+///
+/// `some` is the share of time at least one task waited on memory (reclaim,
+/// swap-in, refault); `full` — the share in which every non-idle task did, i.e.
+/// the machine made no progress at all. A build that merely fills the page cache
+/// reads 0 in both; swap thrash reads tens of percent. That is the signal
+/// `MemAvailable` cannot give: on 2026-11-27 it still read 4–8 GB while the
+/// swap was already empty and the hardware watchdog was seconds from a reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPsi {
+    pub some_avg10: PsiShare,
+    pub some_avg60: PsiShare,
+    pub full_avg10: PsiShare,
+}
+
+/// Parse `/proc/pressure/memory`:
+///
+/// ```text
+/// some avg10=0.00 avg60=0.00 avg300=0.00 total=2
+/// full avg10=0.00 avg60=0.00 avg300=0.00 total=2
+/// ```
+///
+/// `None` unless both lines and all three averages are there — a half-read
+/// file must not report a calm machine.
+pub fn parse_memory_psi(text: &str) -> Option<MemoryPsi> {
+    fn line_field(text: &str, kind: &str, field: &str) -> Option<PsiShare> {
+        let line = text
+            .lines()
+            .find_map(|line| line.strip_prefix(kind)?.strip_prefix(' '))?;
+        let value = line
+            .split_whitespace()
+            .find_map(|pair| pair.strip_prefix(field)?.strip_prefix('='))?;
+        let (whole, frac) = value.split_once('.').unwrap_or((value, "0"));
+        let whole: u32 = whole.parse().ok()?;
+        // Two digits of fraction is what the kernel prints; pad or cut to two.
+        let frac: String = frac.chars().chain(std::iter::repeat('0')).take(2).collect();
+        let frac: u32 = frac.parse().ok()?;
+        Some(PsiShare(whole * 100 + frac))
+    }
+    Some(MemoryPsi {
+        some_avg10: line_field(text, "some", "avg10")?,
+        some_avg60: line_field(text, "some", "avg60")?,
+        full_avg10: line_field(text, "full", "avg10")?,
+    })
+}
+
+/// The machine's memory as one reading, in MB — what [`mem_available_kib`]
+/// sees, plus the budget it is a share of, the swap, and the stall time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineMemory {
+    pub total_mb: u64,
+    pub available_mb: u64,
+    pub swap_total_mb: u64,
+    pub swap_free_mb: u64,
+    /// `None` where the kernel has PSI off (`psi=0`, or `CONFIG_PSI` absent):
+    /// the swap and `MemAvailable` readings still decide then.
+    pub psi: Option<MemoryPsi>,
+}
+
+/// Parse the four [`MachineMemory`] fields out of `/proc/meminfo`. `None` when
+/// any is missing; `psi` is left for the caller.
+pub fn parse_machine_meminfo(meminfo: &str) -> Option<MachineMemory> {
+    let mb = |key| parse_proc_meminfo_kib(meminfo, key).map(|kib| kib / 1024);
+    Some(MachineMemory {
+        total_mb: mb("MemTotal")?,
+        available_mb: mb("MemAvailable")?,
+        swap_total_mb: mb("SwapTotal")?,
+        swap_free_mb: mb("SwapFree")?,
+        psi: None,
+    })
+}
+
+/// Read [`MachineMemory`] now. `None` on platforms without `/proc/meminfo`.
+pub fn machine_memory() -> Option<MachineMemory> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let mut machine = parse_machine_meminfo(&meminfo)?;
+        machine.psi = std::fs::read_to_string("/proc/pressure/memory")
+            .ok()
+            .and_then(|text| parse_memory_psi(&text));
+        Some(machine)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 /// mimalloc's own "give it back" entry point.
@@ -687,6 +801,60 @@ VmFlags: rd wr mr mw me ac
         let meminfo = "MemTotal:       64000000 kB\nMemFree:         1000000 kB\n";
 
         assert_eq!(parse_proc_meminfo_available_kib(meminfo), None);
+    }
+
+    /// The kernel's own text, numbers in hundredths of a percent.
+    #[test]
+    fn psi_parser_reads_kernel_text() {
+        let text = "some avg10=12.34 avg60=5.06 avg300=1.00 total=123456\n\
+                    full avg10=0.70 avg60=0.10 avg300=0.00 total=789\n";
+
+        assert_eq!(
+            parse_memory_psi(text),
+            Some(MemoryPsi {
+                some_avg10: PsiShare(1234),
+                some_avg60: PsiShare(506),
+                full_avg10: PsiShare(70),
+            })
+        );
+        assert_eq!(PsiShare(1234).to_string(), "12.34%");
+        assert_eq!(PsiShare(70).to_string(), "0.70%");
+    }
+
+    /// A file with the `some` line only (older kernels, a truncated read) is not
+    /// a calm machine; neither is a `full` value read off the `some` line.
+    #[test]
+    fn psi_parser_wants_both_lines() {
+        assert_eq!(
+            parse_memory_psi("some avg10=50.00 avg60=50.00 avg300=50.00 total=1\n"),
+            None
+        );
+        assert_eq!(parse_memory_psi(""), None);
+    }
+
+    #[test]
+    fn machine_meminfo_reads_budget_and_swap() {
+        let meminfo = "MemTotal:       64953364 kB\n\
+                       MemFree:         1000000 kB\n\
+                       MemAvailable:   35000000 kB\n\
+                       SwapTotal:      16777212 kB\n\
+                       SwapFree:        4194304 kB\n";
+
+        assert_eq!(
+            parse_machine_meminfo(meminfo),
+            Some(MachineMemory {
+                total_mb: 63431,
+                available_mb: 34179,
+                swap_total_mb: 16383,
+                swap_free_mb: 4096,
+                psi: None,
+            })
+        );
+        // No swap lines — not "no swap", unreadable.
+        assert_eq!(
+            parse_machine_meminfo("MemTotal: 1 kB\nMemAvailable: 1 kB\n"),
+            None
+        );
     }
 
     /// On Linux the reading has to exist, or the floor silently never applies.
