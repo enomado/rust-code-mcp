@@ -274,3 +274,87 @@ fn post_refresh_cost() {
         probe.ask("warm");
     }
 }
+
+/// Probe (plan item `manifest-reload-in-place`): what a reload in place costs
+/// against a full load of the same workspace, and whether they answer alike.
+///
+/// The workspace is loaded once and its watch frozen; then reloaded in place
+/// with nothing changed (the floor: `cargo metadata`, the read of every file,
+/// the verification of every memo); then — with `RMC_RELOAD_PROBE_FEATURE_IN`
+/// naming a package manifest of a *copy* (the probe writes it) — reloaded in
+/// place after a feature is added to it, which changes that crate's cfg and
+/// re-resolves its reverse dependencies. Last, that database is dropped and
+/// the edited tree loaded afresh, and the queries asked again: the answers'
+/// counts are printed beside each other.
+///
+/// ```text
+/// RMC_POST_REFRESH_PROJECT=/path/to/copy RMC_POST_REFRESH_QUERIES=def:X,refs:Y \
+/// RMC_RELOAD_PROBE_FEATURE_IN=/path/to/copy/crates/a/Cargo.toml \
+///   cargo test --release -p rmc-server --lib -- --ignored --nocapture reload_in_place_cost
+/// ```
+#[test]
+#[ignore = "probe: needs a real workspace in RMC_POST_REFRESH_PROJECT and minutes to run"]
+fn reload_in_place_cost() {
+    let _analysis = crate::deep_stack::test_holding_an_analysis();
+    let root = PathBuf::from(required("RMC_POST_REFRESH_PROJECT")).canonicalize().unwrap();
+    let queries: Vec<Query> =
+        required("RMC_POST_REFRESH_QUERIES").split(',').map(Query::parse).collect();
+    let feature_in = std::env::var("RMC_RELOAD_PROBE_FEATURE_IN").ok().map(PathBuf::from);
+    let probe = Probe { service: SemanticService::new(), root: root.clone(), queries };
+
+    println!("| step | part | what | took | found | note | RSS |");
+    println!("|---|---|---|---|---|---|---|");
+    let at = Instant::now();
+    probe.service.get_or_load_full(&root).expect("load");
+    println!("| load | | | {:.1} s | | | {} MiB |", at.elapsed().as_secs_f64(), rss_mib());
+    let reload = |step: &str| {
+        let slot = probe.service.slot_for(&root);
+        let mut guard = slot.lock();
+        let ctx = guard.as_mut().expect("loaded");
+        ctx.watch = tree_watch::TreeWatch::frozen(&root);
+        let at = Instant::now();
+        let done = super::reload_in_place::reload_in_place(ctx, &root).expect("reload in place");
+        println!(
+            "| {step} | reload in place | metadata {:.1} s, change {:.1} s, prime {:.1} s | {:.1} s | | {done:?} | {} MiB |",
+            done.workspace.as_secs_f64(),
+            done.apply.as_secs_f64(),
+            done.prime.as_secs_f64(),
+            at.elapsed().as_secs_f64(),
+            rss_mib()
+        );
+    };
+    reload("frozen");
+    probe.ask("warm");
+    probe.ask("warm");
+    reload("unchanged");
+    probe.ask("after reload");
+
+    let Some(manifest) = feature_in else {
+        return;
+    };
+    let text = std::fs::read_to_string(&manifest).expect("read the manifest");
+    let edited = match text.find("[features]\n") {
+        Some(at) => {
+            let end = at + "[features]\n".len();
+            format!("{}rmc_reload_probe = []\n{}", &text[..end], &text[end..])
+        }
+        None => format!("{text}\n[features]\nrmc_reload_probe = []\n"),
+    };
+    std::fs::write(&manifest, edited).expect("write the manifest");
+    reload("a feature added");
+    probe.ask("after reload");
+    probe.ask("warm");
+
+    drop(probe.service);
+    crate::mcp::memory::release_free_memory();
+    let fresh = Probe {
+        service: SemanticService::new(),
+        root: root.clone(),
+        queries: probe.queries,
+    };
+    let at = Instant::now();
+    fresh.service.get_or_load_full(&root).expect("load");
+    println!("| fresh load | | | {:.1} s | | | {} MiB |", at.elapsed().as_secs_f64(), rss_mib());
+    fresh.ask("fresh");
+    fresh.ask("warm");
+}

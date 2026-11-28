@@ -73,6 +73,7 @@ ra_ap_ide_db = { path = "../rust-analyzer-bur/crates/ide-db", package = "ide-db"
 "ra_ap_load-cargo" = { path = "../rust-analyzer-bur/crates/load-cargo", package = "load-cargo" }
 ra_ap_project_model = { path = "../rust-analyzer-bur/crates/project-model", package = "project-model" }
 ra_ap_vfs = { path = "../rust-analyzer-bur/crates/vfs", package = "vfs" }
+"ra_ap_vfs-notify" = { path = "../rust-analyzer-bur/crates/vfs-notify", package = "vfs-notify" }
 ra_ap_paths = { path = "../rust-analyzer-bur/crates/paths", package = "paths" }
 ra_ap_hir = { path = "../rust-analyzer-bur/crates/hir", package = "hir" }
 ra_ap_hir_def = { path = "../rust-analyzer-bur/crates/hir-def", package = "hir-def" }

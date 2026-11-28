@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use ra_ap_ide::AnalysisHost;
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_ide_db::base_db::file_text_store::FileTextStore;
-use ra_ap_ide_db::base_db::{AbsPathBuf, Crate, SourceDatabase, all_crates, salsa};
+use ra_ap_ide_db::base_db::{
+    AbsPathBuf, Crate, LibraryRoots, LocalRoots, SourceDatabase, SourceRootId, all_crates, salsa,
+};
 use ra_ap_ide_db::prime_caches::parallel_prime_caches;
 use ra_ap_load_cargo::{
     LoadCargoConfig, ProcMacroServerChoice, ProjectFolders, SourceRootConfig,
@@ -44,6 +46,16 @@ pub(crate) struct SourceLayout {
     /// The manifest of every package in the loaded crate graph (members and
     /// path dependencies), plus the workspace's own.
     manifests: HashSet<PathBuf>,
+    /// The database's id of each set `roots` partitions into, by set index —
+    /// the catch-all last. A load numbers them as the partition does (`0..n`);
+    /// a reload in place keeps the ids of the roots it finds again and gives
+    /// new roots ids no root ever had (`super::reload_in_place`), so the two
+    /// orders part there.
+    pub(crate) root_ids: Vec<SourceRootId>,
+    /// The first id no root of this database has had: what a reload in place
+    /// numbers new roots from. Ids of roots gone stay retired (an empty root),
+    /// never handed out again.
+    pub(crate) next_root_id: u32,
 }
 
 /// How a file changed between two stamp sets.
@@ -55,12 +67,43 @@ pub(crate) enum FileChange {
 }
 
 impl SourceLayout {
-    fn of(folders: ProjectFolders, root: &Path, workspace: &ProjectWorkspace) -> Self {
+    /// The layout of `workspace` loaded fresh: `root_ids` as the partition
+    /// numbers its sets — `root_count` of them (the catch-all included), which
+    /// is what the load gave the database.
+    fn of(
+        folders: ProjectFolders,
+        root: &Path,
+        manifests: HashSet<PathBuf>,
+        root_count: usize,
+    ) -> Self {
+        let count = u32::try_from(root_count).expect("fewer than 2^32 source roots");
         SourceLayout {
             roots: folders.source_root_config,
             load: folders.load,
             root: root.to_path_buf(),
-            manifests: package_manifests(workspace),
+            manifests,
+            root_ids: (0..count).map(SourceRootId).collect(),
+            next_root_id: count,
+        }
+    }
+
+    /// The layout of `workspace` reloaded into a database that keeps its
+    /// roots: `root_ids` and `next_root_id` as the reload numbered them.
+    pub(crate) fn reloaded(
+        roots: SourceRootConfig,
+        load: Vec<ra_ap_vfs::loader::Entry>,
+        root: &Path,
+        manifests: HashSet<PathBuf>,
+        root_ids: Vec<SourceRootId>,
+        next_root_id: u32,
+    ) -> Self {
+        SourceLayout {
+            roots,
+            load,
+            root: root.to_path_buf(),
+            manifests,
+            root_ids,
+            next_root_id,
         }
     }
 
@@ -111,16 +154,19 @@ impl SourceLayout {
         self.load.iter().any(|entry| entry.contains_file(&path))
     }
 
-    /// The index of the source root `path` belongs to, or `None` for the
-    /// catch-all set of files under no configured root.
-    pub(crate) fn root_of(&self, path: &VfsPath) -> Option<usize> {
-        self.roots.fsc.classify_path(path)
+    /// The database's id of the source root `path` belongs to, or `None` for
+    /// the catch-all set of files under no configured root.
+    pub(crate) fn root_of(&self, path: &VfsPath) -> Option<SourceRootId> {
+        self.roots
+            .fsc
+            .classify_path(path)
+            .map(|index| self.root_ids[index])
     }
 }
 
 /// The manifests of every package `cargo metadata` gave the workspace, and the
 /// workspace's own; none for a `rust-project.json` workspace.
-fn package_manifests(workspace: &ProjectWorkspace) -> HashSet<PathBuf> {
+pub(crate) fn package_manifests(workspace: &ProjectWorkspace) -> HashSet<PathBuf> {
     let cargo = match &workspace.kind {
         ProjectWorkspaceKind::Cargo { cargo, .. } => Some(cargo),
         ProjectWorkspaceKind::DetachedFile { cargo, .. } => cargo.as_ref().map(|(cargo, ..)| cargo),
@@ -254,23 +300,55 @@ fn load_project_with_config(path: &Path, cargo_config: CargoConfig) -> Result<Lo
     Ok((host, vfs, layout))
 }
 
-/// The workspace loaded into a database, caches cold.
-fn load_unprimed(
-    path: &Path,
-    cargo_config: &CargoConfig,
-) -> Result<(RootDatabase, Vfs, SourceLayout)> {
-    let load_config = LoadCargoConfig {
+/// The cargo configuration a load of `full` (`LoadKind::Full`) or fast kind
+/// asks `cargo metadata` with.
+pub(crate) fn cargo_config_of(full: bool) -> Result<CargoConfig> {
+    if full {
+        full_workspace_cargo_config()
+    } else {
+        Ok(fast_project_cargo_config())
+    }
+}
+
+/// How every load reads a workspace; no proc-macro server, so every proc
+/// macro is "disabled" (`super::reload_in_place` writes the same).
+pub(crate) fn load_config() -> LoadCargoConfig {
+    LoadCargoConfig {
         load_out_dirs_from_check: build_scripts_enabled(),
         with_proc_macro_server: ProcMacroServerChoice::None,
         // Primed by the caller instead, in batches: see `prime_in_batches`.
         prefill_caches: false,
         num_worker_threads: num_cpus::get_physical(),
         proc_macro_processes: 1,
-    };
+    }
+}
+
+/// The workspace at `path` as `cargo metadata` (and the build scripts, when
+/// on) describe it now — the part of a load that reads no source file.
+pub(crate) fn project_workspace(
+    path: &Path,
+    cargo_config: &CargoConfig,
+    load_config: &LoadCargoConfig,
+) -> Result<ProjectWorkspace> {
+    project_workspace_at(path, cargo_config, load_config, &|_| {})
+        .context("Failed to load workspace")
+}
+
+/// Warm the caches of every crate, in batches: what a load does last, and a
+/// reload in place after its change.
+pub(crate) fn prime(db: &mut RootDatabase) {
+    prime_in_batches(db, prime_batch_files(), num_cpus::get_physical());
+}
+
+/// The workspace loaded into a database, caches cold.
+fn load_unprimed(
+    path: &Path,
+    cargo_config: &CargoConfig,
+) -> Result<(RootDatabase, Vfs, SourceLayout)> {
+    let load_config = load_config();
 
     // `load_workspace_at`, opened up so the store goes in before any text does.
-    let workspace = project_workspace_at(path, cargo_config, &load_config, &|_| {})
-        .context("Failed to load workspace")?;
+    let workspace = project_workspace(path, cargo_config, &load_config)?;
     // Read here because `load_workspace` reads it, and `lru_sweep` drives it.
     let lru_cap = std::env::var("RA_LRU_CAP")
         .ok()
@@ -287,14 +365,14 @@ fn load_unprimed(
     // a pure function of it), made here because that function keeps its
     // result to itself. Paths only — the workspace's package roots, nothing read
     // from disk.
-    let layout = SourceLayout::of(
-        ProjectFolders::new(std::slice::from_ref(&workspace), &[], None),
-        path,
-        &workspace,
-    );
+    let folders = ProjectFolders::new(std::slice::from_ref(&workspace), &[], None);
+    let manifests = package_manifests(&workspace);
     let (vfs, _) =
         load_workspace_into_db(workspace, &cargo_config.extra_env, &load_config, &mut db)
             .context("Failed to load workspace")?;
+    // The load set every set of the partition as a root, numbered by its index.
+    let root_count = LocalRoots::get(&db).roots(&db).len() + LibraryRoots::get(&db).roots(&db).len();
+    let layout = SourceLayout::of(folders, path, manifests, root_count);
     Ok((db, vfs, layout))
 }
 

@@ -11,6 +11,7 @@ pub(crate) mod position;
 /// `post-refresh-cost`). Measurement only.
 #[cfg(test)]
 mod post_refresh_probe;
+mod reload_in_place;
 mod rename;
 mod surface;
 mod tree_watch;
@@ -98,8 +99,8 @@ struct ProjectContext {
     /// refresh. Shared with the queries and written like `words`.
     uses: Arc<RwLock<uses::UseTable>>,
     /// The order the builder fills `uses` in, by source root — every root of
-    /// the database ([`exposure_by_root`]); computed at load, as the crate
-    /// graph it reads changes only by a reload.
+    /// the database ([`exposure_by_root`]); computed at load, and again by a
+    /// reload in place — the crate graph it reads changes by nothing else.
     exposure: HashMap<ra_ap_ide_db::base_db::SourceRootId, uses::Exposure>,
     /// Where the load put files, so that a file added since goes where a
     /// reload would put it — see [`apply_tree_change`].
@@ -120,6 +121,10 @@ struct ProjectContext {
     /// ([`RefreshBy::Background`]): the events that called for it are read,
     /// so this is what remembers it. Never set on a context a query refreshes.
     reload_due: Option<LoadReason>,
+    /// How many times a changed manifest was reloaded into this database
+    /// ([`reload_in_place`]) — `loaded_at` stays: the database is the same.
+    /// What a test tells a reload in place from a full load and a patch by.
+    reloads_in_place: usize,
 }
 
 fn stamp_of(path: &Path) -> Option<FileStamp> {
@@ -878,7 +883,7 @@ fn apply_tree_change_with(
                     let root = ctx.layout.root_of(&vfs_path).ok_or_else(|| {
                         anyhow::anyhow!("{} would be loaded but is in no source root", path.display())
                     })?;
-                    Target::New(SourceRootId(root as u32))
+                    Target::New(root)
                 }
                 None => {
                     patched.outside += 1;
@@ -985,6 +990,12 @@ fn apply_tree_change_with(
             vfs.set_file_contents(vfs_path.clone(), None);
             texts.push((*file_id, None));
         }
+        // The `Vfs` queues each change with its whole text until taken; the
+        // texts are in `texts` already. Left queued, every file ever edited
+        // kept a copy of its last text for the life of the context, and a
+        // reload in place (`reload_in_place`), which takes the queue for what
+        // it read, would write them all again.
+        drop(vfs.take_changes());
     }
 
     // Roots before texts: storing a text asks the file's root whether it is a
@@ -1827,6 +1838,7 @@ fn load_into(
         stamps,
         watch,
         reload_due: None,
+        reloads_in_place: 0,
     });
     slot.publish(Some(requested));
     mem.finish();
@@ -1860,9 +1872,11 @@ fn load_into(
 /// A changed manifest, lockfile or toolchain file reloads
 /// ([`Staleness::ManifestChanged`]): the crate graph comes from `cargo
 /// metadata`, and a new package is a new `Cargo.toml` (that is how a package
-/// under a `members` glob is noticed). So does a change that cannot be patched.
-/// Reloading costs seconds (`Fast`, `no_deps`) to minutes (`Full`: 45–95 s on
-/// a ~8000-file workspace), which is why it is reserved for these.
+/// under a `members` glob is noticed) — into the database it has
+/// ([`reload_for`], [`reload_in_place`]): crates, roots and files that did not
+/// change keep their memos. So does a change that cannot be patched, by a full
+/// load: seconds (`Fast`, `no_deps`) to minutes (`Full`: 45–95 s on a
+/// ~8000-file workspace), which is why it is reserved for that.
 ///
 /// Before the patch path for added files, every new `*.rs` reloaded: on a
 /// workspace where a fleet of agents adds test modules all day that was 72
@@ -1891,7 +1905,7 @@ fn refresh_if_stale(
         return match by {
             RefreshBy::Background => Ok(Refreshed::ReloadDeferred),
             RefreshBy::Query => {
-                load_into(gate, slot, context, canonical, requested, reason)?;
+                reload_for(gate, slot, context, canonical, requested, reason)?;
                 Ok(Refreshed::Reloaded)
             }
         };
@@ -1903,16 +1917,25 @@ fn refresh_if_stale(
     };
 
     // A reload, now or — from the background — at the next query. The events
-    // that called for it are read either way; the stamps need no update, as a
-    // load takes its own.
-    let reload = |context: &mut Option<ProjectContext>, reason: LoadReason| match by {
-        RefreshBy::Query => {
-            load_into(gate, slot, context, canonical, requested, reason)?;
-            Ok(Refreshed::Reloaded)
-        }
-        RefreshBy::Background => {
-            context.as_mut().expect("checked above").reload_due = Some(reason);
-            Ok(Refreshed::ReloadDeferred)
+    // that called for it are read either way, so the stamps they give are
+    // kept: a full load takes its own, and a reload in place reads every file
+    // anew, so it describes them (and the next events are judged against
+    // them, not against stamps from before — which would see the manifest
+    // change again).
+    let reload = |context: &mut Option<ProjectContext>,
+                  current: HashMap<PathBuf, FileStamp>,
+                  reason: LoadReason| {
+        let ctx = context.as_mut().expect("checked above");
+        ctx.stamps = current;
+        match by {
+            RefreshBy::Query => {
+                reload_for(gate, slot, context, canonical, requested, reason)?;
+                Ok(Refreshed::Reloaded)
+            }
+            RefreshBy::Background => {
+                ctx.reload_due = Some(reason);
+                Ok(Refreshed::ReloadDeferred)
+            }
         }
     };
     match classify_staleness(&ctx.stamps, &current, &ctx.layout) {
@@ -1929,7 +1952,7 @@ fn refresh_if_stale(
                 canonical.display(),
                 by.reload_when()
             );
-            reload(context, LoadReason::ManifestChanged)
+            reload(context, current, LoadReason::ManifestChanged)
         }
         Staleness::Changed(change) => match apply_tree_change(ctx, &change) {
             Ok(patched) => {
@@ -1964,10 +1987,85 @@ fn refresh_if_stale(
                     canonical.display(),
                     by.reload_when()
                 );
-                reload(context, LoadReason::CannotPatch)
+                reload(context, current, LoadReason::CannotPatch)
             }
         },
     }
+}
+
+/// Reload `canonical` for `reason`: a changed manifest in place
+/// ([`reload_in_place`]), into the database the context has; anything else —
+/// or a failed reload in place — by a full load.
+///
+/// The in-place reload is a load for the log's purposes (`mem: analysis load
+/// InPlace of … because … (in place)`): its slot is held for all of it, and
+/// `--tool-latency` charges it to the query that waited, as it charges a load.
+fn reload_for(
+    gate: &load_gate::LoadGate,
+    slot: &ProjectSlot,
+    context: &mut Option<ProjectContext>,
+    canonical: &Path,
+    requested: LoadKind,
+    reason: LoadReason,
+) -> Result<()> {
+    let ctx = context.as_mut().expect("a reload of a loaded context");
+    if reason == LoadReason::ManifestChanged {
+        tracing::info!("Reloading {} in place", canonical.display());
+        // "(in place)" in the reason: `--tool-latency` sums loads by reason,
+        // and these cost seconds where a full load of the same reason costs a
+        // minute.
+        let mem = rmc_engine::mem_trace::MemSpan::start(format!(
+            "analysis load InPlace of {} because {} (in place)",
+            canonical.display(),
+            reason.as_log_text()
+        ));
+        match reload_in_place::reload_in_place(ctx, canonical) {
+            Ok(done) => {
+                // `cargo metadata` may have written the lockfile: its own
+                // write is not a change to reload for (see `load_into`).
+                let lock = canonical.join("Cargo.lock");
+                match stamp_of(&lock) {
+                    Some(stamp) => ctx.stamps.insert(lock, stamp),
+                    None => ctx.stamps.remove(&lock),
+                };
+                ctx.reload_due = None;
+                ctx.reloads_in_place += 1;
+                mem.finish();
+                tracing::info!(
+                    "Reloaded {} in place: cargo metadata {:.1} s, change {:.1} s, priming {:.1} s; \
+                     crates {} new, {} changed, {} gone; source roots {} new, {} rewritten, {} \
+                     retired; {} text(s) written, {} removed; table of uses: {} ready made \
+                     pending, {} pending",
+                    canonical.display(),
+                    done.workspace.as_secs_f64(),
+                    done.apply.as_secs_f64(),
+                    done.prime.as_secs_f64(),
+                    done.crates_new,
+                    done.crates_changed,
+                    done.crates_gone,
+                    done.roots_new,
+                    done.roots_rewritten,
+                    done.roots_retired,
+                    done.texts_written,
+                    done.texts_removed,
+                    done.uses_widened,
+                    done.uses_pending
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                // Nothing was written (`reload_in_place` fails only before its
+                // first write); the full load reports the error again if it
+                // is the workspace's.
+                mem.finish();
+                tracing::info!(
+                    "Cannot reload {} in place ({e:#}); loading it afresh",
+                    canonical.display()
+                );
+            }
+        }
+    }
+    load_into(gate, slot, context, canonical, requested, reason)
 }
 
 /// Who brings a context up to date — see [`refresh_if_stale`].
@@ -2184,6 +2282,7 @@ impl SemanticService {
                 stamps: HashMap::new(),
                 watch: tree_watch::TreeWatch::walking(&path),
                 reload_due: None,
+                reloads_in_place: 0,
             },
         );
     }
@@ -3057,6 +3156,7 @@ impl SemanticService {
                 stamps: HashMap::new(),
                 watch: tree_watch::TreeWatch::walking(&canonical),
                 reload_due: None,
+                reloads_in_place: 0,
             },
         );
     }
@@ -3704,8 +3804,8 @@ pub fn second() {
         service
             .find_references_by_name_with_exact(root, "target", true)
             .expect("query after a manifest edit");
-        let reloaded = loaded_at(&service, root);
-        assert_ne!(reloaded, loaded, "an edited Cargo.toml must reload");
+        assert_eq!(reloads_in_place(&service, root), 1, "an edited Cargo.toml must reload");
+        assert_eq!(loaded_at(&service, root), loaded, "the reload was not in place");
 
         write_file(
             &root.join("crates/user/Cargo.toml"),
@@ -3718,12 +3818,150 @@ pub fn second() {
         let with_user = service
             .find_references_by_name_with_exact(root, "target", true)
             .expect("query after a new package");
-        assert_ne!(loaded_at(&service, root), reloaded, "a new package must reload");
+        assert_eq!(reloads_in_place(&service, root), 2, "a new package must reload");
         assert_eq!(
             refs_in(&with_user, "crates/user/src/lib.rs"),
             1,
             "the new package's call must be found: {with_user:?}"
         );
+    }
+
+    /// How many times `root`'s database had its workspace reloaded into it.
+    fn reloads_in_place(service: &SemanticService, root: &Path) -> usize {
+        let canonical = root.canonicalize().expect("canonicalize");
+        service.with_context_for_test(&canonical, |ctx| ctx.reloads_in_place)
+    }
+
+    /// Plan item `manifest-reload-in-place`: a changed manifest reloads the
+    /// workspace into the database it has — no new database (`loaded_at`
+    /// stays) — and every answer is the one a fresh load of the same tree
+    /// gives: a feature turned on (a crate's cfg changes), a new dependency, a
+    /// new package, a removed package. The table of uses keeps the files of
+    /// crates the change does not reach ready, and once built again holds
+    /// what a fresh load's table holds.
+    ///
+    /// A full reload of a large workspace was 36–100 s, and its table of uses
+    /// started again from nothing.
+    #[test]
+    fn a_manifest_change_reloads_in_place_as_a_fresh_load_would() {
+        let _analysis = holding_an_analysis();
+        let workspace = tempfile::tempdir().expect("create workspace tempdir");
+        let root = workspace.path();
+        let manifest = |name: &str, deps: &str, features: &str| {
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+                 [dependencies]\n{deps}\n{features}"
+            )
+        };
+        let base_dep = "base = { path = \"../base\" }\n";
+        write_file(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+        );
+        write_file(&root.join("crates/base/Cargo.toml"), &manifest("base", "", ""));
+        write_file(
+            &root.join("crates/base/src/lib.rs"),
+            "pub fn target() {}\n\npub fn first() {\n    target();\n}\n\n\
+             #[cfg(feature = \"extra\")]\npub fn gated() {}\n",
+        );
+        write_file(&root.join("crates/helper/Cargo.toml"), &manifest("helper", base_dep, ""));
+        write_file(
+            &root.join("crates/helper/src/lib.rs"),
+            "pub fn relay() {\n    base::target();\n}\n",
+        );
+        let user_manifest = root.join("crates/user/Cargo.toml");
+        write_file(&user_manifest, &manifest("user", base_dep, ""));
+        write_file(
+            &root.join("crates/user/src/lib.rs"),
+            "pub fn user() {\n    base::target();\n}\n\npub fn via() {\n    helper::relay();\n}\n\n\
+             pub fn uses_gated() {\n    base::gated();\n}\n",
+        );
+        // Reached by no change below: its uses (`Vec::new` of std) stay ready.
+        write_file(&root.join("crates/lone/Cargo.toml"), &manifest("lone", "", ""));
+        write_file(
+            &root.join("crates/lone/src/lib.rs"),
+            "pub fn lone() -> Vec<u32> {\n    Vec::new()\n}\n",
+        );
+
+        let service = SemanticService::new();
+        let query = |name: &str| {
+            service
+                .find_references_by_name_with_exact(root, name, true)
+                .expect("references query")
+        };
+        assert_eq!(refs_in(&query("target"), "crates/base/src/lib.rs"), 1, "positive control");
+        assert_eq!(refs_in(&query("gated"), "crates/user/src/lib.rs"), 0, "`gated` is not compiled");
+        fill_use_table(&service, root);
+        let loaded = loaded_at(&service, root);
+        let mut reloads = 0;
+        let mut step = |what: &str, names: &[&str]| {
+            let answers: Vec<_> = names.iter().map(|name| answer(&query(name))).collect();
+            reloads += 1;
+            assert_eq!(reloads_in_place(&service, root), reloads, "{what}: not reloaded in place");
+            assert_eq!(loaded_at(&service, root), loaded, "{what}: a new database was built");
+            for (name, found) in names.iter().zip(answers) {
+                assert_eq!(found, answer_of_a_fresh_load(root, name), "{what}: `{name}`");
+            }
+        };
+
+        // A feature: `--all-features` turns it on, `gated` is compiled.
+        write_file(
+            &root.join("crates/base/Cargo.toml"),
+            &manifest("base", "", "[features]\nextra = []\n"),
+        );
+        step("a new feature", &["target", "gated"]);
+        assert_eq!(refs_in(&query("gated"), "crates/user/src/lib.rs"), 1, "`gated` is compiled");
+        let (_, pending) = use_table_by_path(&service, root);
+        assert_eq!(
+            pending,
+            ["crates/base/src/lib.rs", "crates/helper/src/lib.rs", "crates/user/src/lib.rs"],
+            "base and its reverse dependencies are pending, `lone` stays ready"
+        );
+
+        // A dependency: `helper::relay` resolves in `user`.
+        write_file(
+            &user_manifest,
+            &manifest("user", &format!("{base_dep}helper = {{ path = \"../helper\" }}\n"), ""),
+        );
+        step("a new dependency", &["relay", "target"]);
+        assert_eq!(refs_in(&query("relay"), "crates/user/src/lib.rs"), 1, "`via` calls `relay`");
+
+        // A package.
+        write_file(&root.join("crates/late/Cargo.toml"), &manifest("late", base_dep, ""));
+        write_file(
+            &root.join("crates/late/src/lib.rs"),
+            "pub fn late() {\n    base::target();\n}\n",
+        );
+        step("a new package", &["target"]);
+        assert_eq!(refs_in(&query("target"), "crates/late/src/lib.rs"), 1);
+
+        // A package gone.
+        fs::remove_dir_all(root.join("crates/user")).expect("remove a package");
+        step("a removed package", &["target", "relay"]);
+        assert_eq!(refs_in(&query("target"), "crates/user/src/lib.rs"), 0);
+
+        // Nothing changed: a reload writes nothing.
+        let canonical = root.canonicalize().expect("canonicalize");
+        let idle = service.with_context_for_test(&canonical, |ctx| {
+            reload_in_place::reload_in_place(ctx, &canonical).expect("reload in place")
+        });
+        assert_eq!(
+            (idle.crates_new, idle.crates_changed, idle.crates_gone),
+            (0, 0, 0),
+            "{idle:?}"
+        );
+        assert_eq!(
+            (idle.roots_new, idle.roots_rewritten, idle.roots_retired),
+            (0, 0, 0),
+            "{idle:?}"
+        );
+        assert_eq!((idle.texts_written, idle.texts_removed), (0, 0), "{idle:?}");
+
+        // The table, built again, is a fresh load's.
+        fill_use_table(&service, root);
+        let fresh = SemanticService::new();
+        fill_use_table(&fresh, root);
+        assert_eq!(use_table_by_path(&service, root), use_table_by_path(&fresh, root));
     }
 
     /// Plan item `post-refresh-cost`: the daemon's loop patches other
@@ -3763,8 +4001,15 @@ pub fn second() {
         service
             .find_references_by_name_with_exact(root, "target", true)
             .expect("query after the manifest edit");
+        assert_eq!(
+            reloads_in_place(&service, root),
+            1,
+            "the query did not do the reload left to it"
+        );
+        let due = service.with_context_for_test(&canonical, |ctx| ctx.reload_due);
+        assert_eq!(due, None, "the reload done is no longer due");
         let reloaded = loaded_at(&service, root);
-        assert_ne!(reloaded, loaded, "the query did not do the reload left to it");
+        assert_eq!(reloaded, loaded, "the reload was not in place");
 
         // Code: patched by the background alone. The watch is frozen right
         // after, so whatever the query sees, the background put there.

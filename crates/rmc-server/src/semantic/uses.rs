@@ -13,9 +13,11 @@
 //! the wanted name, done once for every name — so the rows of a file answer the
 //! same as sweeping it, by construction.
 //!
-//! Library files do not change while a context lives (a manifest or lockfile
-//! change reloads it, and a reload builds a new table), so a key stays valid
-//! for the life of the table.
+//! Library files do not change while a context lives, but for a manifest or
+//! lockfile change — reloaded into the same database (`super::reload_in_place`),
+//! which keeps a file ready only if no crate it may resolve through changed:
+//! files of a changed library's users are pending. So a key of a ready file
+//! stays valid for the life of the table.
 //!
 //! # Ready and pending
 //!

@@ -7185,6 +7185,7 @@ name = "rmc-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam-channel",
  "directories",
  "futures",
  "heed",
@@ -7215,6 +7216,7 @@ dependencies = [
  "tracing",
  "triomphe",
  "vfs",
+ "vfs-notify",
 ]
 
 [[package]]

@@ -64,7 +64,11 @@ ra_ap_ide_db        = { workspace = true }
 "ra_ap_load-cargo"  = { workspace = true }
 ra_ap_project_model = { workspace = true }
 ra_ap_vfs           = { workspace = true }
-ra_ap_intern        = { workspace = true }
+# The file loader a reload in place re-reads the workspace's entries with
+# (`semantic::reload_in_place`), as a load does; and its channel.
+"ra_ap_vfs-notify"  = { workspace = true }
+crossbeam-channel   = "0.5.15"
+ra_ap_intern       = { workspace = true }
 # The lexer the word index reads code words with (`semantic::word_index`).
 ra_ap_parser        = { workspace = true }
 # The parser a refresh tells a file's surface from its fn bodies with
